@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 用最小的实验代码确认第一阶段的技术路径没有阻塞点：pi-env daemon 能在 Docker 容器里通过一致性测试，pi-durable 能驱动容器里的工具，服务端崩溃后的旧进程能被 epoch 隔离清理，`docker commit` 能当检查点用。
+**Goal:** 用最小的实验代码确认第一阶段的技术路径没有阻塞点：pi-env daemon 能在 Docker 容器里通过一致性测试，pi-durable 能驱动容器里的工具，服务端崩溃后的旧进程能被 epoch 隔离清理，`docker commit` 能当检查点用，pi-durable 的钩子和自定义条目能支撑 `perRun` 检查点与单一事件源。
 
 **Architecture:** 所有代码放在 `spikes/m0/`，是可丢弃的实验代码，不是正式包的开头。每个实验写成一个 Vitest 测试文件，测试本身就是实验记录；最后把测得的结论写进 `docs/m0-findings.md`，并据此修订设计文档。
 
@@ -50,8 +50,9 @@ tether/
 │   ├── fence.ts                     Task 5  epoch 隔离原型
 │   ├── holder.ts                    Task 5  被 SIGKILL 的子进程脚本
 │   ├── orphan.test.ts               Task 5  崩溃后旧命令的存活实验 + 隔离验证
-│   └── checkpoint.test.ts           Task 6  docker commit 检查点实验
-└── docs/m0-findings.md              Task 7
+│   ├── checkpoint.test.ts           Task 6  docker commit 检查点实验
+│   └── hooks.test.ts                Task 7  运行开始钩子与自定义条目
+└── docs/m0-findings.md              Task 8
 ```
 
 ---
@@ -365,6 +366,7 @@ it("restores files but not processes from a committed image", async () => {
 it("measures commit time against workspace size", async () => {
 	// 三档：空工作区、50MB、500MB（用 head -c <n> /dev/urandom 生成随机文件）
 	// 每档 docker commit 三次取中位数，写入 .tmp/checkpoint-timing.json
+	// 同时用 docker image inspect 记录每个快照镜像新增层的大小
 	// 不设断言阈值，只记录
 });
 ```
@@ -385,7 +387,60 @@ git commit -m "test: 验证 docker commit 检查点的恢复语义并测量耗�
 
 ---
 
-### Task 7: 结论与设计修订
+### Task 7: 运行开始钩子与自定义条目
+
+对应 spec §4.2（AgentEngine 的运行开始钩子）、§4.4（单一事件源）、§8.3（`perRun` 检查点）。
+
+**Files:**
+- Test: `spikes/m0/hooks.test.ts`
+
+**Interfaces:**
+- Consumes: Task 4 的 Harness 组装方式；`defineExtension`、`hook`、`GenerationTask` 来自 `@earendil-works/pi-durable`。不需要 Docker，用 `MemoryStorage`，不配置 `env`，faux 脚本里不调用工具，只用一个不碰环境的自定义工具 `noop`（`defineTool`，`execute` 返回 `{}`）。
+
+已知事实（`pi-durable/src/harness/types.ts` 的 `GenerationHooks`）：`beforeRequest(request, api, context)` 在**每一次**请求尝试之前调用，包括崩溃恢复后的重试；`api` 是 `HookApi`（`DocumentReader` + `conversationId` + `taskId` + `memo`），文档里没有直接给出"本轮运行对应的用户条目 ID"。一轮运行包含多个 generation 任务（每个模型回合一个），所以"本轮的第一次请求"要靠条目 ID 去重来识别。
+
+- [ ] **Step 1: 写测试**
+
+```ts
+it("identifies the user entry that started each run from beforeRequest", async () => {
+	// faux：run1 = toolUse(noop) → "ok1"（两次请求）；run2 = "ok2"（一次请求）
+	// 扩展 probe：hook(GenerationTask, { beforeRequest: async (_req, api, ctx) => {
+	//   从 api 能读到的内容里找出本对话最新的 pi.user 条目 ID（实现者查 DocumentReader 的方法），
+	//   push 到 seen 数组；返回 undefined（不改请求）
+	// }})
+	// 提交 run1 → wait；提交 run2 → wait
+	expect(seen).toHaveLength(3);
+	expect(seen[0]).toBe(seen[1]);       // 同一轮的两次请求指向同一个用户条目
+	expect(seen[2]).not.toBe(seen[0]);   // 新一轮指向新的用户条目
+	expect(seen[0]).toBe(run1UserEntryId); // 与 transcript 里 run1 的 pi.user 条目一致
+});
+
+it("writes tether entries that the model does or does not see", async () => {
+	// 运行前提交 { type: "write", entry: { kind: "tether.sandbox", data: { state: "running" } } }
+	// 再提交 { type: "write", entry: { kind: "tether.note", data: {...}, model: [{ role: "user", content: "工作区已重置" }] } }
+	// 然后提交一轮输入；在 beforeRequest 里记录 request.messages
+	// 断言：transcript 里两条 tether.* 条目都在，顺序与提交顺序一致；
+	//      messages 里包含 "工作区已重置"，不包含 tether.sandbox 的任何内容
+});
+```
+
+如果从 `HookApi` 读不到用户条目 ID，**不要改用别的钩子硬凑**：把能读到的内容记下来，第一个测试标记为 `it.fails`，在 findings 里写明，并给出备选方案（例如在 core 侧于 inbox 条目被放入时触发检查点），交给 M1 设计决定。`model` 字段的确切形状以 `pi-durable` 的类型为准，与上面的写法不同时按类型改。
+
+- [ ] **Step 2: 运行**
+
+Run: `npx vitest run spikes/m0/hooks.test.ts`
+Expected: 两个测试 PASS，或者第一个测试按上面的规则标记为已知失败并有记录。
+
+- [ ] **Step 3: 提交**
+
+```bash
+git add spikes/m0/hooks.test.ts
+git commit -m "test: 验证运行开始钩子能识别本轮用户条目，以及自定义条目的可见性"
+```
+
+---
+
+### Task 8: 结论与设计修订
 
 **Files:**
 - Create: `docs/m0-findings.md`
@@ -400,9 +455,10 @@ git commit -m "test: 验证 docker commit 检查点的恢复语义并测量耗�
 3. env 一致性测试结果（Task 3）：通过数 / 总数，失败用例逐条列出。
 4. pi-durable 端到端（Task 4）。
 5. 崩溃窗口与 epoch 隔离（Task 5）：三个时间点的观察结果；`command` 函数作为隔离插入点是否成立。
-6. 检查点（Task 6）：恢复语义；三档工作区的 commit 中位耗时。
-7. 阻塞点清单：没有就写"无"；有的话写明影响哪个里程碑。
-8. 对 M1 的输入：M1 计划需要知道的事实。
+6. 检查点（Task 6）：恢复语义；三档工作区的 commit 中位耗时和磁盘占用（`docker image inspect` 的层大小），据此确认 spec §8.3 的默认保留数 5 是否合适。
+7. 运行开始钩子与自定义条目（Task 7）：能否识别本轮用户条目；两种条目的可见性。
+8. 阻塞点清单：没有就写"无"；有的话写明影响哪个里程碑。
+9. 对 M1 的输入：M1 计划需要知道的事实。
 
 - [ ] **Step 2: 修订设计文档**
 
