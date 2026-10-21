@@ -114,12 +114,12 @@ packages/
 |---|---|---|---|
 | 创建 / 查找 / 销毁 | ✅ | ✅ | ✅ |
 | 停止 / 启动（保留文件系统） | `docker stop` / `start` | 暂停 / 恢复（含内存） | 暂停 / 恢复（含内存） |
-| 快照 | `docker commit`（仅文件系统） | ✅ `createSnapshot` | ✅ |
+| 快照 | 宿主工作区目录的 reflink 副本，不支持时 `rsync --link-dest`（仅 `/workspace`，见 ADR-006） | ✅ `createSnapshot` | ✅ |
 | 从快照创建 | ✅ | ✅ | ✅ |
 | 原地回滚 | ❌ | ❌（用"从快照创建新沙箱"代替） | ✅ `rollback` |
 | 分叉 | 用快照模拟 | 用快照模拟 | ✅ `fork` |
 
-第一阶段只实现 Docker 一列。Docker 的检查点只有文件系统（`kind: filesystem`），恢复或分叉后沙箱里原来在跑的进程都不存在，§8.3 的系统说明要写明这一点。
+第一阶段只实现 Docker 一列。Docker 的检查点只有文件系统（`kind: filesystem`），恢复或分叉后沙箱里原来在跑的进程都不存在，§8.3 的系统说明要写明这一点。工作区放在宿主机目录里挂载进容器，快照针对这个目录做，不用 `docker commit`：对同一个容器反复提交，每一层都包含容器创建以来的全部改动，空间会成倍重复（分析与业界做法见 `docs/adr/ADR-006`）。
 
 上表的 E2B 与 CubeSandbox 列来自它们的文档（E2B JS SDK v2.19、CubeSandbox v0.7 / `@cubesandbox/sdk` 0.7.3），接入这些后端时必须实测确认，以实测为准更新这张表。注意：CubeSandbox 的快照、回滚、分叉是它独有的扩展 API，不在 E2B 标准 SDK 里，所以 Cube 适配器使用 `@cubesandbox/sdk` 而不是 `e2b` 包。
 
@@ -405,7 +405,7 @@ WebSocket 连接建立后，服务端先发一个 `snapshot`（会话当前完�
 - `pi-durable` + Docker + `pi-env` daemon（`docker exec -i`）端到端跑通一次工具调用。
 - 在 Docker 后端上跑通 `registerEnvConformance()`。
 - 验证 `pi-env` 的 `Connection` 能否关闭自动重启或被包装（§8.2 的前提）。
-- 验证 `docker commit` + 从镜像创建容器能作为检查点用，记录耗时和磁盘占用。
+- 检查点三种做法的对比：`docker commit` 反复提交的实际层大小、宿主工作区目录的 reflink 副本、`rsync --link-dest`，记录耗时和磁盘占用，确认 ADR-006 的选择和默认保留数。
 - 验证 `pi-durable` 的钩子能在一轮运行的第一个模型请求之前回调，并拿到对齐用的条目 ID（§8.3）；验证自定义条目的模型可见 / 不可见两种写法（§4.4）。
 - 产出：一页结论，确认第一阶段的技术路径没有阻塞点。
 

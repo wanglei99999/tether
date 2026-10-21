@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 用最小的实验代码确认第一阶段的技术路径没有阻塞点：pi-env daemon 能在 Docker 容器里通过一致性测试，pi-durable 能驱动容器里的工具，服务端崩溃后的旧进程能被 epoch 隔离清理，`docker commit` 能当检查点用，pi-durable 的钩子和自定义条目能支撑 `perRun` 检查点与单一事件源。
+**Goal:** 用最小的实验代码确认第一阶段的技术路径没有阻塞点：pi-env daemon 能在 Docker 容器里通过一致性测试，pi-durable 能驱动容器里的工具，服务端崩溃后的旧进程能被 epoch 隔离清理，工作区挂载加 reflink（或 rsync 硬链接）的检查点比 `docker commit` 更省空间且语义正确，pi-durable 的钩子和自定义条目能支撑 `perRun` 检查点与单一事件源。
 
 **Architecture:** 所有代码放在 `spikes/m0/`，是可丢弃的实验代码，不是正式包的开头。每个实验写成一个 Vitest 测试文件，测试本身就是实验记录；最后把测得的结论写进 `docs/m0-findings.md`，并据此修订设计文档。
 
@@ -50,7 +50,8 @@ tether/
 │   ├── fence.ts                     Task 5  epoch 隔离原型
 │   ├── holder.ts                    Task 5  被 SIGKILL 的子进程脚本
 │   ├── orphan.test.ts               Task 5  崩溃后旧命令的存活实验 + 隔离验证
-│   ├── checkpoint.test.ts           Task 6  docker commit 检查点实验
+│   ├── checkpoint.ts                Task 6  工作区快照与恢复（reflink / rsync）
+│   ├── checkpoint.test.ts           Task 6  三种检查点做法的对比实验
 │   └── hooks.test.ts                Task 7  运行开始钩子与自定义条目
 └── docs/m0-findings.md              Task 8
 ```
@@ -127,7 +128,7 @@ git commit -m "chore: 初始化 M0 实验工具链，锁定 pi 1.3.0"
 - Produces（`spikes/m0/docker.ts`）：
   - `IMAGE = "tether-m0-sandbox:dev"`
   - `buildImage(): Promise<void>` —— 构建镜像；把 `packagedDaemon({ platform: "linux", arch: "x64" })` 复制进构建上下文。
-  - `startContainer(name: string, image?: string): Promise<string>` —— `docker run -d --name <name> <image> sleep infinity`，返回容器名。
+  - `startContainer(name: string, options?: { image?: string; workspace?: string }): Promise<string>` —— `docker run -d --name <name> [-v <workspace 的绝对路径>:/workspace] <image，默认 IMAGE> sleep infinity`，返回容器名。
   - `removeContainer(name: string): Promise<void>` —— `docker rm -f`，容器不存在时不报错。
   - `dockerExec(name: string, script: string): Promise<{ code: number; stdout: string }>` —— `docker exec <name> sh -c <script>`。
   - `daemonCommand(name: string, epoch: number): string[]` —— 返回 `["docker", "exec", "-i", name, "/opt/tether/launch.sh", String(epoch)]`。`Connection` 会在末尾追加 `serve --token <hex>`。
@@ -343,49 +344,74 @@ git commit -m "test: 观察崩溃后容器内旧命令的存活并验证 epoch �
 
 ---
 
-### Task 6: `docker commit` 作为检查点
+### Task 6: 检查点三种做法的对比
 
-对应 spec §4.2 Docker 列和 §8.3。
+对应 spec §4.2 Docker 列、§8.3 和 ADR-006。要回答三个问题：`docker commit` 反复提交是否真的重复存储；宿主工作区目录所在的文件系统支不支持 reflink；工作区快照的恢复语义是否正确，三种做法各占多少时间和空间。
 
 **Files:**
+- Create: `spikes/m0/checkpoint.ts`
 - Test: `spikes/m0/checkpoint.test.ts`
 
 **Interfaces:**
-- Consumes: Task 2 的辅助函数（`startContainer` 的第二个参数用于从快照镜像启动）。
+- Consumes: Task 2 的 `startContainer(name, { workspace })`、`dockerExec`、`removeContainer`。
+- Produces（`spikes/m0/checkpoint.ts`）：
+  - `WORKSPACES = ".tmp/m0-workspaces"`：宿主上存放工作区和快照的目录。
+  - `supportsReflink(dir: string): Promise<boolean>`：在 `dir` 里建一个小文件，执行 `cp --reflink=always`，成功返回 `true`。
+  - `snapshot(workspace: string, dest: string, previous: string | undefined, mode: "reflink" | "rsync"): Promise<void>`：`reflink` 模式执行 `cp -a --reflink=always <workspace>/. <dest>/`；`rsync` 模式执行 `rsync -a --delete [--link-dest=<previous>] <workspace>/ <dest>/`。
+  - `restore(snap: string, dest: string, mode: "reflink" | "rsync"): Promise<void>`：`reflink` 模式同样用 `cp -a --reflink=always`；`rsync` 模式用不带 `--link-dest` 的 `cp -a`，保证恢复出的工作区和快照不共享 inode。
 
 - [ ] **Step 1: 写测试**
 
 ```ts
-it("restores files but not processes from a committed image", async () => {
-	// 源容器 tether-m0-ckpt-src：写 /workspace/a.txt = "v1"，后台启动 "sleep 600 &"
-	// docker commit tether-m0-ckpt-src tether-m0-ckpt:1，记录耗时
-	// 从 tether-m0-ckpt:1 启动 tether-m0-ckpt-dst
-	expect((await dockerExec(dst, "cat /workspace/a.txt")).stdout).toBe("v1");
-	expect((await dockerExec(dst, "pgrep -f 'sleep 600'")).code).toBe(1);
-	// 源容器之后的修改不影响快照：
-	// 在 src 写 a.txt = "v2"，再从 tether-m0-ckpt:1 启动另一个容器，读到的仍是 "v1"
+it("records how docker commit layers grow on one container", async () => {
+	// 容器 tether-m0-ckpt-commit（不挂载工作区）：在 /data 写 50 MB 随机文件 big.bin，再写 1 MB 的 small.bin
+	// 提交 c1；原地改写 small.bin（1 MB）后提交 c2；再改写一次提交 c3
+	// 用 docker history --no-trunc --format '{{.Size}}' 取每个镜像最上面那一层的大小
+	// 写入 .tmp/checkpoint-commit-layers.json；不设断言，只记录
+	// 预期（ADR-006 的分析）：三层都约 51 MB；实测不同就记录实测
 });
 
-it("measures commit time against workspace size", async () => {
-	// 三档：空工作区、50MB、500MB（用 head -c <n> /dev/urandom 生成随机文件）
-	// 每档 docker commit 三次取中位数，写入 .tmp/checkpoint-timing.json
-	// 同时用 docker image inspect 记录每个快照镜像新增层的大小
+it("detects reflink support on the workspace filesystem", async () => {
+	// 记录 stat -f -c %T .tmp/m0-workspaces 的文件系统类型和 supportsReflink() 的结果，写入 .tmp/checkpoint-fs.json
+});
+
+it("restores files but not processes from a workspace snapshot", async () => {
+	// mode = supportsReflink(WORKSPACES) ? "reflink" : "rsync"
+	// 工作区 ws-src 挂载进容器 src：写 /workspace/a.txt = "v1"，后台启动 "sleep 600 &"
+	// snapshot(ws-src, snap-1, undefined, mode)；之后在 src 里把 a.txt 改成 "v2"
+	// restore(snap-1, ws-dst, mode)；容器 dst 挂载 ws-dst
+	expect((await dockerExec(dst, "cat /workspace/a.txt")).stdout).toBe("v1");
+	expect((await dockerExec(dst, "pgrep -f 'sleep 600'")).code).toBe(1);
+	// 恢复出的工作区与快照互不影响：在 dst 里把 a.txt 改成 "v3"，snap-1/a.txt 仍是 "v1"
+});
+
+it("measures time and space of the three approaches", async () => {
+	// 工作区三档：空、50 MB、500 MB（head -c <n> /dev/urandom 生成）
+	// 每档：对 docker commit、reflink（支持时）、rsync 各连续做 3 次快照，每两次之间改写 2 MB
+	// 记录每次快照的耗时，以及做快照前后 df --output=used 的差值；写入 .tmp/checkpoint-timing.json
 	// 不设断言阈值，只记录
 });
 ```
 
-`afterAll` 删除所有 `tether-m0-ckpt-*` 容器和 `tether-m0-ckpt:*` 镜像。
+`afterAll` 删除所有 `tether-m0-ckpt-*` 容器、`tether-m0-ckpt:*` 镜像和 `.tmp/m0-workspaces/`。
 
-- [ ] **Step 2: 运行**
+- [ ] **Step 2: 运行，确认失败**
 
 Run: `npx vitest run spikes/m0/checkpoint.test.ts`
-Expected: 第一个测试 PASS；第二个测试生成 `.tmp/checkpoint-timing.json`。
+Expected: FAIL，`checkpoint.ts` 尚不存在。
 
-- [ ] **Step 3: 提交**
+- [ ] **Step 3: 实现 `spikes/m0/checkpoint.ts`**
+
+- [ ] **Step 4: 运行**
+
+Run: `npx vitest run spikes/m0/checkpoint.test.ts`
+Expected: 恢复语义的测试 PASS；其余三个测试生成 `.tmp/checkpoint-commit-layers.json`、`.tmp/checkpoint-fs.json`、`.tmp/checkpoint-timing.json`。
+
+- [ ] **Step 5: 提交**
 
 ```bash
-git add spikes/m0/checkpoint.test.ts
-git commit -m "test: 验证 docker commit 检查点的恢复语义并测量耗时"
+git add spikes/m0/checkpoint.ts spikes/m0/checkpoint.test.ts
+git commit -m "test: 对比 docker commit、reflink、rsync 三种检查点的语义、耗时与空间"
 ```
 
 ---
@@ -458,7 +484,7 @@ git commit -m "test: 验证运行开始钩子能识别本轮用户条目，以�
 3. env 一致性测试结果（Task 3）：通过数 / 总数，失败用例逐条列出。
 4. pi-durable 端到端（Task 4）。
 5. 崩溃窗口与 epoch 隔离（Task 5）：三个时间点的观察结果；`command` 函数作为隔离插入点是否成立。
-6. 检查点（Task 6）：恢复语义；三档工作区的 commit 中位耗时和磁盘占用（`docker image inspect` 的层大小），据此确认 spec §8.3 的默认保留数 5 是否合适。
+6. 检查点（Task 6）：docker commit 反复提交的层大小是否如 ADR-006 所预期；工作区文件系统是否支持 reflink；恢复语义；三种做法在三档工作区上的耗时和空间。据此确认 ADR-006 的选择和 spec §8.3 的默认保留数 5，并更新 ADR-006 的状态。
 7. 运行开始钩子与自定义条目（Task 7）：能否识别本轮用户条目；两种条目的可见性。
 8. 阻塞点清单：没有就写"无"；有的话写明影响哪个里程碑。
 9. 对 M1 的输入：M1 计划需要知道的事实。
