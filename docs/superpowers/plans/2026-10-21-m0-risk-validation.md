@@ -23,7 +23,7 @@
 ## Review Focus
 
 1. **daemon 二进制与容器 libc 不匹配**：pi-env 的 linux-x64 二进制如果是动态链接 glibc，在 alpine 镜像里会直接起不来。镜像固定用 `debian:bookworm-slim`，Task 2 的测试断言 `connection.info()` 能返回 `os: "linux"`。
-2. **服务端崩溃后旧命令继续运行**：这是 spec §8.2 的核心问题。Task 5 用真实的 `SIGKILL` 杀掉持有连接的 Node 进程，然后在不同时间点检查容器里的旧命令是否还活着，不用模拟。
+2. **服务端崩溃后旧命令继续运行**：这是 spec §8.2 的核心问题。Task 5 用真实的 `SIGKILL`（管道关闭）和 `SIGSTOP`（连接卡住）作用于持有连接的 Node 进程，然后在不同时间点检查容器里的旧命令是否还活着，不用模拟。
 3. **隔离逻辑误杀新 daemon**：fence 只能杀 epoch 更小的 daemon。Task 5 的测试在 fence 之后断言新连接上的命令能正常完成。
 4. **容器被删除后的连接行为**：`docker exec` 指向不存在的容器时，`Connection` 应该返回 `lost` 错误，而不是挂起。Task 2 加一个测试覆盖。
 5. **检查点恢复后进程丢失**：spec §4.2 说 Docker 检查点只有文件系统。Task 6 的测试断言恢复后的容器里文件还在、原来的后台进程不在，把这个局限钉成事实。
@@ -42,7 +42,7 @@ tether/
 ├── spikes/m0/
 │   ├── toolchain.test.ts            Task 1  依赖可导入、daemon 二进制存在
 │   ├── sandbox.Dockerfile           Task 2  实验用沙箱镜像
-│   ├── launch.sh                    Task 2  daemon 启动包装：记录 epoch 与 PID，setsid
+│   ├── launch.sh                    Task 2  daemon 启动包装：记录 epoch 与 PID
 │   ├── docker.ts                    Task 2  容器辅助函数
 │   ├── connection.test.ts           Task 2  daemon 能在容器里跑起来
 │   ├── conformance.test.ts          Task 3  pi-durable 的 env 一致性测试
@@ -136,15 +136,16 @@ git commit -m "chore: 初始化 M0 实验工具链，锁定 pi 1.3.0"
 
 镜像基于 `debian:bookworm-slim`，安装 `bash coreutils procps git`，创建 `/workspace` 和 `/run/tether/daemons`，复制 daemon 到 `/opt/tether/pi-env`、`launch.sh` 到 `/opt/tether/launch.sh`（都 `chmod 755`），`WORKDIR /workspace`。
 
-`launch.sh` 的行为（`/bin/sh`）：第一个参数是 epoch，其余参数原样传给 daemon。让 daemon 成为一个新会话的首进程，它启动的所有命令都留在这个会话里，Task 5 的隔离就能按会话整体杀掉。记录文件 `/run/tether/daemons/<epoch>.<SID>` 必须在**新会话内部**写，写入的是新会话的 ID：
+`launch.sh` 的行为（`/bin/sh`）：第一个参数是 epoch，其余参数原样传给 daemon。写一个空的记录文件 `/run/tether/daemons/<epoch>.<PID>`，然后 `exec` 成 daemon（`exec` 保证 PID 不变）：
 
 ```sh
 #!/bin/sh
 epoch="$1"; shift
-exec setsid -w /bin/sh -c 'echo "$$" > "/run/tether/daemons/$0.$$"; exec /opt/tether/pi-env "$@"' "$epoch" "$@"
+: > "/run/tether/daemons/$epoch.$$"
+exec /opt/tether/pi-env "$@"
 ```
 
-两个容易踩的坑：`docker exec` 启动的 shell 是进程组首进程，`setsid` 在这种情况下会 fork，所以外层的 `$$` 不是 daemon 的 PID，只有内层 `sh -c` 里的 `$$` 才是会话 ID；必须加 `-w`，否则外层进程立刻退出，`docker exec` 会认为命令结束，连接随之断开。
+记录只用来观察和断言"当前是哪个 epoch"，隔离本身不依赖它（见 Task 5）。不要用 `setsid` 把 daemon 和命令圈进同一个会话：daemon 会给每个命令单独开会话（pi-env `docs/semantics.md`："Each command gets a new session"），按会话杀不到命令。
 
 - [ ] **Step 2: 写失败的测试 `spikes/m0/connection.test.ts`**
 
@@ -275,35 +276,37 @@ git commit -m "test: pi-durable 通过 RemoteExecutionEnv 在容器内执行工�
 **Interfaces:**
 - Consumes: Task 2 的辅助函数。
 - Produces（`spikes/m0/fence.ts`）：
-  - `fence(container: string, currentEpoch: number): Promise<{ killed: number[] }>` —— 读取 `/run/tether/daemons/` 下所有 epoch 小于 `currentEpoch` 的记录；对每个记录的 PID 用 `pkill -KILL -s <PID>` 杀掉整个会话（daemon 及其启动的全部命令），再删除记录文件；返回被杀的 daemon PID 列表。已经不存在的 PID 只删记录，不报错。
+  - `fence(container: string, currentEpoch: number): Promise<{ killed: number[] }>` —— 在容器里执行一段脚本：先用 `ps` 记下除 PID 1 和脚本自身以外的所有 PID（作为返回值），再执行 `kill -KILL -1`（杀掉除 PID 1 和调用者以外的所有进程，即旧 daemon 和它启动的全部命令），最后删除 `/run/tether/daemons/` 下 epoch 小于 `currentEpoch` 的记录。前提是一个容器同一时刻只有一条连接（spec §8.2）。
   - `fencedCommand(container: string, nextEpoch: () => number): () => Promise<string[]>` —— 给 `ConnectionOptions.command` 用的函数：每次被调用时取一个新 epoch，先 `fence(container, epoch)`，再返回 `daemonCommand(container, epoch)`。`Connection` 每次（重新）启动 daemon 都会调用它，这就是在不修改 `Connection` 的前提下插入隔离的地方。
 
 `holder.ts` 是一个独立脚本：参数为容器名和 epoch，建立 `Connection` + `RemoteExecutionEnv`，执行 `sleep 300; echo late > /workspace/late.txt`，在命令开始后向 stdout 打印一行 `started`，然后一直等待。
 
 - [ ] **Step 1: 写实验测试（先观察，不加隔离）**
 
+pi-env 的 daemon 在 stdin 结束时立即退出，在 30 秒收不到任何字节时也会退出（`docs/protocol.md` 的 Liveness 一节）。两种情况分开观察：holder 被杀（管道关闭）和 holder 被挂起（连接卡住但没断）。
+
 ```ts
-it("observes whether the old command survives a SIGKILL of its holder", async () => {
-	// spawn("node", ["--experimental-strip-types", "spikes/m0/holder.ts", "tether-m0-orphan", "1"])，等到 stdout 出现 "started"
-	// holder.kill("SIGKILL")
+it.each(["SIGKILL", "SIGSTOP"])("observes the old command after %s of its holder", async (signal) => {
+	// spawn("node", ["--experimental-strip-types", "spikes/m0/holder.ts", name, "1"])，等到 stdout 出现 "started"
+	// holder.kill(signal)
 	// 在 t = 1s、10s、40s 时：dockerExec(name, "pgrep -f 'sleep 300' || true")
-	// 把三个时间点的结果打印出来，并写入 .tmp/orphan-observation.json
-	// 断言：t=40s 时 sleep 已经不存在（预期 daemon 在 30 秒无心跳后自杀，见 pi-env docs/protocol.md）
+	// 把结果写入 .tmp/orphan-observation-<signal>.json；SIGSTOP 的用例结束时对 holder 发 SIGKILL 收尾
+	// 断言：t=40s 时 sleep 已经不存在
 });
 ```
 
-这个测试的主要产出是观察记录。如果 t=1s 时进程就已经不在（`docker exec` 客户端死掉后容器内的 daemon 立刻收到 EOF 退出），说明窗口比 spec 假设的小，findings 里要写明；如果 t=40s 时还在，断言失败，这是一个必须在 findings 里标红的结论。
+预期：`SIGKILL` 时 t=1s 就已不存在（`docker exec` 客户端随 holder 退出，daemon 读到 EOF）；`SIGSTOP` 时 t=1s、10s 还在，t=40s 不在。这只是预期，实测结果不同就记录实测，findings 里写明。t=40s 时还在属于必须标红的结论。
 
 - [ ] **Step 2: 运行并记录**
 
 Run: `npx vitest run spikes/m0/orphan.test.ts -t "observes"`
-Expected: 测试运行完成，`.tmp/orphan-observation.json` 记录三个时间点的结果。
+Expected: 两个用例运行完成，两份 `.tmp/orphan-observation-*.json` 记录三个时间点的结果。
 
 - [ ] **Step 3: 写隔离的失败测试**
 
 ```ts
 it("fences the previous epoch before the new daemon serves", async () => {
-	// 用 holder 以 epoch 1 启动 "sleep 300; echo late > /workspace/late.txt"，等 "started"，SIGKILL holder
+	// 用 holder 以 epoch 1 启动 "sleep 300; echo late > /workspace/late.txt"，等 "started"，SIGSTOP holder（连接卡住，旧 daemon 不会自己退出）
 	// 立刻（1 秒内）：
 	//   let epoch = 1;
 	//   const connection = new Connection({ command: fencedCommand(name, () => ++epoch) });
