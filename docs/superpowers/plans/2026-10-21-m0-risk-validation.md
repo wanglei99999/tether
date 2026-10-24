@@ -347,7 +347,7 @@ it("fences the previous epoch before the new daemon serves", async () => {
 });
 ```
 
-再加一个防护测试：`fence` 作用于一个以 `--pid=host` 启动的容器时必须抛错，并且宿主上一个事先启动的 `sleep 301` 仍然存活。
+再加一个防护测试：对以 `--pid=host` 启动的容器，`assertPidIsolated` 必须抛错。测试只调用检查函数，不对这个容器调用 `fence`：检查一旦有 bug，`kill -1` 会杀掉整台测试机的进程（2026-10-24 实现时调整）。`fence` 在容器内的脚本里也会在 kill 之前再检查一次 `/proc/1/comm`，作为第二道防线。
 
 - [ ] **Step 4: 运行，确认失败**
 
