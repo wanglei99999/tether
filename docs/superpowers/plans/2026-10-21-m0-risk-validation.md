@@ -2,11 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 用最小的实验代码确认第一阶段的技术路径没有阻塞点：pi-env daemon 能在 Docker 容器里通过一致性测试，pi-durable 能驱动容器里的工具，服务端崩溃后的旧进程能被 epoch 隔离清理，工作区挂载加 reflink（或 rsync 硬链接）的检查点比 `docker commit` 更省空间且语义正确，pi-durable 的钩子和自定义条目能支撑 `perRun` 检查点与单一事件源。
+**Goal:** 用最小的实验代码确认第一阶段的技术路径没有阻塞点：pi-env daemon 能在 Docker 容器里通过一致性测试，pi-durable 能驱动容器里的工具，服务端崩溃后的旧进程能被 epoch 隔离清理，工作区挂载加 reflink（ext4 上退回 rsync 硬链接或 overlay 分层）的检查点比 `docker commit` 更省空间且语义正确，pi-durable 的钩子和自定义条目能支撑 `perRun` 检查点与单一事件源。
 
 **Architecture:** 所有代码放在 `spikes/m0/`，是可丢弃的实验代码，不是正式包的开头。每个实验写成一个 Vitest 测试文件，测试本身就是实验记录；最后把测得的结论写进 `docs/m0-findings.md`，并据此修订设计文档。
 
-**Tech Stack:** Node ≥ 22.19（在 WSL Ubuntu-24.04 里运行）、TypeScript（Node 原生类型剥离，不编译）、Vitest、Docker 29（WSL 内）、`@earendil-works/pi-durable` / `pi-env` / `pi-ai` / `chord` 精确版本 1.3.0。
+**Tech Stack:** Node ≥ 22.19、TypeScript（Node 原生类型剥离，不编译）、Vitest、Docker CE（官方 apt 源）、`@earendil-works/pi-durable` / `pi-env` / `pi-ai` / `chord` 精确版本 1.3.0。全部运行在测试机 `tether-m0` 上。
+
+**运行环境:** 测试机 `tether-m0`（阿里云轻量，Ubuntu 24.04，x86_64，2 vCPU / 2 GiB，40 GiB ESSD，系统盘 ext4），用户已授权专门用于 Tether。代码在 Windows 的 worktree 里写、提交、推送到 GitHub 分支 `m0-server`；服务器上以用户 `tether` 在 `~/tether` 里 `git pull` 后运行测试。本机执行远程命令的形式：`ssh -n tether-m0 'sudo -iu tether bash -lc "cd ~/tether && <命令>"'`（Windows 的 OpenSSH 必须带 `-n`，否则等待 stdin 卡住）。
 
 **Spec:** `docs/superpowers/specs/2026-10-20-tether-design.md`（M0 定义在 §10，相关设计在 §4.3、§8.2、§8.3、§14）
 
@@ -14,10 +16,16 @@
 
 - pi 依赖锁定精确版本 `1.3.0`，不写 `^` 或 `~`（spec §12："锁定精确版本，升级是单独的提交"）。
 - Node 版本下限 `22.19.0`（pi 1.3.0 的 `engines.node`）。
-- 所有命令在 WSL `Ubuntu-24.04` 里执行，仓库路径为 `/mnt/d/Coding/GitCoding/idea/tether`。Windows 侧不运行 Node 或 Docker 命令。
+- Node 和 Docker 命令只在 `tether-m0` 上执行，Windows 侧只写代码和 git。不用 WSL。
 - 模型一律用 `pi-ai` 的 faux provider，不调用真实模型，不需要 API key。
 - 沙箱内 daemon 路径固定为 `/opt/tether/pi-env`，工作目录固定为 `/workspace`。
 - 测试创建的容器名前缀 `tether-m0-`，镜像名 `tether-m0-sandbox:dev`；每个测试文件在 `afterAll` 里删除自己创建的容器。
+- 防护措施（即使是专用机也保留，正式实现会沿用）：
+  1. 所有容器和由 `docker commit` 产生的镜像都带标签 `tether.m0=1`；清理只按名字前缀或这个标签删除，不用 `docker system prune` 之类的全局命令。
+  2. 容器一律带资源上限 `--cpus 1 --memory 512m --pids-limit 256`。
+  3. 容器不得使用 `--pid=host`；`fence` 执行 `kill -KILL -1` 之前先用 `docker inspect` 确认 `HostConfig.PidMode` 为空，并在容器内确认 `/proc/1/comm` 是容器自己的 init（`sleep`），任一不满足就抛错、不执行。
+  4. Task 6 开始前检查 `df` 剩余空间，系统盘不足 10 GiB 或 XFS 盘不足 6 GiB 时直接失败。
+  5. 不改 sshd 配置、防火墙，不开放端口。
 - 提交信息使用约定式提交格式，中文描述（与仓库已有提交一致）。
 
 ## Review Focus
@@ -27,6 +35,7 @@
 3. **隔离逻辑误杀新 daemon**：fence 只能杀 epoch 更小的 daemon。Task 5 的测试在 fence 之后断言新连接上的命令能正常完成。
 4. **容器被删除后的连接行为**：`docker exec` 指向不存在的容器时，`Connection` 应该返回 `lost` 错误，而不是挂起。Task 2 加一个测试覆盖。
 5. **检查点恢复后进程丢失**：spec §4.2 说 Docker 检查点只有文件系统。Task 6 的测试断言恢复后的容器里文件还在、原来的后台进程不在，把这个局限钉成事实。
+6. **overlay 分层的冻结层被旧进程写入**：overlay 做法在打快照时把当前可写层冻结成只读层、换一个新的可写层。容器里仍在运行、持有旧挂载的进程，可能继续写进已经冻结的那一层，快照就不再是快照。Task 6 专门测这种情况，结果决定 overlay 能不能作为 ext4 上的退路。
 
 ---
 
@@ -50,8 +59,8 @@ tether/
 │   ├── fence.ts                     Task 5  epoch 隔离原型
 │   ├── holder.ts                    Task 5  被 SIGKILL 的子进程脚本
 │   ├── orphan.test.ts               Task 5  崩溃后旧命令的存活实验 + 隔离验证
-│   ├── checkpoint.ts                Task 6  工作区快照与恢复（reflink / rsync）
-│   ├── checkpoint.test.ts           Task 6  三种检查点做法的对比实验
+│   ├── checkpoint.ts                Task 6  工作区快照与恢复（reflink / rsync / overlay）
+│   ├── checkpoint.test.ts           Task 6  四种检查点做法的对比实验
 │   └── hooks.test.ts                Task 7  运行开始钩子与自定义条目
 └── docs/m0-findings.md              Task 8
 ```
@@ -67,10 +76,23 @@ tether/
 **Interfaces:**
 - Produces: `npm test` 跑全部 spikes 测试；`npm run typecheck` 跑 `tsc --noEmit`。
 
-- [ ] **Step 1: 在 WSL 里准备 Node**
+- [ ] **Step 0: 准备测试机（以 root 执行，只做一次）**
 
-Run（WSL）：`curl -fsSL https://fnm.vercel.app/install | bash && source ~/.bashrc && fnm install 22 && fnm default 22 && node -v`
-Expected: 输出 `v22.x.y`，且 `x.y ≥ 19.0`。WSL 里当前没有 Node（已确认），`npm` 8.19.4 来自 Windows 互操作，不要用它。
+每一步执行前把命令告诉用户。
+
+1. 系统更新与基础工具：`apt-get update && apt-get install -y ca-certificates curl git rsync xfsprogs`。
+2. Docker CE：按 Docker 官方文档添加 apt 源，安装 `docker-ce docker-ce-cli containerd.io docker-buildx-plugin`。阿里云机器拉 Docker Hub 慢时，配置 `/etc/docker/daemon.json` 的 `registry-mirrors`，并在 findings 里记录。
+3. 2 GiB swap：`fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile`，写入 `/etc/fstab`。
+4. 用户：`useradd -m -s /bin/bash tether && usermod -aG docker tether`。sudoers 只放行挂载命令：`tether ALL=(root) NOPASSWD: /usr/bin/mount, /usr/bin/umount`（Task 6 的 overlay 需要）。
+5. XFS 测试盘：`fallocate -l 8G /var/lib/tether-xfs.img && mkfs.xfs -m reflink=1 /var/lib/tether-xfs.img && mkdir -p /data/tether-xfs && mount -o loop /var/lib/tether-xfs.img /data/tether-xfs && chown tether: /data/tether-xfs`，写入 `/etc/fstab`。
+6. 克隆仓库：`sudo -iu tether git clone -b m0-server https://github.com/wanglei99999/tether.git ~/tether`。
+
+Expected: `docker run --rm hello-world` 成功；`swapon --show` 有 `/swapfile`；`stat -f -c %T /data/tether-xfs` 输出 `xfs`。
+
+- [ ] **Step 1: 以 `tether` 用户准备 Node**
+
+Run: `curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash && . ~/.nvm/nvm.sh && nvm install 22 && node -v`
+Expected: 输出 `v22.x.y`，且 `x.y ≥ 19.0`。
 
 - [ ] **Step 2: 写配置文件**
 
@@ -100,7 +122,7 @@ describe("toolchain", () => {
 
 - [ ] **Step 4: 运行，确认失败**
 
-Run（WSL，仓库根目录）：`npx vitest run spikes/m0/toolchain.test.ts`
+Run（tether-m0，仓库根目录）：`npx vitest run spikes/m0/toolchain.test.ts`
 Expected: FAIL，原因是依赖尚未安装（`Cannot find package '@earendil-works/pi-env'`）。
 
 - [ ] **Step 5: 安装依赖并重跑**
@@ -128,7 +150,7 @@ git commit -m "chore: 初始化 M0 实验工具链，锁定 pi 1.3.0"
 - Produces（`spikes/m0/docker.ts`）：
   - `IMAGE = "tether-m0-sandbox:dev"`
   - `buildImage(): Promise<void>` —— 构建镜像；把 `packagedDaemon({ platform: "linux", arch: "x64" })` 复制进构建上下文。
-  - `startContainer(name: string, options?: { image?: string; workspace?: string }): Promise<string>` —— `docker run -d --name <name> [-v <workspace 的绝对路径>:/workspace] <image，默认 IMAGE> sleep infinity`，返回容器名。
+  - `startContainer(name: string, options?: { image?: string; workspace?: string; propagation?: "rslave" }): Promise<string>` —— `docker run -d --name <name> --label tether.m0=1 --cpus 1 --memory 512m --pids-limit 256 [-v <workspace 的绝对路径>:/workspace[:rslave]] <image，默认 IMAGE> sleep infinity`，返回容器名。`propagation` 只给 Task 6 的 overlay 做法用。
   - `removeContainer(name: string): Promise<void>` —— `docker rm -f`，容器不存在时不报错。
   - `dockerExec(name: string, script: string): Promise<{ code: number; stdout: string }>` —— `docker exec <name> sh -c <script>`。
   - `daemonCommand(name: string, epoch: number): string[]` —— 返回 `["docker", "exec", "-i", name, "/opt/tether/launch.sh", String(epoch)]`。`Connection` 会在末尾追加 `serve --token <hex>`。
@@ -277,7 +299,7 @@ git commit -m "test: pi-durable 通过 RemoteExecutionEnv 在容器内执行工�
 **Interfaces:**
 - Consumes: Task 2 的辅助函数。
 - Produces（`spikes/m0/fence.ts`）：
-  - `fence(container: string, currentEpoch: number): Promise<{ killed: number[] }>` —— 在容器里执行一段脚本：先用 `ps` 记下除 PID 1 和脚本自身以外的所有 PID（作为返回值），再执行 `kill -KILL -1`（杀掉除 PID 1 和调用者以外的所有进程，即旧 daemon 和它启动的全部命令），最后删除 `/run/tether/daemons/` 下 epoch 小于 `currentEpoch` 的记录。前提是一个容器同一时刻只有一条连接（spec §8.2）。
+  - `fence(container: string, currentEpoch: number): Promise<{ killed: number[] }>` —— 先做 Global Constraints 防护第 3 条的两项检查（`HostConfig.PidMode` 为空、容器内 `/proc/1/comm` 为 `sleep`），不满足就抛错。然后在容器里执行一段脚本：先用 `ps` 记下除 PID 1 和脚本自身以外的所有 PID（作为返回值），再执行 `kill -KILL -1`（杀掉除 PID 1 和调用者以外的所有进程，即旧 daemon 和它启动的全部命令），最后删除 `/run/tether/daemons/` 下 epoch 小于 `currentEpoch` 的记录。前提是一个容器同一时刻只有一条连接（spec §8.2）。
   - `fencedCommand(container: string, nextEpoch: () => number): () => Promise<string[]>` —— 给 `ConnectionOptions.command` 用的函数：每次被调用时取一个新 epoch，先 `fence(container, epoch)`，再返回 `daemonCommand(container, epoch)`。`Connection` 每次（重新）启动 daemon 都会调用它，这就是在不修改 `Connection` 的前提下插入隔离的地方。
 
 `holder.ts` 是一个独立脚本：参数为容器名和 epoch，建立 `Connection` + `RemoteExecutionEnv`，执行 `sleep 300; echo late > /workspace/late.txt`，在命令开始后向 stdout 打印一行 `started`，然后一直等待。
@@ -323,9 +345,11 @@ it("fences the previous epoch before the new daemon serves", async () => {
 });
 ```
 
+再加一个防护测试：`fence` 作用于一个以 `--pid=host` 启动的容器时必须抛错，并且宿主上一个事先启动的 `sleep 301` 仍然存活。
+
 - [ ] **Step 4: 运行，确认失败**
 
-Run: `npx vitest run spikes/m0/orphan.test.ts -t "fences"`
+Run: `npx vitest run spikes/m0/orphan.test.ts -t "fence"`
 Expected: FAIL，`fence.ts` 尚不存在。
 
 - [ ] **Step 5: 实现 `fence` 和 `fencedCommand`**
@@ -333,7 +357,7 @@ Expected: FAIL，`fence.ts` 尚不存在。
 - [ ] **Step 6: 运行，确认通过**
 
 Run: `npx vitest run spikes/m0/orphan.test.ts`
-Expected: 两个测试都 PASS。
+Expected: 全部测试 PASS。
 
 - [ ] **Step 7: 提交**
 
@@ -344,21 +368,29 @@ git commit -m "test: 观察崩溃后容器内旧命令的存活并验证 epoch �
 
 ---
 
-### Task 6: 检查点三种做法的对比
+### Task 6: 检查点四种做法的对比
 
-对应 spec §4.2 Docker 列、§8.3 和 ADR-006。要回答三个问题：`docker commit` 反复提交是否真的重复存储；宿主工作区目录所在的文件系统支不支持 reflink；工作区快照的恢复语义是否正确，三种做法各占多少时间和空间。
+对应 spec §4.2 Docker 列、§8.3 和 ADR-006。要回答四个问题：`docker commit` 反复提交是否真的重复存储；工作区快照的恢复语义是否正确；在 ext4 上 rsync 硬链接和 overlay 分层哪个更适合当退路；四种做法各占多少时间和空间。
+
+测试机系统盘是 ext4，不支持 reflink。reflink 做法在 Step 0 建的 XFS 测试盘 `/data/tether-xfs` 上测，其余三种在系统盘上测。XFS 盘是 loop 设备，底下还有一层 ext4，耗时会比真实 XFS 数据盘略高，findings 里注明。
 
 **Files:**
 - Create: `spikes/m0/checkpoint.ts`
 - Test: `spikes/m0/checkpoint.test.ts`
 
 **Interfaces:**
-- Consumes: Task 2 的 `startContainer(name, { workspace })`、`dockerExec`、`removeContainer`。
+- Consumes: Task 2 的 `startContainer(name, { workspace, propagation })`、`dockerExec`、`removeContainer`。
 - Produces（`spikes/m0/checkpoint.ts`）：
-  - `WORKSPACES = ".tmp/m0-workspaces"`：宿主上存放工作区和快照的目录。
+  - `EXT4_ROOT = ".tmp/m0-workspaces"`、`XFS_ROOT = "/data/tether-xfs/m0-workspaces"`：两种文件系统上存放工作区和快照的目录。
   - `supportsReflink(dir: string): Promise<boolean>`：在 `dir` 里建一个小文件，执行 `cp --reflink=always`，成功返回 `true`。
-  - `snapshot(workspace: string, dest: string, previous: string | undefined, mode: "reflink" | "rsync"): Promise<void>`：`reflink` 模式执行 `cp -a --reflink=always <workspace>/. <dest>/`；`rsync` 模式执行 `rsync -a --delete [--link-dest=<previous>] <workspace>/ <dest>/`。
-  - `restore(snap: string, dest: string, mode: "reflink" | "rsync"): Promise<void>`：`reflink` 模式同样用 `cp -a --reflink=always`；`rsync` 模式用不带 `--link-dest` 的 `cp -a`，保证恢复出的工作区和快照不共享 inode。
+  - 目录式快照（`mode: "reflink" | "rsync"`）：
+    - `snapshot(workspace, dest, previous, mode)`：`reflink` 执行 `cp -a --reflink=always <workspace>/. <dest>/`；`rsync` 执行 `rsync -a --delete [--link-dest=<previous>] <workspace>/ <dest>/`。
+    - `restore(snap, dest, mode)`：`reflink` 同样用 `cp -a --reflink=always`；`rsync` 用不带 `--link-dest` 的 `cp -a`，保证恢复出的工作区和快照不共享 inode。
+  - overlay 分层（工作区是宿主上的 overlay 挂载，目录 `<ws>/layers/<n>`、`<ws>/upper`、`<ws>/work`、挂载点 `<ws>/mnt`；`mount`/`umount` 通过 `sudo` 执行）：
+    - `overlayCreate(ws): Promise<void>`：建目录；把 `<ws>/mnt` bind 到自身并 `--make-shared`，再在上面挂 overlay（第一次没有只读层时用一个空的 `layers/0`）。
+    - `overlaySnapshot(ws): Promise<number>`：卸载 overlay，把 `upper` 改名为 `layers/<n>`（冻结），建新的空 `upper` 和 `work`，以 `lowerdir=layers/n:...:layers/0` 重新挂载；返回 `n`。
+    - `overlayRestore(ws, n, dest): Promise<void>`：在新目录 `dest` 上用 `lowerdir=<ws>/layers/n:...:0` 加一个新的空可写层挂载，不复制任何数据。
+    - `overlayDestroy(ws): Promise<void>`：卸载所有相关挂载并删除目录。
 
 - [ ] **Step 1: 写测试**
 
@@ -371,29 +403,46 @@ it("records how docker commit layers grow on one container", async () => {
 	// 预期（ADR-006 的分析）：三层都约 51 MB；实测不同就记录实测
 });
 
-it("detects reflink support on the workspace filesystem", async () => {
-	// 记录 stat -f -c %T .tmp/m0-workspaces 的文件系统类型和 supportsReflink() 的结果，写入 .tmp/checkpoint-fs.json
+it("detects reflink support on both filesystems", async () => {
+	// 对 EXT4_ROOT 和 XFS_ROOT 分别记录 stat -f -c %T 的类型和 supportsReflink() 的结果，写入 .tmp/checkpoint-fs.json
+	expect(await supportsReflink(XFS_ROOT)).toBe(true); // Step 0 的 XFS 盘没建好时在这里失败
 });
 
-it("restores files but not processes from a workspace snapshot", async () => {
-	// mode = supportsReflink(WORKSPACES) ? "reflink" : "rsync"
-	// 工作区 ws-src 挂载进容器 src：写 /workspace/a.txt = "v1"，后台启动 "sleep 600 &"
-	// snapshot(ws-src, snap-1, undefined, mode)；之后在 src 里把 a.txt 改成 "v2"
-	// restore(snap-1, ws-dst, mode)；容器 dst 挂载 ws-dst
+it.each([
+	["reflink", XFS_ROOT],
+	["rsync", EXT4_ROOT],
+	["overlay", EXT4_ROOT],
+])("restores files but not processes with %s", async (mode, root) => {
+	// 工作区 ws-src 挂载进容器 src（overlay 用 <ws>/mnt 并带 propagation: "rslave"）：
+	//   写 /workspace/a.txt = "v1"，后台启动 "sleep 600 &"
+	// 打快照 1；之后在 src 里把 a.txt 改成 "v2"
+	// 从快照 1 恢复到 ws-dst；容器 dst 挂载 ws-dst
 	expect((await dockerExec(dst, "cat /workspace/a.txt")).stdout).toBe("v1");
 	expect((await dockerExec(dst, "pgrep -f 'sleep 600'")).code).toBe(1);
-	// 恢复出的工作区与快照互不影响：在 dst 里把 a.txt 改成 "v3"，snap-1/a.txt 仍是 "v1"
+	// 恢复出的工作区与快照互不影响：在 dst 里把 a.txt 改成 "v3"，快照 1 里的 a.txt 仍是 "v1"
+	// overlay 额外断言：快照后 src 容器里 /workspace 看到的是重新挂载后的 overlay（写入 b.txt 后出现在新的 upper，不在 layers/1）
 });
 
-it("measures time and space of the three approaches", async () => {
-	// 工作区三档：空、50 MB、500 MB（head -c <n> /dev/urandom 生成）
-	// 每档：对 docker commit、reflink（支持时）、rsync 各连续做 3 次快照，每两次之间改写 2 MB
-	// 记录每次快照的耗时，以及做快照前后 df --output=used 的差值；写入 .tmp/checkpoint-timing.json
-	// 不设断言阈值，只记录
+it("checks whether a running process can write into a frozen overlay layer", async () => {
+	// 对应 Review Focus 6。容器 src 里后台启动：exec 3>/workspace/log.txt; while true; do echo x >&3; sleep 0.2; done
+	// overlaySnapshot(ws) 冻结 layers/1 后等 2 秒，记录 layers/1/log.txt 的大小前后是否变化
+	// 同时记录：卸载 overlay 是否因为文件被占用而失败（umount 报 busy 时改用 umount -l 并记录）
+	// 写入 .tmp/checkpoint-overlay-frozen.json；不设断言，只记录。
+	// 冻结层被写入，或者必须先停掉容器里的进程才能打快照，都要在 findings 里写明，并据此决定 overlay 能否当退路
+});
+
+it("measures time and space of the four approaches", async () => {
+	// 开始前检查剩余空间（Global Constraints 防护第 4 条）
+	// 工作区三档：空、50 MB、500 MB（head -c <n> /dev/urandom 生成 big.bin）
+	// 每档、每种做法（docker commit、reflink、rsync、overlay）各连续做 3 次快照，两次快照之间做两种改动之一，分两组记录：
+	//   组 A：新写一个 2 MB 的文件
+	//   组 B：在 big.bin 中间原地改写 2 MB（dd conv=notrunc），用来暴露文件粒度（rsync、overlay 要复制整个文件）和块粒度（reflink）的差别
+	// 记录每次快照的耗时、做快照前后 df --output=used 的差值；再各做一次恢复并记录耗时
+	// 写入 .tmp/checkpoint-timing.json；不设断言阈值，只记录
 });
 ```
 
-`afterAll` 删除所有 `tether-m0-ckpt-*` 容器、`tether-m0-ckpt:*` 镜像和 `.tmp/m0-workspaces/`。
+`afterAll` 先对所有 overlay 工作区调用 `overlayDestroy`，再删除所有带 `tether.m0=1` 标签的 `tether-m0-ckpt-*` 容器和 `tether-m0-ckpt:*` 镜像，最后删除 `EXT4_ROOT` 和 `XFS_ROOT`。
 
 - [ ] **Step 2: 运行，确认失败**
 
@@ -405,13 +454,13 @@ Expected: FAIL，`checkpoint.ts` 尚不存在。
 - [ ] **Step 4: 运行**
 
 Run: `npx vitest run spikes/m0/checkpoint.test.ts`
-Expected: 恢复语义的测试 PASS；其余三个测试生成 `.tmp/checkpoint-commit-layers.json`、`.tmp/checkpoint-fs.json`、`.tmp/checkpoint-timing.json`。
+Expected: reflink 检测和三种恢复语义的测试 PASS；其余测试生成 `.tmp/checkpoint-commit-layers.json`、`.tmp/checkpoint-fs.json`、`.tmp/checkpoint-overlay-frozen.json`、`.tmp/checkpoint-timing.json`。500 MB 一档在 2 GiB 内存的机器上可能较慢，超过 `testTimeout` 时只对这个用例放宽超时，不删减档位。
 
 - [ ] **Step 5: 提交**
 
 ```bash
 git add spikes/m0/checkpoint.ts spikes/m0/checkpoint.test.ts
-git commit -m "test: 对比 docker commit、reflink、rsync 三种检查点的语义、耗时与空间"
+git commit -m "test: 对比 docker commit、reflink、rsync、overlay 四种检查点的语义、耗时与空间"
 ```
 
 ---
@@ -479,12 +528,12 @@ git commit -m "test: 验证运行开始钩子能识别本轮用户条目，以�
 
 固定结构，每节写"结论 / 证据（测试名或 `.tmp` 文件里的数据）/ 对设计的影响"：
 
-1. 环境：Node 版本、Docker 版本、WSL 发行版、pi 版本。
+1. 环境：测试机规格（`tether-m0`，CPU、内存、磁盘类型）、内核版本、Node 版本、Docker 版本、pi 版本、XFS 测试盘是 loop 设备这一点。
 2. daemon 在容器内运行（Task 2）。
 3. env 一致性测试结果（Task 3）：通过数 / 总数，失败用例逐条列出。
 4. pi-durable 端到端（Task 4）。
 5. 崩溃窗口与 epoch 隔离（Task 5）：三个时间点的观察结果；`command` 函数作为隔离插入点是否成立。
-6. 检查点（Task 6）：docker commit 反复提交的层大小是否如 ADR-006 所预期；工作区文件系统是否支持 reflink；恢复语义；三种做法在三档工作区上的耗时和空间。据此确认 ADR-006 的选择和 spec §8.3 的默认保留数 5，并更新 ADR-006 的状态。
+6. 检查点（Task 6）：docker commit 反复提交的层大小是否如 ADR-006 所预期；三种工作区做法的恢复语义；overlay 冻结层会不会被运行中的进程写入；四种做法在三档工作区、两种改动方式下的耗时和空间。据此确认 ADR-006 的选择、ext4 上的退路用 rsync 还是 overlay、spec §8.3 的默认保留数 5，并更新 ADR-006 的状态。
 7. 运行开始钩子与自定义条目（Task 7）：能否识别本轮用户条目；两种条目的可见性。
 8. 阻塞点清单：没有就写"无"；有的话写明影响哪个里程碑。
 9. 对 M1 的输入：M1 计划需要知道的事实。
