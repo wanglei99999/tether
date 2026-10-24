@@ -1,0 +1,11 @@
+{
+	"name": "@tether/core",
+	"private": true,
+	"type": "module",
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"dependencies": {
+		"typebox": "1.3.27"
+	}
+}
