@@ -509,6 +509,8 @@ it("writes tether entries that the model does or does not see", async () => {
 });
 ```
 
+实现时的结果（2026-10-24）：`HookApi` 只能读文档（`snapshot`），读不到条目，generation 任务的输入为空。改为读 `LiveDoc`：`run.inputs[0]` 是触发本轮的提交 ID，同一轮内不变、新一轮更换；提交记录（`placed`/`done`）的 `entry` 就是本轮的 `pi.user` 条目。`LiveDoc.run.taskId` 是当前 generation 任务的 ID，每个模型回合都会变，不能当本轮标识。测试按这些事实断言。
+
 如果从 `HookApi` 读不到用户条目 ID，**不要改用别的钩子硬凑**：把能读到的内容记下来，第一个测试标记为 `it.fails`，在 findings 里写明，并给出备选方案（例如在 core 侧于 inbox 条目被放入时触发检查点），交给 M1 设计决定。`model` 字段的确切形状以 `pi-durable` 的类型为准，与上面的写法不同时按类型改。
 
 - [ ] **Step 2: 运行**
