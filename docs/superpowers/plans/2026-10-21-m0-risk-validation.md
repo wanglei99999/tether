@@ -446,6 +446,11 @@ it("measures time and space of the four approaches", async () => {
 
 `afterAll` 先对所有 overlay 工作区调用 `overlayDestroy`，再删除所有带 `tether.m0=1` 标签的 `tether-m0-ckpt-*` 容器和 `tether-m0-ckpt:*` 镜像，最后删除 `EXT4_ROOT` 和 `XFS_ROOT`。
 
+实现时的调整（2026-10-24）：
+- 写测试前先在测试机上手动探测了 overlay 的行为：父目录 shared + 容器端 `rslave` 能把宿主上的重新挂载传播进运行中的容器；有进程开着工作区文件时普通卸载报 busy，延迟卸载后冻结层继续被写入，内核日志报 `lowerdir is in-use as upperdir ... undefined behavior`。冻结层测试据此改为断言这一事实（"pins"），不只记录。
+- 三种工作区做法统一成 `spikes/m0/checkpoint-bench.ts` 里的 `Approach` 接口（create / snapshot / restore / discard / destroy），恢复语义测试和成本测量共用；docker commit 单独测量。
+- Task 6 的容器以宿主测试用户的 uid:gid 运行（`ContainerOptions.user`），否则工作区里的文件属于 root，测试用户无法复制和删除。overlay workdir 里内核建的 root 目录用一次性容器删除（`removeTree`）。
+
 - [ ] **Step 2: 运行，确认失败**
 
 Run: `npx vitest run spikes/m0/checkpoint.test.ts`

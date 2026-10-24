@@ -24,10 +24,14 @@ export interface CommandResult {
 
 export interface ContainerOptions {
 	image?: string;
-	/** 宿主上的工作区目录，挂载为容器的 /workspace。 */
+	/** 宿主上的工作区目录，默认挂载为容器的 /workspace。 */
 	workspace?: string;
+	/** 工作区在容器里的挂载点，默认 /workspace。 */
+	target?: string;
 	/** Task 6 的 overlay 做法需要让宿主上的重新挂载传播进容器。 */
 	propagation?: "rslave";
+	/** 以这个 uid:gid 运行容器；Task 6 用宿主测试用户的身份，让工作区文件不属于 root。 */
+	user?: string;
 }
 
 interface ExecFileError {
@@ -78,9 +82,10 @@ export async function buildImage(): Promise<void> {
 }
 
 export async function startContainer(name: string, options: ContainerOptions = {}): Promise<string> {
-	const mount = options.workspace
-		? ["--volume", `${resolve(options.workspace)}:/workspace${options.propagation ? `:${options.propagation}` : ""}`]
-		: [];
+	const target = options.target ?? "/workspace";
+	const propagation = options.propagation ? `:${options.propagation}` : "";
+	const mount = options.workspace ? ["--volume", `${resolve(options.workspace)}:${target}${propagation}`] : [];
+	const user = options.user ? ["--user", options.user] : [];
 	await dockerOrThrow([
 		"run",
 		"--detach",
@@ -89,6 +94,7 @@ export async function startContainer(name: string, options: ContainerOptions = {
 		"--label",
 		LABEL,
 		...LIMITS,
+		...user,
 		...mount,
 		options.image ?? IMAGE,
 		"sleep",
