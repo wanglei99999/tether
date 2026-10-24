@@ -18,6 +18,8 @@ export default defineConfig({
 					name: "docker",
 					include: ["packages/*/test/**/*.docker.test.ts"],
 					testTimeout: 120_000,
+					// 首次构建沙箱镜像要拉基础镜像、装包
+					hookTimeout: 600_000,
 					// 所有用例共用测试机上的同一个 Docker，顺序执行避免互相干扰
 					fileParallelism: false,
 				},
