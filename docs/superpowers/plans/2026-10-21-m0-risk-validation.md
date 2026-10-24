@@ -274,6 +274,8 @@ it("runs write and bash inside the container and persists across reopen", async 
 
 断言的值：`hello.txt` 内容为 `from tether`（11 字节，`write` 不追加换行），`size.txt` 为 `11\n`。如果 `write` 的实际行为与此不同，以实际行为为准修改期望值，并在 findings 里记一笔。
 
+第二个测试（2026-10-24 与用户确认后加入）：工具执行到一半时 harness 进程崩溃。Harness 放在子进程 `spikes/m0/crash-child.ts` 里，faux 让它调用 `bash: echo started >> runs.txt; sleep 5; echo x >> log.txt`；`runs.txt` 出现后对子进程发 `SIGKILL`；用同一个 SQLite 重新打开、用同一个 `requestId` 拿回提交并等待。断言：这次 `bash` 只有一条结果、是错误、内容含 "interrupted"；重开后模型只被调用一次（中断之后的那一轮）；`runs.txt` 只有一行（没有重跑）。旧命令有没有跑完只记录到 `.tmp/e2e-crash-observation.json`，留给 Task 5。辅助模块 `spikes/m0/harness.ts` 供两个测试和子进程共用。
+
 - [ ] **Step 2: 运行**
 
 Run: `npx vitest run spikes/m0/durable-e2e.test.ts`
