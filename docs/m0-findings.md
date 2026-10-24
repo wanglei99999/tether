@@ -76,9 +76,9 @@ docker commit 对同一个容器连续提交三次（50 MB 大文件加每次改
 | 做法 | 每次快照 | 恢复 | 3 次快照新增空间，新文件改动 | 3 次快照新增空间，原地改动 |
 |---|---|---|---|---|
 | reflink（XFS） | 7–9 ms | 5 ms | 4.0 MiB | 4.1 MiB |
-| rsync（ext4） | 第一次 2468 ms，之后 63–238 ms | 2165 ms | 508 MiB | 1500 MiB |
-| overlay 分层（ext4） | 43–49 ms | 57 ms | 4.0 MiB | 1000 MiB |
-| docker commit | 13–15 s | 337 ms | 3016 MiB | 3000 MiB |
+| rsync（ext4） | 新写文件：第一次 2468 ms，之后 63–238 ms；原地改动：每次 5.7–7.0 s | 2.2–5.4 s | 508 MiB | 1500 MiB |
+| overlay 分层（ext4） | 43–56 ms | 57–67 ms | 4.0 MiB | 1000 MiB |
+| docker commit | 13–16 s | 337–357 ms | 3016 MiB | 3000 MiB |
 
 0 MiB 和 50 MiB 两档的趋势相同：reflink 在三档上的快照耗时都在 5–9 ms，rsync 的第一次快照和恢复与工作区大小成正比。
 

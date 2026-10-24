@@ -52,9 +52,9 @@ M0 的 Task 6 要实测四种做法（docker commit 反复提交、reflink、rsy
 | 做法 | 每次快照 | 恢复 | 新增空间（新文件改动 / 大文件原地改动） |
 |---|---|---|---|
 | C：reflink（XFS） | 7–9 ms | 5 ms | 4.0 MiB / 4.1 MiB |
-| B：rsync（ext4） | 第一次 2468 ms，之后 63–238 ms | 2165 ms | 508 MiB / 1500 MiB |
-| E：overlay 分层（ext4） | 43–49 ms | 57 ms | 4.0 MiB / 1000 MiB |
-| A：docker commit | 13–15 s | 337 ms | 3016 MiB / 3000 MiB |
+| B：rsync（ext4） | 新写文件：第一次 2468 ms，之后 63–238 ms；原地改动：每次 5.7–7.0 s | 2.2–5.4 s | 508 MiB / 1500 MiB |
+| E：overlay 分层（ext4） | 43–56 ms | 57–67 ms | 4.0 MiB / 1000 MiB |
+| A：docker commit | 13–16 s | 337–357 ms | 3016 MiB / 3000 MiB |
 
 - A：同一容器连续提交三次，每层都是 53.5 MB，确认了重复存储；Docker 29 的 containerd 镜像存储下每次提交约占两倍层大小，比示意估算更贵。
 - C 的耗时与工作区大小无关（0、50、500 MiB 三档都在 5–9 ms），首选成立。
