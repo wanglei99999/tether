@@ -1,9 +1,20 @@
-import type { AgentEngine, EngineAgentConfig, ModelRef, TranscriptEntry } from "@tether/core";
+import {
+	type AgentEngine,
+	applyEvent,
+	type EngineAgentConfig,
+	type ModelRef,
+	type SessionView,
+	type TetherEvent,
+	type TranscriptEntry,
+} from "@tether/core";
 import type { ConformanceRunner } from "./app-store.ts";
 
 /** 与模型实现无关的剧本：每一步是模型的一次回答。 */
 export type ScriptStep = { text: string } | { toolCall: { name: string; args: unknown } };
 
+/**
+ * make 的实现要给会话提供一个能执行 shell 命令的环境：第二组用例让模型调用 bash（例如 sleep）。
+ */
 export interface MadeEngine {
 	engine: AgentEngine;
 	/** 剧本对应的模型，createSession 时用。 */
@@ -19,9 +30,67 @@ function config(model: ModelRef): EngineAgentConfig {
 	return { model, instructions: "Be brief.", tools: [], cwd: "/workspace" };
 }
 
+function bashConfig(model: ModelRef): EngineAgentConfig {
+	return { ...config(model), tools: ["bash"] };
+}
+
 function texts(entries: TranscriptEntry[]): string[] {
 	return entries.flatMap((entry) => (entry.text === undefined ? [] : [entry.text]));
 }
+
+const bash = (command: string): ScriptStep => ({ toolCall: { name: "bash", args: { command } } });
+
+interface Recorded {
+	events: TetherEvent[];
+	/** 等到某个事件出现，返回它。 */
+	until(predicate: (event: TetherEvent) => boolean, timeoutMs?: number): Promise<TetherEvent>;
+	stop(): Promise<void>;
+}
+
+/** 订阅并记下所有事件；提交之前订阅，事件就不会漏。 */
+async function record(engine: AgentEngine, sessionId: string): Promise<Recorded> {
+	const events: TetherEvent[] = [];
+	const waiters = new Set<() => void>();
+	const subscription = await engine.subscribe(sessionId, (batch) => {
+		events.push(...batch);
+		for (const wake of waiters) wake();
+	});
+	return {
+		events,
+		until(predicate, timeoutMs = 20_000) {
+			return new Promise((resolve, reject) => {
+				const check = () => {
+					const found = events.find(predicate);
+					if (!found) return;
+					waiters.delete(check);
+					clearTimeout(timer);
+					resolve(found);
+				};
+				const timer = setTimeout(() => {
+					waiters.delete(check);
+					reject(new Error(`event not seen within ${timeoutMs} ms; got ${events.map((e) => e.type).join(", ")}`));
+				}, timeoutMs);
+				waiters.add(check);
+				check();
+			});
+		},
+		stop: () => subscription.stop(),
+	};
+}
+
+function fold(events: TetherEvent[]): SessionView {
+	const [first, ...rest] = events;
+	if (first?.type !== "snapshot") throw new Error(`first event is ${first?.type}, not snapshot`);
+	return rest.reduce(applyEvent, first.view);
+}
+
+/** 整个记录，旧的在前，与 SessionView.entries 的顺序一致。 */
+async function fullTranscript(engine: AgentEngine, sessionId: string): Promise<TranscriptEntry[]> {
+	return [...(await engine.transcript(sessionId, { limit: 1000 })).items].reverse();
+}
+
+const runEndOf = (submissionId: string) => (event: TetherEvent) =>
+	event.type === "run_end" && event.submissionId === submissionId;
 
 /** 任何 AgentEngine 实现都要通过的用例。 */
 export function registerAgentEngineConformance(
@@ -153,6 +222,126 @@ export function registerAgentEngineConformance(
 
 				expect(requests()[0]).toContain("The sandbox was stopped while idle.");
 			});
+		});
+
+		it("delivers a snapshot first, then events whose application equals the final transcript", async () => {
+			await withEngine([bash("echo hi"), { text: "It printed hi." }], async ({ engine, model }) => {
+				const id = await engine.createSession(bashConfig(model));
+				const recorded = await record(engine, id);
+				try {
+					const { submissionId } = await engine.submit(id, { content: "run it", requestId: "r" });
+					await recorded.until(runEndOf(submissionId));
+
+					const view = fold(recorded.events);
+					const transcript = await fullTranscript(engine, id);
+					expect(view.entries.map((e) => e.id)).toEqual(transcript.map((e) => e.id));
+					expect(view.entries).toEqual(transcript);
+					expect(view).toMatchObject({ running: false, tools: [] });
+					expect(view.streaming).toBeUndefined();
+					expect(recorded.events.some((e) => e.type === "tool_start" && e.name === "bash")).toBe(true);
+				} finally {
+					await recorded.stop();
+				}
+			});
+		});
+
+		it("delivers to two subscribers independently", async () => {
+			await withEngine([{ text: "Hello both." }], async ({ engine, model }) => {
+				const id = await engine.createSession(config(model));
+				const first = await record(engine, id);
+				const second = await record(engine, id);
+				try {
+					const { submissionId } = await engine.submit(id, { content: "hi", requestId: "r" });
+					await first.until(runEndOf(submissionId));
+					await second.until(runEndOf(submissionId));
+
+					const transcript = await fullTranscript(engine, id);
+					expect(fold(first.events).entries).toEqual(transcript);
+					expect(fold(second.events).entries).toEqual(transcript);
+				} finally {
+					await first.stop();
+					await second.stop();
+				}
+			});
+		});
+
+		it("queues a follow-up while busy and answers it after the current run", async () => {
+			const script = [bash("sleep 1"), { text: "first done" }, { text: "second done" }];
+			await withEngine(script, async ({ engine, model }) => {
+				const id = await engine.createSession(bashConfig(model));
+				const recorded = await record(engine, id);
+				try {
+					const a = await engine.submit(id, { content: "first", requestId: "a" });
+					await recorded.until((e) => e.type === "tool_start");
+					const b = await engine.submit(id, { content: "second", requestId: "b", whenBusy: "followUp" });
+
+					expect((await engine.waitSubmission(a.submissionId)).answer?.text).toBe("first done");
+					expect((await engine.waitSubmission(b.submissionId)).answer?.text).toBe("second done");
+					const order = texts(await fullTranscript(engine, id));
+					expect(order.indexOf("second")).toBeGreaterThan(order.indexOf("first done"));
+				} finally {
+					await recorded.stop();
+				}
+			});
+		});
+
+		it("rejects with TetherError busy when whenBusy is reject", async () => {
+			await withEngine([bash("sleep 1"), { text: "done" }], async ({ engine, model }) => {
+				const id = await engine.createSession(bashConfig(model));
+				const recorded = await record(engine, id);
+				try {
+					const a = await engine.submit(id, { content: "first", requestId: "a" });
+					await recorded.until((e) => e.type === "tool_start");
+
+					await expect(
+						engine.submit(id, { content: "second", requestId: "b", whenBusy: "reject" }),
+					).rejects.toMatchObject({ name: "TetherError", code: "busy" });
+					await engine.waitSubmission(a.submissionId);
+				} finally {
+					await recorded.stop();
+				}
+			});
+		});
+
+		it("aborts a running tool and settles the submission as unanswered", async () => {
+			await withEngine([bash("sleep 30"), { text: "never" }], async ({ engine, model }) => {
+				const id = await engine.createSession(bashConfig(model));
+				const recorded = await record(engine, id);
+				try {
+					const started = Date.now();
+					const { submissionId } = await engine.submit(id, { content: "wait", requestId: "r" });
+					await recorded.until((e) => e.type === "tool_start");
+
+					await engine.abort(id);
+
+					expect((await engine.waitSubmission(submissionId)).status).toBe("unanswered");
+					expect(Date.now() - started).toBeLessThan(15_000);
+					const end = await recorded.until(runEndOf(submissionId));
+					expect(end).toMatchObject({ status: "aborted" });
+					expect(fold(recorded.events)).toMatchObject({ running: false, tools: [] });
+				} finally {
+					await recorded.stop();
+				}
+			});
+		});
+
+		it("continues an unfinished run after reopen", async () => {
+			const made = await make([bash("sleep 2"), { text: "too late" }]);
+			try {
+				const id = await made.engine.createSession(bashConfig(made.model));
+				const recorded = await record(made.engine, id);
+				const { submissionId } = await made.engine.submit(id, { content: "go", requestId: "r" });
+				await recorded.until((e) => e.type === "tool_start");
+				await recorded.stop();
+
+				const reopened = await made.reopen([{ text: "Recovered." }]);
+				reopened.resume();
+
+				const settled = await reopened.waitSubmission(submissionId);
+				expect(settled).toMatchObject({ status: "done", answer: { text: "Recovered." } });
+			} finally {
+				await made.close();
+			}
 		});
 
 		it("reports an unknown session", async () => {

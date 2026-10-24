@@ -3,18 +3,28 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Models } from "@earendil-works/pi-ai";
 import {
 	type Conversation,
+	ConversationBusy,
 	type ConversationId,
 	createRegistry,
 	type EntryId,
 	Harness,
 	type SubmissionId,
+	watchEvents,
 } from "@earendil-works/pi-durable";
 import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
-import { type AgentEngine, type EngineAgentConfig, TetherError, type TranscriptEntry } from "@tether/core";
+import {
+	type AgentEngine,
+	type EngineAgentConfig,
+	TetherError,
+	type TetherEvent,
+	type TranscriptEntry,
+} from "@tether/core";
+import { createEventTranslator } from "./events.ts";
 import { toTranscriptEntry } from "./transcript.ts";
 
+export { createEventTranslator, toTetherEvents } from "./events.ts";
 export { toTranscriptEntry } from "./transcript.ts";
 
 export interface PiEngineOptions {
@@ -89,16 +99,23 @@ export async function openPiEngine(options: PiEngineOptions): Promise<AgentEngin
 
 		async submit(engineSessionId, input) {
 			const conversation = await require(engineSessionId);
-			const submission = await conversation.submit(
-				{
-					type: "input",
-					content: input.content,
-					requestId: input.requestId,
-					...(input.whenBusy && { whenBusy: input.whenBusy }),
-				},
-				context,
-			);
-			return { submissionId: String(submission.id) };
+			try {
+				const submission = await conversation.submit(
+					{
+						type: "input",
+						content: input.content,
+						requestId: input.requestId,
+						...(input.whenBusy && { whenBusy: input.whenBusy }),
+					},
+					context,
+				);
+				return { submissionId: String(submission.id) };
+			} catch (error) {
+				if (error instanceof ConversationBusy) {
+					throw new TetherError("busy", `engine session ${engineSessionId} is running`);
+				}
+				throw error;
+			}
 		},
 
 		async waitSubmission(submissionId) {
@@ -152,8 +169,26 @@ export async function openPiEngine(options: PiEngineOptions): Promise<AgentEngin
 			);
 		},
 
-		async subscribe() {
-			throw new TetherError("internal", "subscribe is implemented in Task 8");
+		async subscribe(engineSessionId, listener) {
+			const conversation = await require(engineSessionId);
+			const stream = await watchEvents(harness, conversation.id, context);
+			const translate = createEventTranslator();
+			const deliver = (events: TetherEvent[]) => {
+				if (events.length === 0) return;
+				try {
+					listener(events);
+				} catch (error) {
+					// 一个订阅者出错不影响引擎和其他订阅者
+					options.onError?.(error);
+				}
+			};
+			deliver(translate([stream.snapshot]));
+			stream.start(async (events) => deliver(translate(events)));
+			return {
+				stop: async () => {
+					await stream.stop();
+				},
+			};
 		},
 
 		resume() {

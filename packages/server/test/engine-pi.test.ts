@@ -9,6 +9,7 @@ import {
 	fauxProvider,
 	fauxToolCall,
 } from "@earendil-works/pi-ai/providers/faux";
+import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import type { AgentEngine } from "@tether/core";
 import { type MadeEngine, registerAgentEngineConformance, type ScriptStep } from "@tether/testkit";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
@@ -16,6 +17,7 @@ import { openPiEngine } from "../src/adapters/engine-pi/index.ts";
 
 const MODEL = { provider: "faux", modelId: "faux-1" } as const;
 const root = mkdtempSync(join(tmpdir(), "tether-engine-"));
+const workdir = mkdtempSync(join(root, "work-"));
 let databases = 0;
 
 afterAll(() => {
@@ -48,7 +50,8 @@ async function make(script: ScriptStep[]): Promise<MadeEngine> {
 		faux.setResponses(toFaux(steps, requests));
 		const models = createModels();
 		models.setProvider(faux.provider);
-		return openPiEngine({ database, models, envFor: async () => undefined });
+		// 第二组用例让模型调用 bash；这里在本机临时目录里执行，不需要 Docker
+		return openPiEngine({ database, models, envFor: async () => new NodeExecutionEnv({ cwd: workdir }) });
 	}
 
 	let engine = await open(script);
