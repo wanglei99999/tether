@@ -123,9 +123,9 @@ packages/
 
 上表的 E2B 与 CubeSandbox 列来自它们的文档（E2B JS SDK v2.19、CubeSandbox v0.7 / `@cubesandbox/sdk` 0.7.3），接入这些后端时必须实测确认，以实测为准更新这张表。注意：CubeSandbox 的快照、回滚、分叉是它独有的扩展 API，不在 E2B 标准 SDK 里，所以 Cube 适配器使用 `@cubesandbox/sdk` 而不是 `e2b` 包。
 
-**ExecChannel**：沙箱内的文件与命令操作。对上实现 `TetherEnv`（结构同 `pi-durable` 的 `ExecutionEnv`：文件读写、目录、监听、`exec`），对下用 SandboxProvider 给的 daemon 命令建立连接。连接管理和 epoch 隔离（§8.2）都在这一层，与后端无关：以后加 E2B，只需实现生命周期和字节管道，隔离逻辑不用重写。第一阶段直接用 `pi-env` 的 `Connection` + `RemoteExecutionEnv` + Rust daemon。
+**ExecChannel**：沙箱内的文件与命令操作。对上实现 `TetherEnv`（文件读写、目录、`exec` 的最小子集，见下方说明），对下用 SandboxProvider 给的 daemon 命令建立连接。连接管理和 epoch 隔离（§8.2）都在这一层，与后端无关：以后加 E2B，只需实现生命周期和字节管道，隔离逻辑不用重写。第一阶段直接用 `pi-env` 的 `Connection` + `RemoteExecutionEnv` + Rust daemon。
 
-> 关于 `ExecutionEnv` 这个类型：第一阶段它来自 `pi-durable`。为了第二阶段替换引擎时不受影响，Tether 在 `core` 里复制一份结构相同的接口定义（`TetherEnv`），适配层做双向转换。复制而不是引用，是为了让 pi 的类型不出现在接口层。
+> 关于 `ExecutionEnv` 这个类型：第一阶段它来自 `pi-durable`。Tether 不复制它的全部方法，`core` 里的 `TetherEnv` 只声明 Tether 自己用得到的最小子集；内置工具继续用 pi 的 `ExecutionEnv`，由 `exec-pienv` 在同一个连接上提供，pi 的类型只出现在适配器和组装层。理由和代价见 `docs/adr/ADR-009`。
 
 ### 4.3 为什么执行层选"pi-env daemon + 字节管道"，而不是直接调 E2B 的文件/命令 API
 
