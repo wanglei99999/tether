@@ -26,7 +26,7 @@ export class SessionService {
 	 * 引擎失败时记录留着、engineSessionId 为 null，启动修复会找到它。
 	 */
 	async create(input: { agentId: string; agentVersion?: number; variables?: unknown }): Promise<SessionRecord> {
-		const { store, engine, agents, clock, ids } = this.#deps;
+		const { store, agents, clock, ids } = this.#deps;
 		const agent = await agents.get(input.agentId);
 		if (agent.archivedAt !== undefined) throw new TetherError("conflict", `agent ${agent.id} is archived`);
 		const version = await agents.getVersion(agent.id, input.agentVersion);
@@ -47,7 +47,13 @@ export class SessionService {
 			lastActiveAt: at,
 		};
 		await store.createSession(session);
+		return { ...session, engineSessionId: await this.attachEngine(session) };
+	}
 
+	/** 按会话固定的版本建引擎会话并回填 ID。create 和启动修复共用。 */
+	async attachEngine(session: SessionRecord): Promise<string> {
+		const { store, engine, agents } = this.#deps;
+		const version = await agents.getVersion(session.agentId, session.agentVersion);
 		let engineSessionId: string;
 		try {
 			const { model, instructions, tools } = version.spec;
@@ -58,7 +64,7 @@ export class SessionService {
 			});
 		}
 		await store.setEngineSessionId(session.id, engineSessionId);
-		return { ...session, engineSessionId };
+		return engineSessionId;
 	}
 
 	async get(id: string): Promise<SessionRecord> {
