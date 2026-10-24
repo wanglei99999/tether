@@ -1,0 +1,61 @@
+import { MemoryAppStore, sampleSpec } from "@tether/testkit";
+import { describe, expect, it } from "vitest";
+import { AgentService, BUILTIN_TOOLS } from "../src/index.ts";
+import { FakeClock, FakeIds } from "./fakes.ts";
+
+function service() {
+	const store = new MemoryAppStore();
+	return { store, agents: new AgentService({ store, clock: new FakeClock(), ids: new FakeIds(), catalog: BUILTIN_TOOLS }) };
+}
+
+describe("AgentService", () => {
+	it("creates an agent with version 1 and validates tools against the catalog", async () => {
+		const { store, agents } = service();
+
+		const { agent, version } = await agents.create({ name: "fixer", spec: sampleSpec() });
+
+		expect(agent).toMatchObject({ id: "agt_0001", ownerId: "local", name: "fixer", description: "" });
+		expect(version).toMatchObject({ agentId: agent.id, version: 1, spec: sampleSpec() });
+		expect(await store.getVersion(agent.id)).toEqual(version);
+		await expect(
+			agents.create({ name: "bad", spec: { ...sampleSpec(), tools: ["teleport"] } }),
+		).rejects.toMatchObject({ code: "invalid_request", message: expect.stringContaining("teleport") });
+	});
+
+	it("rejects an empty name", async () => {
+		const { agents } = service();
+		await expect(agents.create({ name: "", spec: sampleSpec() })).rejects.toMatchObject({ code: "invalid_request" });
+	});
+
+	it("adds versions 2 and 3 and returns the latest by default", async () => {
+		const { agents } = service();
+		const { agent } = await agents.create({ name: "fixer", spec: sampleSpec() });
+
+		await agents.addVersion(agent.id, sampleSpec("v2"));
+		const third = await agents.addVersion(agent.id, sampleSpec("v3"));
+
+		expect(third.version).toBe(3);
+		expect(await agents.getVersion(agent.id)).toEqual(third);
+		expect((await agents.getVersion(agent.id, 2)).spec.instructions).toBe("v2");
+	});
+
+	it("rejects a version for an archived agent with conflict", async () => {
+		const { agents } = service();
+		const { agent } = await agents.create({ name: "fixer", spec: sampleSpec() });
+		await agents.archive(agent.id);
+
+		expect((await agents.get(agent.id)).archivedAt).toBeDefined();
+		await expect(agents.addVersion(agent.id, sampleSpec())).rejects.toMatchObject({ code: "conflict" });
+	});
+
+	it("returns not_found for an unknown agent", async () => {
+		const { agents } = service();
+
+		await expect(agents.get("agt_missing")).rejects.toMatchObject({ code: "not_found" });
+		await expect(agents.getVersion("agt_missing")).rejects.toMatchObject({ code: "not_found" });
+		await expect(agents.addVersion("agt_missing", sampleSpec())).rejects.toMatchObject({ code: "not_found" });
+		await expect(agents.archive("agt_missing")).rejects.toMatchObject({ code: "not_found" });
+		const { agent } = await agents.create({ name: "fixer", spec: sampleSpec() });
+		await expect(agents.getVersion(agent.id, 7)).rejects.toMatchObject({ code: "not_found" });
+	});
+});
