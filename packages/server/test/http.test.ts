@@ -1,85 +1,25 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
+import type { SessionService, TetherEvent } from "@tether/core";
+import { MemoryAppStore, type ScriptStep } from "@tether/testkit";
+import { afterEach, describe, expect, it } from "vitest";
 import {
-	type AgentEngine,
-	AgentService,
-	type AppStore,
-	BUILTIN_TOOLS,
-	type Log,
-	SessionService,
-	type TetherEvent,
-} from "@tether/core";
-import { MemoryAppStore, type ScriptStep, sampleSpec } from "@tether/testkit";
-import type { Hono } from "hono";
-import { afterAll, afterEach, describe, expect, it } from "vitest";
-import { openPiEngine } from "../src/adapters/engine-pi/index.ts";
-import { createHttpApp } from "../src/http/routes.ts";
-import { createIds, systemClock } from "../src/ids.ts";
-import { FAUX_MODEL, fauxModels } from "./fixtures/faux.ts";
+	agentSpec as spec,
+	call,
+	newSession,
+	makeApi as openApi,
+	type TestApi,
+	type TestApiOptions,
+} from "./fixtures/api.ts";
 
-const root = mkdtempSync(join(tmpdir(), "tether-http-"));
-const workdir = mkdtempSync(join(root, "work-"));
-const engines: AgentEngine[] = [];
-let databases = 0;
+const opened: TestApi[] = [];
 
 afterEach(async () => {
-	for (const engine of engines.splice(0)) await engine.close();
+	for (const api of opened.splice(0)) await api.close();
 });
 
-afterAll(() => {
-	rmSync(root, { recursive: true, force: true });
-});
-
-interface Api {
-	app: Hono;
-	sessions: SessionService;
-	warnings: unknown[];
-}
-
-/** 真实的 pi 引擎 + faux 模型；bash 在本机临时目录里执行，不需要 Docker。 */
-async function makeApi(script: ScriptStep[], options: { token?: string; store?: AppStore } = {}): Promise<Api> {
-	const store = options.store ?? new MemoryAppStore();
-	const engine = await openPiEngine({
-		database: join(root, `engine-${databases++}.sqlite`),
-		models: fauxModels(script),
-		envFor: async () => new NodeExecutionEnv({ cwd: workdir }),
-	});
-	engines.push(engine);
-	const ids = createIds();
-	const agents = new AgentService({ store, clock: systemClock, ids, catalog: BUILTIN_TOOLS });
-	const sessions = new SessionService({ store, engine, agents, clock: systemClock, ids });
-	const warnings: unknown[] = [];
-	const log: Log = { warn: (message, detail) => warnings.push({ message, detail }) };
-	const app = createHttpApp({
-		agents,
-		sessions,
-		sandboxes: { status: (id) => store.getBinding(id) },
-		log,
-		...(options.token !== undefined && { token: options.token }),
-	});
-	return { app, sessions, warnings };
-}
-
-function spec(tools: string[] = []) {
-	return { ...sampleSpec(), model: FAUX_MODEL, tools };
-}
-
-async function call(app: Hono, method: string, path: string, body?: unknown, headers: Record<string, string> = {}) {
-	const init: RequestInit = { method, headers: { ...headers } };
-	if (body !== undefined) {
-		init.body = JSON.stringify(body);
-		(init.headers as Record<string, string>)["content-type"] = "application/json";
-	}
-	const response = await app.request(path, init);
-	return { status: response.status, body: (await response.json()) as { ok: boolean; data?: any; error?: any } };
-}
-
-async function newSession(app: Hono, tools: string[] = []): Promise<string> {
-	const created = await call(app, "POST", "/v1/agents", { name: "a", spec: spec(tools) });
-	const session = await call(app, "POST", "/v1/sessions", { agentId: created.body.data.agent.id });
-	return session.body.data.session.id;
+async function makeApi(script: ScriptStep[], options?: TestApiOptions): Promise<TestApi> {
+	const api = await openApi(script, options);
+	opened.push(api);
+	return api;
 }
 
 function waitFor(sessions: SessionService, id: string, match: (e: TetherEvent) => boolean) {

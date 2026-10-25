@@ -7,10 +7,12 @@ import {
 	type SessionStatus,
 	TetherError,
 } from "@tether/core";
+import { createNodeWebSocket, type NodeWebSocket } from "@hono/node-ws";
 import { type Context, Hono } from "hono";
 import { type TSchema, Type } from "typebox";
 import { bearerAuth } from "./auth.ts";
 import { fail, failFromError, ok } from "./envelope.ts";
+import { eventStream } from "./events.ts";
 
 export interface HttpDeps {
 	agents: AgentService;
@@ -143,16 +145,24 @@ function sessionRoutes(sessions: SessionService, sandboxes: HttpDeps["sandboxes"
 	return r;
 }
 
-/** `/v1` 下的全部路由，响应统一用 `{ ok, data }` / `{ ok, error }` 信封。 */
-export function createHttpApp(deps: HttpDeps): Hono {
+export interface HttpApp {
+	app: Hono;
+	/** 监听之后调用一次，把 WebSocket 升级挂到 Node 的 HTTP 服务器上。 */
+	injectWebSocket: NodeWebSocket["injectWebSocket"];
+}
+
+/** `/v1` 下的全部路由，响应统一用 `{ ok, data }` / `{ ok, error }` 信封；事件流走 WebSocket。 */
+export function createHttpApp(deps: HttpDeps): HttpApp {
 	const app = new Hono();
+	const { upgradeWebSocket, injectWebSocket } = createNodeWebSocket({ app });
 	if (deps.token !== undefined) app.use("*", bearerAuth(deps.token));
 
 	app.get("/v1/health", (c) => ok(c, { status: "ok" }));
+	app.get("/v1/sessions/:id/events", eventStream(deps, upgradeWebSocket));
 	app.route("/v1/agents", agentRoutes(deps.agents));
 	app.route("/v1/sessions", sessionRoutes(deps.sessions, deps.sandboxes));
 
 	app.notFound((c) => fail(c, "not_found", `no route for ${c.req.method} ${c.req.path}`));
 	app.onError((error, c) => failFromError(c, error, deps.log));
-	return app;
+	return { app, injectWebSocket };
 }

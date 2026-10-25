@@ -23,6 +23,7 @@ if (process.env.TETHER_FIXTURE_SEND) {
 	process.stdout.write(`submitted ${submissionId}\n`);
 }
 
-serve({ fetch: tether.app.fetch, hostname: config.host, port: config.port }, (info) => {
+const server = serve({ fetch: tether.app.fetch, hostname: config.host, port: config.port }, (info) => {
 	process.stdout.write(`listening ${info.port}\n`);
 });
+tether.injectWebSocket(server);

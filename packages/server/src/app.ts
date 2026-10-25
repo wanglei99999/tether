@@ -15,13 +15,12 @@ import {
 	SessionService,
 	WORKSPACE,
 } from "@tether/core";
-import type { Hono } from "hono";
 import { openPiEngine } from "./adapters/engine-pi/index.ts";
 import { createPiEnvExecChannel } from "./adapters/exec-pienv/index.ts";
 import { createDockerSandboxProvider } from "./adapters/sandbox-docker/index.ts";
 import { openSqliteAppStore } from "./adapters/store-sqlite/index.ts";
 import type { Config } from "./config.ts";
-import { createHttpApp } from "./http/routes.ts";
+import { createHttpApp, type HttpApp } from "./http/routes.ts";
 import { createIds, systemClock } from "./ids.ts";
 
 export interface TetherServices {
@@ -32,8 +31,7 @@ export interface TetherServices {
 	sandboxes: SandboxService;
 }
 
-export interface Tether {
-	app: Hono;
+export interface Tether extends HttpApp {
 	services: TetherServices;
 	close(): Promise<void>;
 }
@@ -122,7 +120,7 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 		throw error;
 	}
 
-	const app = createHttpApp({
+	const http = createHttpApp({
 		agents,
 		sessions,
 		sandboxes,
@@ -130,7 +128,7 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 		...(config.token !== undefined && { token: config.token }),
 	});
 	return {
-		app,
+		...http,
 		services: { store, engine: opened, agents, sessions, sandboxes },
 		close: async () => {
 			await opened.close();

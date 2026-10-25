@@ -16,6 +16,7 @@ const tether = await createTether(config);
 const server = serve({ fetch: tether.app.fetch, hostname: config.host, port: config.port }, (info) => {
 	process.stderr.write(`tether listening on http://${info.address}:${info.port}\n`);
 });
+tether.injectWebSocket(server);
 
 let closing = false;
 async function shutdown(): Promise<void> {
