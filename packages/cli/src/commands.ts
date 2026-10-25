@@ -175,29 +175,52 @@ function render(event: TetherEvent): string {
 /**
  * 先订阅再发消息，保证不漏掉这次运行的事件；收到这次提交的 run_end 后退出。
  * done 退出码 0；unanswered 和 aborted 退出码 1。
+ *
+ * 事件流断线期间结束的运行，重连后只能看到一个新快照，不会再有 run_end（spec §7.3）。
+ * 所以重连之后向服务端确认一次这次提交的结果：已经结束的立即返回，没结束的等它结束。
  */
 async function follow(client: TetherClient, sessionId: string, text: string, json: boolean, io: Io): Promise<number> {
 	return new Promise<number>((resolve, reject) => {
 		const ended = new Map<string, RunStatus>();
 		let submissionId: string | undefined;
-		let subscribed = false;
+		let snapshots = 0;
+		let finished = false;
 
 		const finish = (status: RunStatus) => {
+			if (finished) return;
+			finished = true;
 			stream.close();
 			resolve(status === "done" ? 0 : 1);
 		};
+		const fail = (error: unknown) => {
+			if (finished) return;
+			finished = true;
+			stream.close();
+			reject(error);
+		};
+		const confirm = (id: string) => {
+			client.sessions.waitSubmission(sessionId, id).then(
+				(settled) => finish(settled.status),
+				// 又断了：下一次重连再确认
+				(error: unknown) => (error instanceof TetherApiError && error.code === "network" ? undefined : fail(error)),
+			);
+		};
+		const send = () => {
+			client.sessions.send(sessionId, text).then((sent) => {
+				submissionId = sent.submissionId;
+				const status = ended.get(sent.submissionId);
+				if (status) finish(status);
+				else if (snapshots > 1) confirm(sent.submissionId);
+			}, fail);
+		};
+
 		const stream = client.follow(
 			sessionId,
 			(_view, event) => {
 				if (event.type === "snapshot") {
-					if (!subscribed) {
-						subscribed = true;
-						client.sessions.send(sessionId, text).then((sent) => {
-							submissionId = sent.submissionId;
-							const status = ended.get(sent.submissionId);
-							if (status) finish(status);
-						}, fail);
-					}
+					snapshots += 1;
+					if (snapshots === 1) send();
+					else if (submissionId !== undefined) confirm(submissionId);
 					return;
 				}
 				io.out(json ? `${JSON.stringify(event)}\n` : render(event));
@@ -207,10 +230,5 @@ async function follow(client: TetherClient, sessionId: string, text: string, jso
 			},
 			{ onError: fail },
 		);
-
-		function fail(error: unknown) {
-			stream.close();
-			reject(error);
-		}
 	});
 }

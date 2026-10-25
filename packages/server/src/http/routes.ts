@@ -130,6 +130,10 @@ function sessionRoutes(sessions: SessionService, sandboxes: HttpDeps["sandboxes"
 		const input = await body(c, SendMessageBody);
 		return ok(c, await sessions.sendMessage(c.req.param("id"), input), 202);
 	});
+	// 等这次提交结束才返回（已经结束的立即返回）：事件流断线期间结束的运行靠它补上结果
+	r.get("/:id/submissions/:submissionId", async (c) =>
+		ok(c, await sessions.waitSubmission(c.req.param("id"), c.req.param("submissionId"))),
+	);
 	r.post("/:id/abort", async (c) => {
 		await sessions.abort(c.req.param("id"));
 		return ok(c, {});

@@ -88,6 +88,12 @@ export class SessionService {
 		return result;
 	}
 
+	/** 等一次提交结束；已经结束的立即返回。客户端断线重连后用它确认错过的运行结果。 */
+	async waitSubmission(id: string, submissionId: string): ReturnType<AgentEngine["waitSubmission"]> {
+		await this.get(id);
+		return this.#deps.engine.waitSubmission(submissionId);
+	}
+
 	async abort(id: string): Promise<void> {
 		await this.#deps.engine.abort(this.#engineId(await this.get(id)));
 	}

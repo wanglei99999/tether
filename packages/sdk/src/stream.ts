@@ -55,10 +55,17 @@ export class SessionStream {
 	#connect(): void {
 		const socket = new WebSocket(this.#url);
 		this.#socket = socket;
+		let lost = false;
+		// 连接被拒绝时 Node 的 WebSocket 只发 error、不一定发 close：两个都当作断开，各取第一次。
+		// 只等 close 的话重连定时器不会安排，进程里没有别的事就直接退出了
+		const onLost = (code: number | undefined) => {
+			if (lost) return;
+			lost = true;
+			this.#onClose(code);
+		};
 		socket.addEventListener("message", (message) => this.#receive(String(message.data)));
-		socket.addEventListener("close", (event) => this.#onClose(event.code));
-		// 连接失败时随后一定有 close 事件，重连在那里安排
-		socket.addEventListener("error", () => {});
+		socket.addEventListener("close", (event) => onLost(event.code));
+		socket.addEventListener("error", () => onLost(undefined));
 	}
 
 	#receive(data: string): void {
@@ -70,10 +77,10 @@ export class SessionStream {
 		}
 	}
 
-	#onClose(code: number): void {
+	#onClose(code: number | undefined): void {
 		this.#socket = undefined;
 		if (this.#closed) return;
-		const fatal = FATAL_CLOSE[code];
+		const fatal = code === undefined ? undefined : FATAL_CLOSE[code];
 		if (fatal) {
 			this.#closed = true;
 			this.#options.onError?.(new TetherApiError(fatal.code, `event stream closed: ${fatal.code}`, fatal.status));

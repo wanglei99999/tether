@@ -112,6 +112,25 @@ describe("HTTP API", () => {
 		expect(users.map((e: { text: string }) => e.text)).toEqual(["a"]);
 	});
 
+	it("waits for a submission to settle and returns its status", async () => {
+		const { app } = await makeApi([{ text: "settled answer" }]);
+		const id = await newSession(app);
+		const sent = await call(app, "POST", `/v1/sessions/${id}/messages`, { content: "q", requestId: "r1" });
+		const submissionId = sent.body.data.submissionId;
+
+		const settled = await call(app, "GET", `/v1/sessions/${id}/submissions/${submissionId}`);
+		expect(settled.body).toMatchObject({
+			ok: true,
+			data: { status: "done", answer: { role: "assistant", text: "settled answer" } },
+		});
+		// 已经结束的提交立即返回同样的结果
+		const again = await call(app, "GET", `/v1/sessions/${id}/submissions/${submissionId}`);
+		expect(again.body.data.status).toBe("done");
+
+		expect((await call(app, "GET", `/v1/sessions/${id}/submissions/999999`)).status).toBe(404);
+		expect((await call(app, "GET", `/v1/sessions/ses_missing/submissions/${submissionId}`)).status).toBe(404);
+	});
+
 	it("returns 409 busy for whenBusy reject while a run is in progress", async () => {
 		const { app, sessions } = await makeApi([{ toolCall: { name: "bash", args: { command: "sleep 1" } } }, { text: "done" }]);
 		const id = await newSession(app, ["bash"]);

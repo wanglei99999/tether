@@ -3,6 +3,7 @@ import type {
 	AgentVersionRecord,
 	AgentVersionSpec,
 	ErrorCode,
+	RunStatus,
 	SandboxBinding,
 	SessionRecord,
 	SessionStatus,
@@ -79,6 +80,12 @@ export class TetherClient {
 		get: (id: string) =>
 			this.#request<{ session: SessionRecord; sandbox?: SandboxBinding }>("GET", `/v1/sessions/${enc(id)}`),
 		send: (id: string, content: string, options: SendOptions = {}) => this.#send(id, content, options),
+		/** 等一次提交结束（已经结束的立即返回）。 */
+		waitSubmission: (id: string, submissionId: string) =>
+			this.#request<{ status: RunStatus; answer?: TranscriptEntry }>(
+				"GET",
+				`/v1/sessions/${enc(id)}/submissions/${enc(submissionId)}`,
+			),
 		abort: async (id: string): Promise<void> => {
 			await this.#request<Record<string, never>>("POST", `/v1/sessions/${enc(id)}/abort`);
 		},
