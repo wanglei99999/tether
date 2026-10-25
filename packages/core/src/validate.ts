@@ -5,7 +5,7 @@ import { AgentVersionSpec } from "./model.ts";
 import type { ToolDescriptor } from "./tools.ts";
 
 /** 按 schema 校验，失败时把第一个出错的路径写进消息。 */
-function checkSchema(schema: TSchema, value: unknown, what: string): void {
+export function checkSchema(schema: TSchema, value: unknown, what: string): void {
 	if (Value.Check(schema, value)) return;
 	const [first] = Value.Errors(schema, value);
 	const path = first?.instancePath || "/";

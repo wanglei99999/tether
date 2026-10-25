@@ -15,12 +15,13 @@ import {
 	SessionService,
 	WORKSPACE,
 } from "@tether/core";
-import { Hono } from "hono";
+import type { Hono } from "hono";
 import { openPiEngine } from "./adapters/engine-pi/index.ts";
 import { createPiEnvExecChannel } from "./adapters/exec-pienv/index.ts";
 import { createDockerSandboxProvider } from "./adapters/sandbox-docker/index.ts";
 import { openSqliteAppStore } from "./adapters/store-sqlite/index.ts";
 import type { Config } from "./config.ts";
+import { createHttpApp } from "./http/routes.ts";
 import { createIds, systemClock } from "./ids.ts";
 
 export interface TetherServices {
@@ -121,7 +122,13 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 		throw error;
 	}
 
-	const app = new Hono();
+	const app = createHttpApp({
+		agents,
+		sessions,
+		sandboxes,
+		log,
+		...(config.token !== undefined && { token: config.token }),
+	});
 	return {
 		app,
 		services: { store, engine: opened, agents, sessions, sandboxes },
