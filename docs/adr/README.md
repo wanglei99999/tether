@@ -10,7 +10,7 @@
 | [ADR-002](ADR-002-harness-outside-sandbox.md) | harness 不进沙箱 | 已采纳 | 2026-10-20 |
 | [ADR-003](ADR-003-docker-as-phase1-sandbox.md) | 第一阶段的沙箱后端用 Docker | 已采纳 | 2026-10-20 |
 | [ADR-004](ADR-004-ports-and-adapters-five-packages.md) | 端口与适配器架构，五个包 | 已采纳 | 2026-10-21 |
-| [ADR-005](ADR-005-single-event-source.md) | 单一事件源，沙箱与检查点事件写进引擎日志 | 已采纳，待 M0 验证 | 2026-10-21 |
-| [ADR-006](ADR-006-checkpoint-workspace-mount-reflink.md) | 检查点用工作区挂载加 reflink，不用 docker commit | 已采纳，待 M0 验证 | 2026-10-21 |
-| [ADR-007](ADR-007-epoch-fencing.md) | 用 epoch 隔离清理崩溃后的旧进程 | 已采纳，待 M0 验证 | 2026-10-21 |
+| [ADR-005](ADR-005-single-event-source.md) | 单一事件源，沙箱与检查点事件写进引擎日志 | 已采纳（M0 已验证） | 2026-10-21 |
+| [ADR-006](ADR-006-checkpoint-workspace-mount-reflink.md) | 检查点用工作区挂载加 reflink，不用 docker commit | 已采纳（M0 已验证） | 2026-10-21 |
+| [ADR-007](ADR-007-epoch-fencing.md) | 用 epoch 隔离清理崩溃后的旧进程 | 已采纳（M0 已验证） | 2026-10-21 |
 | [ADR-008](ADR-008-idle-two-tiers.md) | 闲置分两档，停止容器时写说明 | 已采纳 | 2026-10-21 |
