@@ -1,0 +1,3 @@
+#!/usr/bin/env node
+// 入口是 TypeScript 源码，靠 Node 的 type stripping 直接运行（Node ≥ 22.19，见仓库 README）
+import("../src/main.ts");

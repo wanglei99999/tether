@@ -7,5 +7,5 @@
 		"allowImportingTsExtensions": true,
 		"skipLibCheck": true
 	},
-	"include": ["spikes"]
+	"include": ["packages/*/src", "packages/*/test", "spikes"]
 }

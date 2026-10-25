@@ -1,0 +1,126 @@
+import { execFile } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+import type { SandboxProvider } from "@tether/core";
+import { registerSandboxProviderConformance, sampleSandboxSpec } from "@tether/testkit";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { buildSandboxImage, createDockerSandboxProvider } from "../src/adapters/sandbox-docker/index.ts";
+
+const run = promisify(execFile);
+const IMAGE = "tether-sandbox:dev";
+const USER = `${process.getuid?.()}:${process.getgid?.()}`;
+
+async function docker(...args: string[]): Promise<string> {
+	return (await run("docker", args)).stdout.trim();
+}
+
+function inspect(sandboxId: string, format: string): Promise<string> {
+	return docker("inspect", "--format", format, sandboxId);
+}
+
+let counter = 0;
+const nextSessionId = () => `ses_t${process.pid}_${Date.now().toString(36)}_${counter++}`;
+
+beforeAll(async () => {
+	await buildSandboxImage(IMAGE);
+});
+
+/** 每个用例一个独立的工作区根目录，结束时销毁这次建过的所有沙箱。 */
+async function makeProvider() {
+	const workspaceRoot = mkdtempSync(join(tmpdir(), "tether-ws-"));
+	const provider = createDockerSandboxProvider({ workspaceRoot, user: USER, defaultImage: IMAGE });
+	const created: string[] = [];
+	const tracked: SandboxProvider = {
+		...provider,
+		create: async (input) => {
+			const result = await provider.create(input);
+			created.push(result.sandboxId);
+			return result;
+		},
+	};
+	return {
+		provider: tracked,
+		workspaceRoot,
+		sessionId: nextSessionId,
+		cleanup: async () => {
+			for (const sandboxId of created) await provider.destroy(sandboxId);
+			rmSync(workspaceRoot, { recursive: true, force: true });
+		},
+	};
+}
+
+registerSandboxProviderConformance({ describe, it, expect, beforeEach }, "docker", makeProvider);
+
+describe("docker sandbox specifics", () => {
+	let made: Awaited<ReturnType<typeof makeProvider>>;
+
+	beforeEach(async () => {
+		made = await makeProvider();
+		return () => made.cleanup();
+	});
+
+	afterAll(async () => {
+		// 兜底：用例中途失败时也不留下本进程建的容器
+		const names = await docker("ps", "-aq", "--filter", "label=tether.managed=1", "--filter", `name=tether-ses_t${process.pid}_`);
+		if (names) await run("docker", ["rm", "--force", ...names.split("\n")]);
+	});
+
+	it("runs the container as the given uid:gid with PID 1 sleep", async () => {
+		const { sandboxId } = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec() });
+
+		expect(await docker("exec", sandboxId, "sh", "-c", "echo $(id -u):$(id -g)")).toBe(USER);
+		expect(await docker("exec", sandboxId, "cat", "/proc/1/comm")).toBe("sleep");
+	});
+
+	it("applies cpu, memory and network none", async () => {
+		const { sandboxId } = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec() });
+
+		expect(await inspect(sandboxId, "{{.HostConfig.NanoCpus}}")).toBe("1000000000");
+		expect(await inspect(sandboxId, "{{.HostConfig.Memory}}")).toBe(String(512 * 1024 * 1024));
+		expect(await inspect(sandboxId, "{{.HostConfig.NetworkMode}}")).toBe("none");
+	});
+
+	it("uses bridge networking for egress", async () => {
+		const { sandboxId } = await made.provider.create({
+			sessionId: made.sessionId(),
+			spec: sampleSandboxSpec({ network: "egress" }),
+		});
+
+		expect(await inspect(sandboxId, "{{.HostConfig.NetworkMode}}")).toBe("bridge");
+	});
+
+	it("mounts <workspaceRoot>/<sessionId> at /workspace", async () => {
+		const sessionId = made.sessionId();
+		const { sandboxId } = await made.provider.create({ sessionId, spec: sampleSandboxSpec() });
+
+		await docker("exec", sandboxId, "sh", "-c", "echo hello > /workspace/probe.txt");
+
+		expect(existsSync(join(made.workspaceRoot, sessionId, "probe.txt"))).toBe(true);
+	});
+
+	it("removes the workspace directory on destroy", async () => {
+		const sessionId = made.sessionId();
+		const { sandboxId } = await made.provider.create({ sessionId, spec: sampleSandboxSpec() });
+		await docker("exec", sandboxId, "sh", "-c", "mkdir -p /workspace/a/b && echo x > /workspace/a/b/c");
+
+		await made.provider.destroy(sandboxId);
+
+		expect(existsSync(join(made.workspaceRoot, sessionId))).toBe(false);
+	});
+
+	it("labels containers tether.managed=1 and tether.session=<id>", async () => {
+		const sessionId = made.sessionId();
+		const { sandboxId } = await made.provider.create({ sessionId, spec: sampleSandboxSpec() });
+
+		expect(await inspect(sandboxId, '{{index .Config.Labels "tether.managed"}}')).toBe("1");
+		expect(await inspect(sandboxId, '{{index .Config.Labels "tether.session"}}')).toBe(sessionId);
+	});
+
+	it("rejects a session id that is not a plain name", async () => {
+		await expect(
+			made.provider.create({ sessionId: "../escape", spec: sampleSandboxSpec() }),
+		).rejects.toMatchObject({ code: "invalid_request" });
+	});
+});
