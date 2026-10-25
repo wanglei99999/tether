@@ -33,7 +33,7 @@ afterAll(async () => {
 });
 
 /** 真实的 Docker 与 pi-env，只有存储用内存实现。 */
-async function sessionWith(setup: string[], variables: Record<string, string>) {
+async function sessionWith(setup: string[], variables: Record<string, string>, setupTimeoutMs?: number) {
 	const store = new MemoryAppStore();
 	const spec = sampleSpec();
 	spec.sandbox = { ...spec.sandbox, setup, variables: Object.keys(variables) };
@@ -47,6 +47,7 @@ async function sessionWith(setup: string[], variables: Record<string, string>) {
 		exec,
 		clock: { now: () => new Date().toISOString() },
 		record: async () => {},
+		...(setupTimeoutMs !== undefined && { setupTimeoutMs }),
 	});
 	return { store, sandboxes, sessionId, workspace: join(workspaceRoot, sessionId) };
 }
@@ -74,6 +75,20 @@ describe("SandboxService on docker", () => {
 		expect((error as Error).message).toContain("boom");
 		expect(await store.getBinding(sessionId)).toBeUndefined();
 		expect(existsSync(workspace)).toBe(false);
+		const { stdout } = await run("docker", ["ps", "-aq", "--filter", `name=tether-${sessionId}`]);
+		expect(stdout.trim()).toBe("");
+	});
+
+	it("fails a setup command that never exits once the timeout passes", async () => {
+		const { store, sandboxes, sessionId } = await sessionWith(["echo cloning; sleep 300"], {}, 1_500);
+		const started = Date.now();
+
+		const error = await sandboxes.ensureSandbox(sessionId).catch((e: unknown) => e);
+
+		expect(Date.now() - started).toBeLessThan(30_000);
+		expect(error).toMatchObject({ code: "sandbox_failed" });
+		expect((error as Error).message).toContain("echo cloning; sleep 300");
+		expect(await store.getBinding(sessionId)).toBeUndefined();
 		const { stdout } = await run("docker", ["ps", "-aq", "--filter", `name=tether-${sessionId}`]);
 		expect(stdout.trim()).toBe("");
 	});

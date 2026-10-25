@@ -113,13 +113,15 @@ export interface ExecCall {
 	cwd: string;
 	command: string;
 	env?: Record<string, string>;
+	timeoutMs?: number;
 }
 
-/** exec 按命令返回脚本里的结果，没写的返回成功；记录每次调用。 */
+/** exec 按命令返回脚本里的结果，没写的返回成功；failures 里的命令直接抛错（例如超时）；记录每次调用。 */
 export class FakeExecChannel implements ExecChannel {
 	readonly calls: ExecCall[] = [];
 	readonly closed: string[] = [];
 	results = new Map<string, ExecResult>();
+	failures = new Map<string, Error>();
 
 	env(binding: SandboxBinding, options: { cwd: string }): TetherEnv {
 		const unused = async (): Promise<never> => {
@@ -137,7 +139,10 @@ export class FakeExecChannel implements ExecChannel {
 					cwd: options.cwd,
 					command,
 					...(execOptions?.env && { env: execOptions.env }),
+					...(execOptions?.timeoutMs !== undefined && { timeoutMs: execOptions.timeoutMs }),
 				});
+				const failure = this.failures.get(command);
+				if (failure) throw failure;
 				return this.results.get(command) ?? { exitCode: 0, stdout: "", stderr: "" };
 			},
 		};

@@ -5,7 +5,7 @@ import { FakeClock, FakeExecChannel, FakeProvider } from "./fakes.ts";
 
 type Recorded = { sessionId: string; state: SandboxBinding["state"]; reason?: string };
 
-async function setUp(setup: string[] = [], variables: Record<string, string> = {}) {
+async function setUp(setup: string[] = [], variables: Record<string, string> = {}, setupTimeoutMs?: number) {
 	const store = new MemoryAppStore();
 	const spec = sampleSpec();
 	spec.sandbox.setup = setup;
@@ -23,6 +23,7 @@ async function setUp(setup: string[] = [], variables: Record<string, string> = {
 		record: async (sessionId, data) => {
 			recorded.push({ sessionId, ...data });
 		},
+		...(setupTimeoutMs !== undefined && { setupTimeoutMs }),
 	});
 	return { store, provider, exec, recorded, sandboxes };
 }
@@ -37,11 +38,30 @@ describe("SandboxService.ensureSandbox", () => {
 		expect(binding).toMatchObject({ sessionId: "ses_1", provider: "docker", epoch: 1, state: "running", template: "" });
 		expect(provider.calls).toEqual(["create"]);
 		expect(exec.calls).toEqual([
-			{ sandboxId: binding.sandboxId, cwd: "/workspace", command: 'git clone "$REPO_URL" .', env: variables },
-			{ sandboxId: binding.sandboxId, cwd: "/workspace", command: "npm ci", env: variables },
+			{ sandboxId: binding.sandboxId, cwd: "/workspace", command: 'git clone "$REPO_URL" .', env: variables, timeoutMs: 600_000 },
+			{ sandboxId: binding.sandboxId, cwd: "/workspace", command: "npm ci", env: variables, timeoutMs: 600_000 },
 		]);
 		expect(await store.getBinding("ses_1")).toEqual(binding);
 		expect(await sandboxes.status("ses_1")).toEqual(binding);
+	});
+
+	it("bounds every setup command with the configured timeout", async () => {
+		const { exec, sandboxes } = await setUp(["a", "b"], {}, 1_500);
+		await sandboxes.ensureSandbox("ses_1");
+		expect(exec.calls.map((call) => call.timeoutMs)).toEqual([1_500, 1_500]);
+	});
+
+	it("names the setup command when running it fails, and cleans up as for a non-zero exit", async () => {
+		const { store, provider, exec, sandboxes } = await setUp(["git clone https://dead.example/r.git ."]);
+		exec.failures.set("git clone https://dead.example/r.git .", new Error("exec failed (timeout): timed out after 600 s"));
+
+		const error = await sandboxes.ensureSandbox("ses_1").catch((e: unknown) => e);
+
+		expect(error).toMatchObject({ code: "sandbox_failed" });
+		expect((error as Error).message).toContain("`git clone https://dead.example/r.git .`");
+		expect((error as Error).message).toContain("timed out");
+		expect(provider.calls).toEqual(["create", "destroy"]);
+		expect(await store.getBinding("ses_1")).toBeUndefined();
 	});
 
 	it("creates only one sandbox for concurrent ensureSandbox calls on a new session", async () => {

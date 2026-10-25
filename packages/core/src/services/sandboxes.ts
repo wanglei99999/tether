@@ -12,9 +12,12 @@ export interface SandboxServiceDeps {
 	clock: Clock;
 	/** 写一条 tether.sandbox 条目进会话记录（设计文档 §4.4），由组装层接到引擎的 appendEntry。 */
 	record: SandboxRecord;
+	/** 每条 setup 命令的上限。不设上限的话，一条不退出的命令（连不上的 git clone）会让会话一直等下去。 */
+	setupTimeoutMs?: number;
 }
 
 export const WORKSPACE = "/workspace";
+export const DEFAULT_SETUP_TIMEOUT_MS = 10 * 60 * 1000;
 /** M1 不做重连隔离，epoch 固定为 1（M2 实现 ADR-007）。 */
 const EPOCH = 1;
 /** setup 失败时错误消息里保留的输出长度。 */
@@ -103,11 +106,15 @@ export class SandboxService {
 		};
 		await store.putBinding(creating);
 
+		const timeoutMs = this.#deps.setupTimeoutMs ?? DEFAULT_SETUP_TIMEOUT_MS;
 		try {
 			const env = exec.env(creating, { cwd: WORKSPACE });
 			for (const command of spec.setup) {
 				// 变量只经环境变量传入，命令原样执行（设计文档 §5.1）
-				const result = await env.exec(command, { env: session.variables });
+				const result = await env.exec(command, { env: session.variables, timeoutMs }).catch((error: unknown) => {
+					const reason = error instanceof Error ? error.message : String(error);
+					throw new TetherError("sandbox_failed", `sandbox setup failed: \`${command}\`: ${reason}`, { command });
+				});
 				if (result.exitCode !== 0) throw setupFailure(command, result);
 			}
 		} catch (error) {

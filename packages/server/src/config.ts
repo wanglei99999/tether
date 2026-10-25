@@ -10,6 +10,17 @@ export interface Config {
 	token?: string;
 	workspaceRoot: string;
 	sandboxImage: string;
+	/** 每条 setup 命令的上限（TETHER_SETUP_TIMEOUT_SECONDS，默认 600 秒）。 */
+	setupTimeoutMs: number;
+}
+
+function setupTimeoutMs(raw: string | undefined): number {
+	if (raw === undefined) return 600_000;
+	const seconds = Number(raw);
+	if (!Number.isFinite(seconds) || seconds <= 0) {
+		throw new TetherError("invalid_request", `TETHER_SETUP_TIMEOUT_SECONDS must be a positive number, got ${raw}`);
+	}
+	return Math.round(seconds * 1000);
 }
 
 /** 空字符串和未设置同样处理：`TETHER_DATA_DIR=` 不应该把数据写进当前目录。 */
@@ -33,5 +44,6 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
 		...(token !== undefined && { token }),
 		workspaceRoot: resolve(dataDir, "workspaces"),
 		sandboxImage: setting(env, "TETHER_SANDBOX_IMAGE") ?? "tether-sandbox:dev",
+		setupTimeoutMs: setupTimeoutMs(setting(env, "TETHER_SETUP_TIMEOUT_SECONDS")),
 	};
 }

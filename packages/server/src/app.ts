@@ -85,6 +85,7 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 		provider,
 		exec,
 		clock: systemClock,
+		setupTimeoutMs: config.setupTimeoutMs,
 		record: async (sessionId, data) => {
 			const session = await store.getSession(sessionId);
 			if (engine && session?.engineSessionId) {

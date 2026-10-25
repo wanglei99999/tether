@@ -10,6 +10,7 @@ describe("loadConfig", () => {
 			port: 7420,
 			workspaceRoot: resolve("./data/workspaces"),
 			sandboxImage: "tether-sandbox:dev",
+			setupTimeoutMs: 600_000,
 		});
 	});
 
@@ -20,6 +21,7 @@ describe("loadConfig", () => {
 			TETHER_PORT: "8080",
 			TETHER_TOKEN: "secret",
 			TETHER_SANDBOX_IMAGE: "custom:1",
+			TETHER_SETUP_TIMEOUT_SECONDS: "90",
 		});
 
 		expect(config).toEqual({
@@ -29,6 +31,7 @@ describe("loadConfig", () => {
 			token: "secret",
 			workspaceRoot: "/srv/tether/workspaces",
 			sandboxImage: "custom:1",
+			setupTimeoutMs: 90_000,
 		});
 	});
 
@@ -39,5 +42,11 @@ describe("loadConfig", () => {
 	it("rejects a port that is not a port number", () => {
 		expect(() => loadConfig({ TETHER_PORT: "http" })).toThrow(/TETHER_PORT/);
 		expect(() => loadConfig({ TETHER_PORT: "70000" })).toThrow(/TETHER_PORT/);
+	});
+
+	it("rejects a setup timeout that is not a positive number of seconds", () => {
+		for (const value of ["0", "-5", "ten"]) {
+			expect(() => loadConfig({ TETHER_SETUP_TIMEOUT_SECONDS: value }), value).toThrow(/TETHER_SETUP_TIMEOUT_SECONDS/);
+		}
 	});
 });

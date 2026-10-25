@@ -93,6 +93,7 @@ npx tether sandbox ses_01a171fd998800009db3e7ce
 | `TETHER_PORT` | `7420` | 监听端口 |
 | `TETHER_TOKEN` | 不设置 | 设置后除 `/v1/health` 外都要 `Authorization: Bearer <token>`；事件流的 WebSocket 也接受 `?token=` |
 | `TETHER_SANDBOX_IMAGE` | `tether-sandbox:dev` | 沙箱镜像，`--build-sandbox` 构建的也是它 |
+| `TETHER_SETUP_TIMEOUT_SECONDS` | `600` | 每条 `setup` 命令的上限；超时算 `setup` 失败，容器删除，下一次工具调用重新创建 |
 | `ANTHROPIC_API_KEY`、`OPENAI_API_KEY` | 不设置 | 模型凭据，只在服务进程里，不进沙箱 |
 
 token 是单一的共享口令，M1 没有用户和权限。服务走明文 HTTP，监听非本机地址时前面要放一个提供 HTTPS 的反向代理；用 `?token=` 时注意它可能出现在代理的访问日志里。
