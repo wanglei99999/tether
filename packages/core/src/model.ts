@@ -2,6 +2,11 @@ import Type from "typebox";
 
 /** 会话变量以环境变量形式交给 setup，名字必须是合法的 shell 标识符。 */
 export const VARIABLE_NAME = "^[A-Z_][A-Z0-9_]*$";
+/**
+ * 镜像引用（`仓库/名字:标签@摘要`）或空字符串。沙箱后端把它放在镜像参数的位置，
+ * 以 `-` 开头会被 docker 当成参数（`--privileged`），所以第一个字符必须是字母或数字。
+ */
+export const IMAGE_REFERENCE = "^$|^[A-Za-z0-9][A-Za-z0-9._/:@-]*$";
 
 export const ModelRef = Type.Object(
 	{
@@ -18,7 +23,7 @@ export type ModelRef = Type.Static<typeof ModelRef>;
 export const SandboxSpec = Type.Object(
 	{
 		/** 空字符串表示用服务端配置的默认镜像。 */
-		template: Type.String(),
+		template: Type.String({ pattern: IMAGE_REFERENCE }),
 		resources: Type.Object(
 			{
 				cpu: Type.Number({ exclusiveMinimum: 0 }),

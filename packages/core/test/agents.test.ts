@@ -22,6 +22,24 @@ describe("AgentService", () => {
 		).rejects.toMatchObject({ code: "invalid_request", message: expect.stringContaining("teleport") });
 	});
 
+	it("accepts only an image reference as the sandbox template", async () => {
+		const { agents } = service();
+		const withTemplate = (template: string) => {
+			const spec = sampleSpec();
+			return { ...spec, sandbox: { ...spec.sandbox, template } };
+		};
+
+		// template 放在 docker run 的镜像位置：以 - 开头会被当成 docker 的参数
+		for (const template of ["--privileged", "-v/:/host", "img --rm", "img\nx"]) {
+			await expect(agents.create({ name: "a", spec: withTemplate(template) }), template).rejects.toMatchObject({
+				code: "invalid_request",
+			});
+		}
+		for (const template of ["", "node:22-slim", "ghcr.io/org/sandbox:1.2", "registry:5000/a/b@sha256:abc123"]) {
+			await expect(agents.create({ name: "a", spec: withTemplate(template) }), template).resolves.toBeDefined();
+		}
+	});
+
 	it("rejects an empty name", async () => {
 		const { agents } = service();
 		await expect(agents.create({ name: "", spec: sampleSpec() })).rejects.toMatchObject({ code: "invalid_request" });
