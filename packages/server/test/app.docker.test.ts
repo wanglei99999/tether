@@ -95,6 +95,46 @@ describe("createTether on docker", () => {
 		await shutdown(tether);
 	});
 
+	it("creates no sandbox for a run without tool calls", async () => {
+		const config = newConfig();
+		const tether = await open(config, [{ text: "just chatting" }]);
+		const { agents, sessions, sandboxes, engine } = tether.services;
+		// 配了 bash，但这一轮模型没有调用它（spec §4：第一次工具调用时才创建）
+		const { agent } = await agents.create({ name: "chat", spec: bashSpec() });
+		const session = await sessions.create({ agentId: agent.id });
+
+		const { submissionId } = await sessions.sendMessage(session.id, { content: "hello", requestId: "r1" });
+		expect(await engine.waitSubmission(submissionId)).toMatchObject({ status: "done" });
+
+		expect(await sandboxes.status(session.id)).toBeUndefined();
+		const { stdout } = await run("docker", ["ps", "-aq", "--filter", `label=tether.session=${session.id}`]);
+		expect(stdout.trim()).toBe("");
+		await shutdown(tether);
+	});
+
+	it("reports a failing setup command in the tool result", async () => {
+		const config = newConfig();
+		const tether = await open(config, [
+			{ toolCall: { name: "bash", args: { command: "echo hi" } } },
+			{ text: "gave up" },
+		]);
+		const { agents, sessions, sandboxes, engine } = tether.services;
+		const base = bashSpec();
+		const spec = { ...base, sandbox: { ...base.sandbox, setup: ["echo setup-broke >&2; exit 3"] } };
+		const { agent } = await agents.create({ name: "broken", spec });
+		const session = await sessions.create({ agentId: agent.id });
+
+		const { submissionId } = await sessions.sendMessage(session.id, { content: "go", requestId: "r1" });
+		await engine.waitSubmission(submissionId);
+
+		const { items } = await sessions.transcript(session.id, { limit: 20 });
+		const result = items.find((e) => e.role === "tool");
+		expect(result?.toolResult).toMatchObject({ isError: true });
+		expect(result?.toolResult?.text).toMatch(/setup-broke/);
+		expect(await sandboxes.status(session.id)).toBeUndefined();
+		await shutdown(tether);
+	});
+
 	it("resumes an unfinished run after the process is killed", async () => {
 		const config = newConfig();
 		const setup = await open(config, []);

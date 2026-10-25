@@ -13,6 +13,8 @@ import {
 	type TetherEnv,
 } from "@tether/core";
 
+export { type LazyEnvOptions, lazyEnv } from "./lazy.ts";
+
 export interface PiEnvExecChannelOptions {
 	/** 由 SandboxProvider 提供；Connection 会在末尾追加 serve --token <hex>。 */
 	daemonCommand: (sandboxId: string, epoch: number) => string[];

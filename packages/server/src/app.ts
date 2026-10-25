@@ -16,7 +16,7 @@ import {
 	WORKSPACE,
 } from "@tether/core";
 import { openPiEngine } from "./adapters/engine-pi/index.ts";
-import { createPiEnvExecChannel } from "./adapters/exec-pienv/index.ts";
+import { createPiEnvExecChannel, lazyEnv } from "./adapters/exec-pienv/index.ts";
 import { createDockerSandboxProvider } from "./adapters/sandbox-docker/index.ts";
 import { openSqliteAppStore } from "./adapters/store-sqlite/index.ts";
 import type { Config } from "./config.ts";
@@ -96,12 +96,16 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 	const opened = await openPiEngine({
 		database: join(config.dataDir, "engine.sqlite"),
 		models: overrides.models ?? defaultModels(),
-		// 工具调用时才建容器：按引擎会话找到 Tether 会话，确保沙箱，再给 pi 的工具一个执行环境
+		// pi 每一轮都会要环境，但只有工具真正用到它时才建容器（spec §4 懒创建）：
+		// 按引擎会话找到 Tether 会话，返回懒环境；第一次调用方法时确保沙箱，再接到 daemon 上
 		envFor: async (engineSessionId) => {
 			const session = await store.getSessionByEngineId(engineSessionId);
 			if (!session) return undefined;
-			const binding = await sandboxes.ensureSandbox(session.id);
-			return exec.piEnv(binding, WORKSPACE);
+			return lazyEnv({
+				id: `tether:${session.id}`,
+				cwd: WORKSPACE,
+				resolve: async () => exec.piEnv(await sandboxes.ensureSandbox(session.id), WORKSPACE),
+			});
 		},
 		onError: (error) => log.warn("engine reported an error", error),
 	});
