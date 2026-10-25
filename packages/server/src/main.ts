@@ -12,6 +12,15 @@ const { createTether } = await import("./app.ts");
 const { loadConfig } = await import("./config.ts");
 
 const config = loadConfig(process.env);
+
+// 部署时先跑一次：构建沙箱镜像（TETHER_SANDBOX_IMAGE），然后退出
+if (process.argv.includes("--build-sandbox")) {
+	const { buildSandboxImage } = await import("./adapters/sandbox-docker/index.ts");
+	await buildSandboxImage(config.sandboxImage);
+	process.stderr.write(`built sandbox image ${config.sandboxImage}\n`);
+	process.exit(0);
+}
+
 const tether = await createTether(config);
 const server = serve({ fetch: tether.app.fetch, hostname: config.host, port: config.port }, (info) => {
 	process.stderr.write(`tether listening on http://${info.address}:${info.port}\n`);

@@ -5,7 +5,11 @@
 	"exports": {
 		".": "./src/index.ts"
 	},
+	"bin": {
+		"tether": "./bin/tether"
+	},
 	"dependencies": {
+		"@tether/core": "*",
 		"@tether/sdk": "*"
 	}
 }
