@@ -141,6 +141,16 @@ describe("WS /v1/sessions/:id/events", () => {
 		await allowed.until((e) => e.type === "snapshot");
 	});
 
+	it("closes event streams with 1001 on shutdown", async () => {
+		const { api, base } = await serveApi([]);
+		const id = await newSession(api.app);
+		const client = connect(`${base}/v1/sessions/${id}/events`);
+		await client.until((e) => e.type === "snapshot");
+
+		api.closeEventStreams();
+		expect(await client.closed).toMatchObject({ code: 1001 });
+	});
+
 	it("stops the engine subscription when the client disconnects", async () => {
 		let stops = 0;
 		const counting = (engine: AgentEngine): AgentEngine => {

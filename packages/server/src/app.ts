@@ -131,6 +131,7 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 		...http,
 		services: { store, engine: opened, agents, sessions, sandboxes },
 		close: async () => {
+			http.closeEventStreams();
 			await opened.close();
 			exec.closeAll();
 			await closeStore();

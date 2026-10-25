@@ -80,7 +80,7 @@ function statusParam(raw: string | undefined): SessionStatus | undefined {
 	return status;
 }
 
-/** 可选字段没有值时整个键都不出现（exactOptionalPropertyTypes 下不能写成 `key: undefined`）。 */
+/** 可选字段没有值时整个键都不出现，下游不会收到 `key: undefined`。 */
 function optional<K extends string, V>(key: K, value: V | undefined): Partial<Record<K, V>> {
 	return value === undefined ? {} : ({ [key]: value } as Record<K, V>);
 }
@@ -149,12 +149,17 @@ export interface HttpApp {
 	app: Hono;
 	/** 监听之后调用一次，把 WebSocket 升级挂到 Node 的 HTTP 服务器上。 */
 	injectWebSocket: NodeWebSocket["injectWebSocket"];
+	/**
+	 * 以 1001（服务端下线）关闭所有事件流。升级后的连接不归 HTTP 服务器管，
+	 * 不关掉的话 `server.close()` 会一直等下去；客户端收到 1001 会自动重连。
+	 */
+	closeEventStreams(): void;
 }
 
 /** `/v1` 下的全部路由，响应统一用 `{ ok, data }` / `{ ok, error }` 信封；事件流走 WebSocket。 */
 export function createHttpApp(deps: HttpDeps): HttpApp {
 	const app = new Hono();
-	const { upgradeWebSocket, injectWebSocket } = createNodeWebSocket({ app });
+	const { upgradeWebSocket, injectWebSocket, wss } = createNodeWebSocket({ app });
 	if (deps.token !== undefined) app.use("*", bearerAuth(deps.token));
 
 	app.get("/v1/health", (c) => ok(c, { status: "ok" }));
@@ -164,5 +169,8 @@ export function createHttpApp(deps: HttpDeps): HttpApp {
 
 	app.notFound((c) => fail(c, "not_found", `no route for ${c.req.method} ${c.req.path}`));
 	app.onError((error, c) => failFromError(c, error, deps.log));
-	return { app, injectWebSocket };
+	const closeEventStreams = () => {
+		for (const client of wss.clients) client.close(1001, "server shutting down");
+	};
+	return { app, injectWebSocket, closeEventStreams };
 }
