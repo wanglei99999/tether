@@ -19,10 +19,15 @@ export interface SandboxServiceDeps {
 	log: Log;
 	/** 每条 setup 命令的上限。不设上限的话，一条不退出的命令（连不上的 git clone）会让会话一直等下去。 */
 	setupTimeoutMs?: number;
+	/** 同时运行（含创建中）的沙箱上限，默认 DEFAULT_MAX_RUNNING_SANDBOXES（spec §4.6）。 */
+	maxRunning?: number;
 }
 
 export const WORKSPACE = "/workspace";
 export const DEFAULT_SETUP_TIMEOUT_MS = 10 * 60 * 1000;
+export const DEFAULT_MAX_RUNNING_SANDBOXES = 4;
+/** 准入锁只有一把，所有会话共用这个键。 */
+const ADMISSION = "admission";
 /** setup 失败时错误消息里保留的输出长度。 */
 const OUTPUT_TAIL_BYTES = 4096;
 
@@ -46,6 +51,8 @@ export class SandboxService {
 	readonly #deps: SandboxServiceDeps;
 	/** 同一个会话的沙箱操作排队执行：工具调用、巡检、重建、归档不会交错。 */
 	readonly #lock = new KeyedLock();
+	/** 全局的准入锁，总在会话锁之内获取：先会话锁，再准入锁。 */
+	readonly #admission = new KeyedLock();
 	/**
 	 * 刚创建或刚启动、还没连过 daemon 的会话：容器里没有旧进程，这次连接不用告诉模型。
 	 * 其余连接都是重连。只在内存里：服务重启后为空，重启后的第一次连接也写说明（崩溃时 daemon 退出会带走后台进程）。
@@ -90,9 +97,9 @@ export class SandboxService {
 
 	async #ensure(sessionId: string): Promise<SandboxBinding> {
 		const binding = await this.#deps.store.getBinding(sessionId);
-		// 每次工具调用都走这里，运行中的直接用；容器在运行中丢失由执行通道的报错暴露（Task 5 做巡检）。
+		// 每次工具调用都走这里，运行中的直接用，不过准入；容器在运行中丢失由执行通道的报错暴露（Task 5 做巡检）。
 		if (binding?.state === "running") return binding;
-		if (binding?.state === "stopped") return this.#start(binding);
+		if (binding?.state === "stopped") return this.#admit(sessionId, () => this.#start(binding));
 		// 其余状态先按状态表检查能不能重建，再作废旧绑定（Task 6 换成正式重建并写说明）
 		nextState(binding?.state, "create");
 		if (binding) await this.#deps.store.deleteBinding(sessionId);
@@ -123,19 +130,23 @@ export class SandboxService {
 		}
 		const spec = version.spec.sandbox;
 
-		const { sandboxId } = await provider.create({ sessionId, spec });
-		const at = clock.now();
-		const creating: SandboxBinding = {
-			sessionId,
-			provider: provider.name,
-			sandboxId,
-			epoch: 0,
-			state: "creating",
-			template: spec.template,
-			createdAt: at,
-			lastUsedAt: at,
-		};
-		await store.createBinding(creating);
+		// 写下 creating 就占住了名额，setup 可能跑几分钟，在准入锁外面跑
+		const creating = await this.#admit(sessionId, async () => {
+			const { sandboxId } = await provider.create({ sessionId, spec });
+			const at = clock.now();
+			const binding: SandboxBinding = {
+				sessionId,
+				provider: provider.name,
+				sandboxId,
+				epoch: 0,
+				state: "creating",
+				template: spec.template,
+				createdAt: at,
+				lastUsedAt: at,
+			};
+			await store.createBinding(binding);
+			return binding;
+		});
 		this.#fresh.add(sessionId);
 
 		try {
@@ -148,6 +159,28 @@ export class SandboxService {
 		const running = await this.#transition(creating, "setup_done");
 		await this.#note(sessionId, { state: "running", reason: "created" });
 		return running;
+	}
+
+	/**
+	 * 新占一个运行名额（创建、启动）之前的准入检查。数数和占位（occupy 里写 creating 或 running）在同一把全局锁里，
+	 * 几个会话同时第一次调用工具时不会都数到"还有空位"。本会话自己的绑定不算。
+	 */
+	#admit<T>(sessionId: string, occupy: () => Promise<T>): Promise<T> {
+		return this.#admission.run(ADMISSION, async () => {
+			const limit = this.#deps.maxRunning ?? DEFAULT_MAX_RUNNING_SANDBOXES;
+			const running = (await this.#deps.store.listBindings()).filter(
+				(b) => b.sessionId !== sessionId && (b.state === "running" || b.state === "creating"),
+			).length;
+			if (running >= limit) {
+				// 模型从工具的错误结果里已经看到原因，这条只给客户端看
+				await this.#deps.record(sessionId, { kind: "tether.admission", data: { limit, running } });
+				throw new TetherError(
+					"sandbox_limit",
+					`sandbox limit reached: ${running} of ${limit} sandboxes are running; try again after another session goes idle`,
+				);
+			}
+			return occupy();
+		});
 	}
 
 	async #runSetup(binding: SandboxBinding, setup: readonly string[], variables: Record<string, string>): Promise<void> {

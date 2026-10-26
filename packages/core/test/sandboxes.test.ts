@@ -26,7 +26,12 @@ class SpyStore extends MemoryAppStore {
 	}
 }
 
-async function setUp(setup: string[] = [], variables: Record<string, string> = {}, setupTimeoutMs?: number) {
+async function setUp(
+	setup: string[] = [],
+	variables: Record<string, string> = {},
+	setupTimeoutMs?: number,
+	maxRunning?: number,
+) {
 	const store = new SpyStore();
 	const spec = sampleSpec();
 	spec.sandbox.setup = setup;
@@ -49,8 +54,18 @@ async function setUp(setup: string[] = [], variables: Record<string, string> = {
 		},
 		log: { warn: (message) => warnings.push(message) },
 		...(setupTimeoutMs !== undefined && { setupTimeoutMs }),
+		...(maxRunning !== undefined && { maxRunning }),
 	});
 	return { store, provider, exec, recorded, notes, warnings, sandboxes };
+}
+
+/** ses_1 到 ses_<count> 共用一个 SandboxService，上限为 maxRunning。 */
+async function setUpSessions(count: number, maxRunning?: number) {
+	const made = await setUp([], {}, undefined, maxRunning);
+	for (let i = 2; i <= count; i++) {
+		await made.store.createSession(sampleSession(`ses_${i}`, { engineSessionId: `eng_${i}` }));
+	}
+	return made;
 }
 
 describe("SandboxService.ensureSandbox", () => {
@@ -229,6 +244,87 @@ describe("SandboxService.ensureSandbox", () => {
 	it("returns not_found for an unknown session", async () => {
 		const { sandboxes } = await setUp();
 		await expect(sandboxes.ensureSandbox("ses_missing")).rejects.toMatchObject({ code: "not_found" });
+	});
+});
+
+describe("SandboxService admission", () => {
+	it("refuses a new sandbox at the limit with sandbox_limit and records tether.admission", async () => {
+		const { store, provider, notes, sandboxes } = await setUpSessions(2, 1);
+		await sandboxes.ensureSandbox("ses_1");
+		notes.length = 0;
+
+		const error = await sandboxes.ensureSandbox("ses_2").catch((e: unknown) => e);
+
+		expect(error).toMatchObject({ name: "TetherError", code: "sandbox_limit" });
+		expect((error as Error).message).toBe(
+			"sandbox limit reached: 1 of 1 sandboxes are running; try again after another session goes idle",
+		);
+		expect(notes).toEqual([{ kind: "tether.admission", data: { limit: 1, running: 1 } }]);
+		expect(provider.calls.filter((call) => call === "create")).toHaveLength(1);
+		expect(await store.getBinding("ses_2")).toBeUndefined();
+	});
+
+	it("admits again after another sandbox stops", async () => {
+		const { store, provider, sandboxes } = await setUpSessions(2, 1);
+		const first = await sandboxes.ensureSandbox("ses_1");
+		await expect(sandboxes.ensureSandbox("ses_2")).rejects.toMatchObject({ code: "sandbox_limit" });
+		await provider.stop(first.sandboxId);
+		await store.updateBinding("ses_1", { state: "stopped" }, { state: "running" });
+
+		const second = await sandboxes.ensureSandbox("ses_2");
+
+		expect(second.state).toBe("running");
+	});
+
+	it("admits exactly the limit when first tool calls in more sessions arrive at once", async () => {
+		const { provider, notes, sandboxes } = await setUpSessions(5, 4);
+		provider.createDelayMs = 20;
+
+		const results = await Promise.allSettled(
+			["ses_1", "ses_2", "ses_3", "ses_4", "ses_5"].map((id) => sandboxes.ensureSandbox(id)),
+		);
+
+		expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(4);
+		const refused = results.filter((r) => r.status === "rejected");
+		expect(refused).toHaveLength(1);
+		expect((refused[0] as PromiseRejectedResult).reason).toMatchObject({ code: "sandbox_limit" });
+		expect(provider.calls.filter((call) => call === "create")).toHaveLength(4);
+		expect(notes.filter((note) => note.kind === "tether.admission")).toEqual([
+			{ kind: "tether.admission", data: { limit: 4, running: 4 } },
+		]);
+	});
+
+	it("never refuses tool calls on a sandbox that is already running", async () => {
+		const { store, provider, sandboxes } = await setUpSessions(2, 1);
+		const first = await sandboxes.ensureSandbox("ses_1");
+		// 上限调低之前留下的第二个运行中的沙箱：现在已经超过上限
+		await store.createBinding({ ...first, sessionId: "ses_2", sandboxId: "sbx_other" });
+		provider.calls.length = 0;
+
+		await expect(sandboxes.ensureSandbox("ses_1")).resolves.toMatchObject({ state: "running" });
+		await expect(sandboxes.ensureSandbox("ses_2")).resolves.toMatchObject({ state: "running" });
+		expect(provider.calls).toEqual([]);
+	});
+
+	it("applies the limit to starting a stopped sandbox", async () => {
+		const { store, provider, sandboxes } = await setUpSessions(2, 1);
+		const first = await sandboxes.ensureSandbox("ses_1");
+		await provider.stop(first.sandboxId);
+		await store.updateBinding("ses_1", { state: "stopped" }, { state: "running" });
+		await sandboxes.ensureSandbox("ses_2");
+		provider.calls.length = 0;
+
+		await expect(sandboxes.ensureSandbox("ses_1")).rejects.toMatchObject({ code: "sandbox_limit" });
+
+		expect(provider.calls).toEqual([]);
+		expect((await store.getBinding("ses_1"))?.state).toBe("stopped");
+	});
+
+	it("defaults to 4 running sandboxes", async () => {
+		const { sandboxes } = await setUpSessions(5);
+		for (const id of ["ses_1", "ses_2", "ses_3", "ses_4"]) await sandboxes.ensureSandbox(id);
+
+		await expect(sandboxes.ensureSandbox("ses_5")).rejects.toMatchObject({ code: "sandbox_limit" });
 	});
 });
 

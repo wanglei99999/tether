@@ -10,6 +10,7 @@ const STATUS: Record<ErrorCode, ContentfulStatusCode> = {
 	conflict: 409,
 	busy: 409,
 	sandbox_failed: 502,
+	sandbox_limit: 503,
 	engine_failed: 502,
 	internal: 500,
 };

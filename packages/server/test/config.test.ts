@@ -11,6 +11,7 @@ describe("loadConfig", () => {
 			workspaceRoot: resolve("./data/workspaces"),
 			sandboxImage: "tether-sandbox:dev",
 			setupTimeoutMs: 600_000,
+			maxRunningSandboxes: 4,
 		});
 	});
 
@@ -22,6 +23,7 @@ describe("loadConfig", () => {
 			TETHER_TOKEN: "secret",
 			TETHER_SANDBOX_IMAGE: "custom:1",
 			TETHER_SETUP_TIMEOUT_SECONDS: "90",
+			TETHER_MAX_RUNNING_SANDBOXES: "2",
 		});
 
 		expect(config).toEqual({
@@ -32,6 +34,7 @@ describe("loadConfig", () => {
 			workspaceRoot: "/srv/tether/workspaces",
 			sandboxImage: "custom:1",
 			setupTimeoutMs: 90_000,
+			maxRunningSandboxes: 2,
 		});
 	});
 
@@ -47,6 +50,14 @@ describe("loadConfig", () => {
 	it("rejects a setup timeout that is not a positive number of seconds", () => {
 		for (const value of ["0", "-5", "ten"]) {
 			expect(() => loadConfig({ TETHER_SETUP_TIMEOUT_SECONDS: value }), value).toThrow(/TETHER_SETUP_TIMEOUT_SECONDS/);
+		}
+	});
+
+	it("rejects a sandbox limit that is not a positive integer", () => {
+		for (const value of ["0", "-1", "abc", "1.5"]) {
+			expect(() => loadConfig({ TETHER_MAX_RUNNING_SANDBOXES: value }), value).toThrow(
+				expect.objectContaining({ code: "invalid_request", message: expect.stringMatching(/TETHER_MAX_RUNNING_SANDBOXES/) }),
+			);
 		}
 	});
 });

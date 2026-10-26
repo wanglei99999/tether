@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { TetherError } from "@tether/core";
+import { DEFAULT_MAX_RUNNING_SANDBOXES, TetherError } from "@tether/core";
 
 export interface Config {
 	/** tether.sqlite、engine.sqlite 和工作区都在这里。 */
@@ -12,6 +12,17 @@ export interface Config {
 	sandboxImage: string;
 	/** 每条 setup 命令的上限（TETHER_SETUP_TIMEOUT_SECONDS，默认 600 秒）。 */
 	setupTimeoutMs: number;
+	/** 同时运行的沙箱上限（TETHER_MAX_RUNNING_SANDBOXES，默认 4）。 */
+	maxRunningSandboxes: number;
+}
+
+function maxRunningSandboxes(raw: string | undefined): number {
+	if (raw === undefined) return DEFAULT_MAX_RUNNING_SANDBOXES;
+	const limit = Number(raw);
+	if (!Number.isInteger(limit) || limit <= 0) {
+		throw new TetherError("invalid_request", `TETHER_MAX_RUNNING_SANDBOXES must be a positive integer, got ${raw}`);
+	}
+	return limit;
 }
 
 function setupTimeoutMs(raw: string | undefined): number {
@@ -45,5 +56,6 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
 		workspaceRoot: resolve(dataDir, "workspaces"),
 		sandboxImage: setting(env, "TETHER_SANDBOX_IMAGE") ?? "tether-sandbox:dev",
 		setupTimeoutMs: setupTimeoutMs(setting(env, "TETHER_SETUP_TIMEOUT_SECONDS")),
+		maxRunningSandboxes: maxRunningSandboxes(setting(env, "TETHER_MAX_RUNNING_SANDBOXES")),
 	};
 }

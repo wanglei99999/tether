@@ -19,10 +19,10 @@ const RUN_TETHER = fileURLToPath(new URL("./fixtures/run-tether.ts", import.meta
 const dirs: string[] = [];
 const opened: Tether[] = [];
 
-function newConfig(): Config {
+function newConfig(env: Record<string, string> = {}): Config {
 	const dataDir = mkdtempSync(join(tmpdir(), "tether-app-"));
 	dirs.push(dataDir);
-	return loadConfig({ TETHER_DATA_DIR: dataDir, TETHER_PORT: "0", TETHER_SANDBOX_IMAGE: IMAGE });
+	return loadConfig({ TETHER_DATA_DIR: dataDir, TETHER_PORT: "0", TETHER_SANDBOX_IMAGE: IMAGE, ...env });
 }
 
 function bashSpec(): AgentVersionSpec {
@@ -92,6 +92,28 @@ describe("createTether on docker", () => {
 		expect(bindingA?.sandboxId).not.toBe(bindingB?.sandboxId);
 		expect(readFileSync(join(config.workspaceRoot, a.id, "who.txt"), "utf8")).toBe("first\n");
 		expect(readFileSync(join(config.workspaceRoot, b.id, "who.txt"), "utf8")).toBe("second\n");
+		await shutdown(tether);
+	});
+
+	it("returns the sandbox limit as the second session's tool result and records tether.admission", async () => {
+		const config = newConfig({ TETHER_MAX_RUNNING_SANDBOXES: "1" });
+		const bash: ScriptStep = { toolCall: { name: "bash", args: { command: "echo hi" } } };
+		const tether = await open(config, [bash, { text: "ok" }, bash, { text: "no room" }]);
+		const { agents, sessions, sandboxes, engine } = tether.services;
+		const { agent } = await agents.create({ name: "limit", spec: bashSpec() });
+		const a = await sessions.create({ agentId: agent.id });
+		const b = await sessions.create({ agentId: agent.id });
+
+		await engine.waitSubmission((await sessions.sendMessage(a.id, { content: "go", requestId: "r" })).submissionId);
+		await engine.waitSubmission((await sessions.sendMessage(b.id, { content: "go", requestId: "r" })).submissionId);
+
+		expect(await sandboxes.status(a.id)).toMatchObject({ state: "running" });
+		expect(await sandboxes.status(b.id)).toBeUndefined();
+		const { items } = await sessions.transcript(b.id, { limit: 20 });
+		const result = items.find((e) => e.role === "tool");
+		expect(result?.toolResult).toMatchObject({ isError: true });
+		expect(result?.toolResult?.text).toMatch(/sandbox limit reached: 1 of 1 sandboxes are running/);
+		expect(items.find((e) => e.kind === "tether.admission")).toMatchObject({ data: { limit: 1, running: 1 } });
 		await shutdown(tether);
 	});
 
