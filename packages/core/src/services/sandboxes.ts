@@ -1,4 +1,4 @@
-import type { ExecResult } from "../env.ts";
+import type { DirEntry, ExecResult, TetherEnv } from "../env.ts";
 import { TetherError } from "../errors.ts";
 import { KeyedLock } from "../lock.ts";
 import type { BindingPatch, SandboxBinding, SandboxState } from "../model.ts";
@@ -38,6 +38,10 @@ export const WORKSPACE = "/workspace";
 export const DEFAULT_SETUP_TIMEOUT_MS = 10 * 60 * 1000;
 export const DEFAULT_MAX_RUNNING_SANDBOXES = 4;
 export const DEFAULT_STOP_AFTER_MS = 60 * 60 * 1000;
+/** 文件下载的上限。 */
+export const MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024;
+
+const tooLarge = () => new TetherError("invalid_request", "file is larger than 10 MiB");
 /** 准入锁只有一把，所有会话共用这个键。 */
 const ADMISSION = "admission";
 /** setup 失败时错误消息里保留的输出长度。 */
@@ -101,6 +105,48 @@ export class SandboxService {
 
 	status(sessionId: string): Promise<SandboxBinding | undefined> {
 		return this.#deps.store.getBinding(sessionId);
+	}
+
+	/** 列出工作区里的一个目录，path 相对 /workspace，空字符串即 /workspace。 */
+	listFiles(sessionId: string, path: string): Promise<DirEntry[]> {
+		return this.#browse(sessionId, path, async (env, real) => {
+			if ((await env.info(real)).kind !== "dir") throw new TetherError("invalid_request", `${path} is not a directory`);
+			return env.list(real);
+		});
+	}
+
+	/** 读工作区里的一个文件，最大 MAX_DOWNLOAD_BYTES。 */
+	readFile(sessionId: string, path: string): Promise<{ name: string; content: Uint8Array }> {
+		return this.#browse(sessionId, path, async (env, real) => {
+			const info = await env.info(real);
+			if (info.kind !== "file") throw new TetherError("invalid_request", `${path} is not a regular file`);
+			if (info.size > MAX_DOWNLOAD_BYTES) throw tooLarge();
+			const content = await env.readBytes(real);
+			// 文件可能在 info 和读取之间变大
+			if (content.byteLength > MAX_DOWNLOAD_BYTES) throw tooLarge();
+			return { name: info.name, content };
+		});
+	}
+
+	/**
+	 * 浏览文件的公共部分：在会话锁里拿到可用的沙箱（没有就 not_found，不为看文件创建；停止的启动，丢失的重建），
+	 * 把路径解析成真实路径（符号链接跟到底），不在 /workspace 下就拒绝。不刷新 lastUsedAt：看文件不算在用沙箱。
+	 * 已知限制：解析和读取之间，沙箱里的进程可以把路径上的目录换成符号链接；读到的仍是容器里的文件。
+	 */
+	#browse<T>(sessionId: string, path: string, use: (env: TetherEnv, real: string) => Promise<T>): Promise<T> {
+		return this.#lock.run(sessionId, async () => {
+			const { store, exec } = this.#deps;
+			if (!(await store.getSession(sessionId))) throw new TetherError("not_found", `session ${sessionId} not found`);
+			let binding = await store.getBinding(sessionId);
+			if (!binding) throw new TetherError("not_found", `session ${sessionId} has no sandbox yet`);
+			if (binding.state !== "running") binding = await this.#ensure(sessionId);
+			const env = exec.env(binding, { cwd: WORKSPACE });
+			const real = await env.realPath(path === "" ? "." : path);
+			if (real !== WORKSPACE && !real.startsWith(`${WORKSPACE}/`)) {
+				throw new TetherError("invalid_request", "path is outside /workspace");
+			}
+			return use(env, real);
+		});
 	}
 
 	/**

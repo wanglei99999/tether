@@ -109,6 +109,19 @@ describe("exec-pienv TetherEnv", () => {
 		expect(await env.exists("pwned2")).toBe(false);
 	});
 
+	it("reads bytes, file info and the real path through the daemon", async () => {
+		const env = channel.env(binding, { cwd: "/workspace" });
+		await env.writeFile("bin/data.bin", new Uint8Array([0, 255, 1, 2]));
+		await dockerExec("ln -sfn /etc /workspace/etc-link");
+
+		expect(await env.readBytes("bin/data.bin")).toEqual(new Uint8Array([0, 255, 1, 2]));
+		expect(await env.info("bin/data.bin")).toEqual({ name: "data.bin", kind: "file", size: 4 });
+		expect(await env.info("bin")).toMatchObject({ name: "bin", kind: "dir" });
+		expect(await env.realPath("bin/../bin/data.bin")).toBe("/workspace/bin/data.bin");
+		expect(await env.realPath("etc-link")).toBe("/etc");
+		await expect(env.realPath("nope")).rejects.toMatchObject({ code: "not_found" });
+	});
+
 	it("maps a missing file to TetherError not_found", async () => {
 		const env = channel.env(binding, { cwd: "/workspace" });
 

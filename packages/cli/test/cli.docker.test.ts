@@ -195,6 +195,20 @@ describe("tether CLI", () => {
 		firstSessionId = sessionId;
 	});
 
+	it("lists the workspace and prints a file from the command line", async () => {
+		const listed = await cli("files", firstSessionId);
+		expect(listed).toMatchObject({ code: 0, stderr: "" });
+		expect(listed.stdout).toMatch(/^file\s+6\s+who\.txt$/m);
+		expect(listed.stdout).toMatch(/^file\s+0\s+ready$/m);
+
+		const printed = await cli("cat", firstSessionId, "who.txt");
+		expect(printed).toMatchObject({ code: 0, stdout: "tether", stderr: "" });
+
+		const outside = await cli("cat", firstSessionId, "../../etc/passwd");
+		expect(outside.code).toBe(1);
+		expect(outside.stderr).toMatch(/invalid_request: path is outside \/workspace/);
+	});
+
 	it("archives a session from the command line", async () => {
 		const archived = await cli("session", "archive", firstSessionId);
 		expect(archived).toMatchObject({ code: 0, stderr: "" });

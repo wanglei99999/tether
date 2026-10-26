@@ -109,6 +109,44 @@ describe("HTTP API", () => {
 		expect(response.body.error.code).toBe("not_found");
 	});
 
+	it("serves a file as octet-stream with its name", async () => {
+		const { app } = await makeApi([]);
+		const id = await newSession(app);
+
+		const response = await app.request(`/v1/sessions/${id}/sandbox/file?path=${encodeURIComponent("out/notes.txt")}`);
+
+		expect(response.status).toBe(200);
+		expect(response.headers.get("content-type")).toBe("application/octet-stream");
+		expect(response.headers.get("content-disposition")).toBe(
+			`attachment; filename="notes.txt"; filename*=UTF-8''notes.txt`,
+		);
+		expect(await response.text()).toBe("content of out/notes.txt");
+	});
+
+	it("keeps quotes, line breaks and non-ASCII in a file name out of the header", async () => {
+		const { app } = await makeApi([]);
+		const id = await newSession(app);
+		const name = 'a"b\r\nx: y ü.txt';
+
+		const response = await app.request(`/v1/sessions/${id}/sandbox/file?path=${encodeURIComponent(name)}`);
+
+		expect(response.headers.get("content-disposition")).toBe(
+			`attachment; filename="a_b__x: y _.txt"; filename*=UTF-8''${encodeURIComponent(name)}`,
+		);
+		expect(response.headers.get("x")).toBeNull();
+	});
+
+	it("lists files and requires a path to download", async () => {
+		const { app } = await makeApi([]);
+		const id = await newSession(app);
+
+		const listed = await call(app, "GET", `/v1/sessions/${id}/sandbox/files`);
+		expect(listed.body).toEqual({ ok: true, data: { items: [] } });
+		const missing = await call(app, "GET", `/v1/sessions/${id}/sandbox/file`);
+		expect(missing.status).toBe(400);
+		expect(missing.body.error.code).toBe("invalid_request");
+	});
+
 	it("requires requestId on messages", async () => {
 		const { app } = await makeApi([]);
 		const id = await newSession(app);

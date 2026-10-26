@@ -69,6 +69,13 @@ function wrap(remote: RemoteExecutionEnv, cwd: string): TetherEnv {
 			const infos = await call(`list ${path}`, () => remote.listDir(path, context));
 			return infos.map(toDirEntry).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 		},
+		async readBytes(path) {
+			const bytes = await call(`read ${path}`, () => remote.readBinaryFile(path, context));
+			// pi 给的是 Node 的 Buffer；换成同一块内存上的普通 Uint8Array，core 只认端口里的类型
+			return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+		},
+		info: async (path) => toDirEntry(await call(`stat ${path}`, () => remote.fileInfo(path, context))),
+		realPath: (path) => call(`realpath ${path}`, () => remote.canonicalPath(path, context)),
 		async exec(command: string, options: ExecOptions = {}): Promise<ExecResult> {
 			const output = { stdout: "", stderr: "" };
 			const { exitCode } = await call(`exec`, () =>

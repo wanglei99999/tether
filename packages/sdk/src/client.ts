@@ -2,6 +2,7 @@ import type {
 	AgentRecord,
 	AgentVersionRecord,
 	AgentVersionSpec,
+	DirEntry,
 	ErrorCode,
 	RunStatus,
 	SandboxBinding,
@@ -93,6 +94,12 @@ export class TetherClient {
 			this.#request<Page<TranscriptEntry>>("GET", `/v1/sessions/${enc(id)}/transcript${query(page)}`),
 		sandbox: async (id: string) =>
 			(await this.#request<{ binding: SandboxBinding | null }>("GET", `/v1/sessions/${enc(id)}/sandbox`)).binding,
+		/** 列出沙箱工作区里的目录；path 相对 /workspace，省略即 /workspace。 */
+		files: async (id: string, path?: string) =>
+			(await this.#request<{ items: DirEntry[] }>("GET", `/v1/sessions/${enc(id)}/sandbox/files${query({ path })}`))
+				.items,
+		/** 下载工作区里的一个文件（最大 10 MiB）。 */
+		file: (id: string, path: string) => this.#download(`/v1/sessions/${enc(id)}/sandbox/file${query({ path })}`),
 		/** 归档：之后的消息被拒绝，沙箱的容器和工作区被删除。 */
 		archive: async (id: string) =>
 			(await this.#request<{ session: SessionRecord }>("POST", `/v1/sessions/${enc(id)}/archive`)).session,
@@ -127,13 +134,22 @@ export class TetherClient {
 	}
 
 	async #request<T>(method: string, path: string, body?: unknown): Promise<T> {
+		return this.#envelope<T>(method, path, await this.#respond(method, path, body));
+	}
+
+	/** 成功时是原始字节；出错时服务端仍回 JSON 信封。 */
+	async #download(path: string): Promise<Uint8Array> {
+		const response = await this.#respond("GET", path);
+		if (!response.ok) return this.#envelope<never>("GET", path, response);
+		return new Uint8Array(await response.arrayBuffer());
+	}
+
+	async #respond(method: string, path: string, body?: unknown): Promise<Response> {
 		const headers: Record<string, string> = {};
 		if (this.#token !== undefined) headers.authorization = `Bearer ${this.#token}`;
 		if (body !== undefined) headers["content-type"] = "application/json";
-
-		let response: Response;
 		try {
-			response = await this.#fetch(`${this.#baseUrl}${path}`, {
+			return await this.#fetch(`${this.#baseUrl}${path}`, {
 				method,
 				headers,
 				...(body !== undefined && { body: JSON.stringify(body) }),
@@ -142,7 +158,9 @@ export class TetherClient {
 			const reason = error instanceof Error ? error.message : String(error);
 			throw new TetherApiError("network", `${method} ${path} failed: ${reason}`);
 		}
+	}
 
+	async #envelope<T>(method: string, path: string, response: Response): Promise<T> {
 		let envelope: Envelope<T>;
 		try {
 			envelope = (await response.json()) as Envelope<T>;

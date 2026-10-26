@@ -209,6 +209,51 @@ describe("createTether on docker", () => {
 		await shutdown(tether);
 	});
 
+	it("lists and downloads a file the agent wrote", async () => {
+		const config = newConfig();
+		const tether = await open(config, [
+			{ toolCall: { name: "bash", args: { command: "mkdir -p out && printf '\\000\\377\\001bin' > out/data.bin" } } },
+			{ text: "done" },
+		]);
+		const { agents, sessions, sandboxes, engine } = tether.services;
+		const { agent } = await agents.create({ name: "files", spec: bashSpec() });
+		const session = await sessions.create({ agentId: agent.id });
+		await engine.waitSubmission((await sessions.sendMessage(session.id, { content: "go", requestId: "r" })).submissionId);
+
+		expect(await sandboxes.listFiles(session.id, "")).toContainEqual({ name: "out", kind: "dir", size: expect.any(Number) });
+		expect(await sandboxes.listFiles(session.id, "out")).toEqual([{ name: "data.bin", kind: "file", size: 6 }]);
+		const response = await tether.app.request(`/v1/sessions/${session.id}/sandbox/file?path=out/data.bin`);
+		expect(response.status).toBe(200);
+		expect(response.headers.get("content-type")).toBe("application/octet-stream");
+		expect(response.headers.get("content-disposition")).toMatch(/^attachment; filename="data.bin"/);
+		expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array([0, 255, 1, 98, 105, 110]));
+		await shutdown(tether);
+	});
+
+	it("refuses a symlink in the workspace that points to /etc", async () => {
+		const config = newConfig();
+		const tether = await open(config, [
+			{ toolCall: { name: "bash", args: { command: "ln -s /etc config" } } },
+			{ text: "linked" },
+		]);
+		const { agents, sessions, sandboxes, engine } = tether.services;
+		const { agent } = await agents.create({ name: "escape", spec: bashSpec() });
+		const session = await sessions.create({ agentId: agent.id });
+		await engine.waitSubmission((await sessions.sendMessage(session.id, { content: "go", requestId: "r" })).submissionId);
+
+		for (const read of [
+			() => sandboxes.listFiles(session.id, "config"),
+			() => sandboxes.readFile(session.id, "config/passwd"),
+			() => sandboxes.readFile(session.id, "../../etc/passwd"),
+		]) {
+			await expect(read()).rejects.toMatchObject({ code: "invalid_request", message: "path is outside /workspace" });
+		}
+		const response = await tether.app.request(`/v1/sessions/${session.id}/sandbox/file?path=config/passwd`);
+		expect(response.status).toBe(400);
+		expect(await response.json()).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+		await shutdown(tether);
+	});
+
 	it("creates no sandbox for a run without tool calls", async () => {
 		const config = newConfig();
 		const tether = await open(config, [{ text: "just chatting" }]);

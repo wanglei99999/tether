@@ -165,23 +165,68 @@ export interface ExecCall {
 	timeoutMs?: number;
 }
 
-/** exec 按命令返回脚本里的结果，没写的返回成功；failures 里的命令直接抛错（例如超时）；记录每次调用。 */
+/** 按 POSIX 规则拼接并规范化路径：处理 "." 和 ".."，根目录之上还是根目录。 */
+function normalize(cwd: string, path: string): string {
+	const parts: string[] = [];
+	for (const part of (path.startsWith("/") ? path : `${cwd}/${path}`).split("/")) {
+		if (part === "" || part === ".") continue;
+		if (part === "..") parts.pop();
+		else parts.push(part);
+	}
+	return `/${parts.join("/")}`;
+}
+
+const notFound = (path: string) => new TetherError("not_found", `${path} does not exist`);
+
+/**
+ * exec 按命令返回脚本里的结果，没写的返回成功；failures 里的命令直接抛错（例如超时）；记录每次调用。
+ * 文件操作走一个假文件系统：files 是绝对路径到内容（"dir" 表示目录），realPaths 覆盖 realPath 的结果（模拟符号链接）。
+ */
 export class FakeExecChannel implements ExecChannel {
 	readonly calls: ExecCall[] = [];
 	readonly closed: string[] = [];
 	results = new Map<string, ExecResult>();
 	failures = new Map<string, Error>();
+	readonly files = new Map<string, Uint8Array | "dir">([["/workspace", "dir"]]);
+	readonly realPaths = new Map<string, string>();
 
 	env(binding: SandboxBinding, options: { cwd: string }): TetherEnv {
 		const unused = async (): Promise<never> => {
 			throw new Error("not used by these tests");
+		};
+		const entry = (path: string) => {
+			const content = this.files.get(path);
+			if (content === undefined) throw notFound(path);
+			const name = path.slice(path.lastIndexOf("/") + 1);
+			return content === "dir"
+				? { name, kind: "dir" as const, size: 0 }
+				: { name, kind: "file" as const, size: content.byteLength };
 		};
 		return {
 			cwd: options.cwd,
 			readText: unused,
 			writeFile: unused,
 			exists: unused,
-			list: unused,
+			list: async (path) => {
+				const dir = normalize(options.cwd, path);
+				return [...this.files.keys()]
+					.filter((p) => p.startsWith(`${dir}/`) && !p.slice(dir.length + 1).includes("/"))
+					.sort()
+					.map(entry);
+			},
+			readBytes: async (path) => {
+				const content = this.files.get(normalize(options.cwd, path));
+				if (content === undefined || content === "dir") throw notFound(path);
+				return content;
+			},
+			info: async (path) => entry(normalize(options.cwd, path)),
+			realPath: async (path) => {
+				const absolute = normalize(options.cwd, path);
+				const mapped = this.realPaths.get(absolute);
+				if (mapped !== undefined) return mapped;
+				if (!this.files.has(absolute)) throw notFound(path);
+				return absolute;
+			},
 			exec: async (command: string, execOptions?: ExecOptions) => {
 				this.calls.push({
 					sandboxId: binding.sandboxId,

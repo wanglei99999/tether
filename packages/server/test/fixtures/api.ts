@@ -49,7 +49,15 @@ export async function makeApi(script: ScriptStep[], options: TestApiOptions = {}
 	const http = createHttpApp({
 		agents,
 		sessions,
-		sandboxes: { status: (id) => store.getBinding(id) },
+		sandboxes: {
+			status: (id) => store.getBinding(id),
+			// 没有真实沙箱：列目录为空，读文件返回 "content of <path>"，名字取路径最后一段
+			listFiles: async () => [],
+			readFile: async (_id, path) => ({
+				name: path.slice(path.lastIndexOf("/") + 1),
+				content: new TextEncoder().encode(`content of ${path}`),
+			}),
+		},
 		log,
 		...(options.token !== undefined && { token: options.token }),
 	});

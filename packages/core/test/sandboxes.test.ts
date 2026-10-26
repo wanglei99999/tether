@@ -476,6 +476,115 @@ describe("SandboxService.destroy", () => {
 	});
 });
 
+const bytes = (text: string) => new TextEncoder().encode(text);
+
+describe("SandboxService files", () => {
+	it("lists /workspace when the path is empty", async () => {
+		const { exec, sandboxes } = await setUp();
+		await sandboxes.ensureSandbox("ses_1");
+		exec.files.set("/workspace/a.txt", bytes("hi"));
+		exec.files.set("/workspace/src", "dir");
+		exec.files.set("/workspace/src/main.ts", bytes("x"));
+
+		expect(await sandboxes.listFiles("ses_1", "")).toEqual([
+			{ name: "a.txt", kind: "file", size: 2 },
+			{ name: "src", kind: "dir", size: 0 },
+		]);
+		expect(await sandboxes.listFiles("ses_1", "src")).toEqual([{ name: "main.ts", kind: "file", size: 1 }]);
+	});
+
+	it("reads a file with its name", async () => {
+		const { exec, sandboxes } = await setUp();
+		await sandboxes.ensureSandbox("ses_1");
+		exec.files.set("/workspace/out", "dir");
+		exec.files.set("/workspace/out/report.bin", new Uint8Array([0, 255, 1]));
+
+		expect(await sandboxes.readFile("ses_1", "out/report.bin")).toEqual({
+			name: "report.bin",
+			content: new Uint8Array([0, 255, 1]),
+		});
+	});
+
+	it("rejects a path that resolves outside /workspace with invalid_request", async () => {
+		const { exec, sandboxes } = await setUp();
+		await sandboxes.ensureSandbox("ses_1");
+		exec.files.set("/etc", "dir");
+		exec.files.set("/etc/passwd", bytes("root:x:0:0"));
+		// 工作区里的符号链接，以及名字以 /workspace 开头的兄弟目录
+		exec.realPaths.set("/workspace/config", "/etc");
+		exec.realPaths.set("/workspace/sneaky", "/workspace2/secret");
+
+		for (const read of [
+			() => sandboxes.readFile("ses_1", "../../etc/passwd"),
+			() => sandboxes.readFile("ses_1", "/etc/passwd"),
+			() => sandboxes.listFiles("ses_1", "config"),
+			() => sandboxes.listFiles("ses_1", "sneaky"),
+		]) {
+			const error = await read().catch((e: unknown) => e);
+			expect(error).toMatchObject({ code: "invalid_request", message: "path is outside /workspace" });
+		}
+	});
+
+	it("reports not_found for a session without a sandbox and creates none", async () => {
+		const { provider, sandboxes } = await setUp();
+
+		await expect(sandboxes.listFiles("ses_1", "")).rejects.toMatchObject({
+			code: "not_found",
+			message: "session ses_1 has no sandbox yet",
+		});
+		await expect(sandboxes.listFiles("ses_missing", "")).rejects.toMatchObject({ code: "not_found" });
+		expect(provider.calls).toEqual([]);
+	});
+
+	it("starts a stopped sandbox before reading", async () => {
+		const { store, provider, exec, sandboxes } = await setUp();
+		const { sandboxId } = await sandboxes.ensureSandbox("ses_1");
+		await provider.stop(sandboxId);
+		await store.updateBinding("ses_1", { state: "stopped" }, { state: "running" });
+		exec.files.set("/workspace/a.txt", bytes("kept"));
+
+		const file = await sandboxes.readFile("ses_1", "a.txt");
+
+		expect(file.content).toEqual(bytes("kept"));
+		expect(provider.containers.get(sandboxId)?.state).toBe("running");
+		expect((await store.getBinding("ses_1"))?.state).toBe("running");
+	});
+
+	it("rejects a file larger than 10 MiB and a directory", async () => {
+		const { exec, sandboxes } = await setUp();
+		await sandboxes.ensureSandbox("ses_1");
+		exec.files.set("/workspace/big.bin", new Uint8Array(10 * 1024 * 1024 + 1));
+		exec.files.set("/workspace/dir", "dir");
+
+		await expect(sandboxes.readFile("ses_1", "big.bin")).rejects.toMatchObject({
+			code: "invalid_request",
+			message: "file is larger than 10 MiB",
+		});
+		await expect(sandboxes.readFile("ses_1", "dir")).rejects.toMatchObject({ code: "invalid_request" });
+		await expect(sandboxes.listFiles("ses_1", "big.bin")).rejects.toMatchObject({ code: "invalid_request" });
+	});
+
+	it("does not refresh lastUsedAt", async () => {
+		const { store, exec, clock, sandboxes } = await setUp();
+		const { lastUsedAt } = await sandboxes.ensureSandbox("ses_1");
+		exec.files.set("/workspace/a.txt", bytes("hi"));
+		clock.advance(60_000);
+
+		await sandboxes.listFiles("ses_1", "");
+		await sandboxes.readFile("ses_1", "a.txt");
+
+		expect((await store.getBinding("ses_1"))?.lastUsedAt).toBe(lastUsedAt);
+	});
+
+	it("refuses browsing a destroyed sandbox with conflict", async () => {
+		const { sandboxes } = await setUp();
+		await sandboxes.ensureSandbox("ses_1");
+		await sandboxes.destroy("ses_1", "archived");
+
+		await expect(sandboxes.listFiles("ses_1", "")).rejects.toMatchObject({ code: "conflict" });
+	});
+});
+
 const HOUR = 3_600_000;
 const NOTHING = { stoppedIdle: 0, stoppedOutside: 0, lost: 0 };
 
