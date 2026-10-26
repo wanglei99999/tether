@@ -78,11 +78,15 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 			const workspace = workspaceOf(sessionId);
 			await mkdir(workspace, { recursive: true });
 			// spec.resources.diskMb 不会到这里：校验时就拒绝（UNSUPPORTED_IN_M2）。Docker 限制磁盘依赖存储驱动（overlay2 + xfs pquota），测试机不满足。
-			await dockerOrThrow([
+			const args = [
 				"run",
 				"--detach",
 				"--name",
 				sandboxId,
+				// PID 1 必须是 sleep（fence.sh 和 ADR-007 的防护都依赖它）：不让 daemon.json 的 init 或模板镜像的 ENTRYPOINT 换掉它
+				"--init=false",
+				"--entrypoint",
+				"sleep",
 				"--label",
 				MANAGED_LABEL,
 				"--label",
@@ -106,9 +110,16 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 				"--volume",
 				`${workspace}:/workspace`,
 				spec.template === "" ? options.defaultImage : spec.template,
-				"sleep",
 				"infinity",
-			]);
+			];
+			try {
+				await dockerOrThrow(args);
+			} catch (error) {
+				// docker run 可能已经建好容器、只是启动失败：删掉它和刚建的工作区，否则下次创建撞上同名容器
+				await docker(["rm", "--force", sandboxId]).catch(() => {});
+				await rm(workspace, { recursive: true, force: true }).catch(() => {});
+				throw error;
+			}
 			return { sandboxId };
 		},
 

@@ -282,8 +282,8 @@ export class SandboxService {
 	}
 
 	/**
-	 * 按模板创建沙箱并执行 setup。给了 lost 的旧绑定就是重建：先删掉旧容器、工作区和绑定，成功后告诉模型环境重置了。
-	 * 重建在准入通过之后才删旧的：被准入拒绝时绑定还是 lost，下次仍按重建处理。
+	 * 按模板创建沙箱并执行 setup。给了 lost 的旧绑定就是重建：先删掉旧容器和工作区，再新建，成功后告诉模型环境重置了。
+	 * 旧绑定一直留到新容器建好：被准入拒绝或 docker run 失败时绑定还是 lost，下次仍按重建处理。
 	 */
 	async #create(sessionId: string, lost?: SandboxBinding): Promise<SandboxBinding> {
 		const { store, provider, exec, clock } = this.#deps;
@@ -295,14 +295,16 @@ export class SandboxService {
 		}
 		const spec = version.spec.sandbox;
 
+		// 删旧容器和工作区可能很慢，放在准入锁外面；删除可以重复，被准入拒绝或新建失败时绑定还是 lost
+		if (lost) {
+			exec.close(lost.sandboxId);
+			await provider.destroy(lost.sandboxId);
+		}
 		// 写下 creating 就占住了名额，setup 可能跑几分钟，在准入锁外面跑
 		const creating = await this.#admit(sessionId, async () => {
-			if (lost) {
-				exec.close(lost.sandboxId);
-				await provider.destroy(lost.sandboxId);
-				await store.deleteBinding(sessionId);
-			}
 			const { sandboxId } = await provider.create({ sessionId, spec });
+			// 新容器建好了才删旧绑定：docker run 失败时绑定留在 lost，下次仍按重建处理并告诉模型
+			if (lost) await store.deleteBinding(sessionId);
 			const at = clock.now();
 			const binding: SandboxBinding = {
 				sessionId,

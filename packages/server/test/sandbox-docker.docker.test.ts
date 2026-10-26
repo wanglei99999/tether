@@ -140,6 +140,37 @@ describe("docker sandbox specifics", () => {
 		}
 	});
 
+	it("removes the container and the workspace when docker run creates it but cannot start it", async () => {
+		// 空镜像里没有 sleep：容器建得出来，启动失败
+		await run("sh", ["-c", "tar cf - --files-from /dev/null | docker import - tether-test-empty:1"]);
+		const sessionId = made.sessionId();
+
+		await expect(
+			made.provider.create({ sessionId, spec: sampleSandboxSpec({ template: "tether-test-empty:1" }) }),
+		).rejects.toMatchObject({ code: "sandbox_failed" });
+
+		expect(await docker("ps", "-aq", "--filter", `name=^tether-${sessionId}$`)).toBe("");
+		expect(existsSync(join(made.workspaceRoot, sessionId))).toBe(false);
+		// 同一个会话再建一次不会撞上残留的同名容器
+		const { sandboxId } = await made.provider.create({ sessionId, spec: sampleSandboxSpec() });
+		expect(await made.provider.status(sandboxId)).toBe("running");
+	});
+
+	it("keeps sleep as PID 1 when the template image has its own entrypoint", async () => {
+		// 入口是一个不 exec 的 shell：不覆盖的话 PID 1 是 sh，fence 永远失败
+		await run("sh", [
+			"-c",
+			`printf 'FROM ${IMAGE}\\nENTRYPOINT ["/bin/sh", "-c", "sleep infinity; true"]\\n' | docker build -q -t tether-test-entrypoint:1 -`,
+		]);
+		const { sandboxId } = await made.provider.create({
+			sessionId: made.sessionId(),
+			spec: sampleSandboxSpec({ template: "tether-test-entrypoint:1" }),
+		});
+
+		expect(await docker("exec", sandboxId, "cat", "/proc/1/comm")).toBe("sleep");
+		await expect(made.provider.fence(sandboxId, 1)).resolves.toMatchObject({ killed: expect.any(Number) });
+	});
+
 	it("rejects a session id that is not a plain name", async () => {
 		await expect(
 			made.provider.create({ sessionId: "../escape", spec: sampleSandboxSpec() }),

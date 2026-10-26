@@ -391,8 +391,50 @@ describe("SandboxService rebuild", () => {
 
 		await expect(sandboxes.ensureSandbox("ses_1")).rejects.toMatchObject({ code: "sandbox_limit" });
 
-		expect(provider.calls).toEqual([]);
+		// 残留在准入之前就删了（删除可以重复），没有新建；绑定还是 lost，下次照样按重建处理
+		expect(provider.calls).toEqual(["destroy"]);
 		expect((await store.getBinding("ses_1"))?.state).toBe("lost");
+	});
+
+	it("keeps the binding lost when creating the replacement fails, so the next call still writes the reset note", async () => {
+		const { store, provider, notes, sandboxes } = await setUp();
+		await sandboxes.ensureSandbox("ses_1");
+		provider.containers.clear();
+		await sandboxes.sweep();
+		provider.failCreate = true;
+
+		await expect(sandboxes.ensureSandbox("ses_1")).rejects.toMatchObject({ code: "sandbox_failed" });
+
+		expect((await store.getBinding("ses_1"))?.state).toBe("lost");
+		provider.failCreate = false;
+		await sandboxes.ensureSandbox("ses_1");
+		expect(notes.at(-1)).toMatchObject({ data: { reason: "recovered" }, modelText: NOTES.reset("missing") });
+	});
+
+	it("removes the lost sandbox's leftovers outside the global admission lock", async () => {
+		const { provider, sandboxes } = await setUpSessions(3, { maxRunning: 2 });
+		const first = await sandboxes.ensureSandbox("ses_1");
+		await sandboxes.ensureSandbox("ses_2");
+		provider.containers.delete(first.sandboxId);
+		await sandboxes.sweep();
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const destroy = provider.destroy.bind(provider);
+		provider.destroy = async (id) => {
+			await gate;
+			await destroy(id);
+		};
+
+		// ses_1 的重建卡在删除残留上（宿主上删工作区可能很慢）；另一个会话的第一次工具调用照常过准入
+		const rebuild = sandboxes.ensureSandbox("ses_1").catch((e: unknown) => e);
+		const third = sandboxes.ensureSandbox("ses_3");
+		const raced = await Promise.race([third.then(() => "admitted"), sleep(200).then(() => "blocked")]);
+		release();
+
+		expect(raced).toBe("admitted");
+		expect(await rebuild).toMatchObject({ code: "sandbox_limit" });
 	});
 
 	it("leaves the binding lost when the rebuild's setup fails", async () => {
@@ -477,6 +519,7 @@ describe("SandboxService.destroy", () => {
 });
 
 const bytes = (text: string) => new TextEncoder().encode(text);
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 describe("SandboxService files", () => {
 	it("lists /workspace when the path is empty", async () => {

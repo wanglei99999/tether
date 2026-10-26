@@ -97,6 +97,8 @@ export class FakeProvider implements SandboxProvider {
 	createDelayMs = 0;
 	/** 为 true 时 destroy 抛错，模拟清理失败。 */
 	failDestroy = false;
+	/** 为 true 时 create 抛错，模拟 docker run 失败。 */
+	failCreate = false;
 	/** 为 true 时 fence 抛错，模拟隔离失败（例如容器共享宿主 PID 命名空间）。 */
 	failFence = false;
 	readonly fenced: { sandboxId: string; epoch: number }[] = [];
@@ -105,6 +107,7 @@ export class FakeProvider implements SandboxProvider {
 	async create({ sessionId }: SandboxCreate) {
 		this.calls.push("create");
 		await new Promise((resolve) => setTimeout(resolve, this.createDelayMs));
+		if (this.failCreate) throw new TetherError("sandbox_failed", "docker run failed");
 		const sandboxId = `sbx_${++this.#created}`;
 		this.containers.set(sandboxId, { sessionId, state: "running" });
 		return { sandboxId };
