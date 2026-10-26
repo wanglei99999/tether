@@ -137,14 +137,15 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 				"--filter",
 				`label=${MANAGED_LABEL}`,
 				"--format",
-				`{{.Names}}\t{{.Label "${SESSION_LABEL}"}}`,
+				`{{.Names}}\t{{.Label "${SESSION_LABEL}"}}\t{{.State}}`,
 			]);
 			return out
 				.split("\n")
 				.filter((line) => line.trim() !== "")
 				.map((line) => {
-					const [sandboxId = "", sessionId = ""] = line.split("\t");
-					return { sandboxId, sessionId };
+					const [sandboxId = "", sessionId = "", state = ""] = line.split("\t");
+					// 与 status() 一致：只有 running 算运行，created、exited、paused 等都算停止
+					return { sandboxId, sessionId, status: state === "running" ? "running" : "stopped" } as const;
 				});
 		},
 

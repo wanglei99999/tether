@@ -1,4 +1,5 @@
 import type { SandboxBinding } from "./model.ts";
+import { NOTES, type SandboxNote } from "./notes.ts";
 import type { AgentEngine, AppStore, SandboxProvider } from "./ports.ts";
 import type { SessionService } from "./services/sessions.ts";
 
@@ -19,6 +20,11 @@ export interface RecoverResult {
 	repairedSessions: number;
 	lostBindings: number;
 	removedOrphans: number;
+	/**
+	 * 对账发现的、要写进会话记录的说明。recover() 不写引擎：pi 的写入会开启调度，在 resume 之前写等于提前续跑。
+	 * 由组装层在 recover() 返回之后逐条写入。
+	 */
+	notes: { sessionId: string; note: SandboxNote }[];
 }
 
 /** 已经不对应容器的绑定，对账时跳过。 */
@@ -33,9 +39,9 @@ const SETTLED: readonly SandboxBinding["state"][] = ["lost", "destroyed"];
  */
 export async function recover(deps: RecoverDeps): Promise<RecoverResult> {
 	const repairedSessions = await repairSessions(deps);
-	const { lostBindings, removedOrphans } = await reconcileSandboxes(deps);
+	const { lostBindings, removedOrphans, notes } = await reconcileSandboxes(deps);
 	deps.engine.resume();
-	return { repairedSessions, lostBindings, removedOrphans };
+	return { repairedSessions, lostBindings, removedOrphans, notes };
 }
 
 async function repairSessions({ store, sessions, log }: RecoverDeps): Promise<number> {
@@ -57,9 +63,10 @@ async function reconcileSandboxes({
 	store,
 	provider,
 	log,
-}: RecoverDeps): Promise<Pick<RecoverResult, "lostBindings" | "removedOrphans">> {
+}: RecoverDeps): Promise<Pick<RecoverResult, "lostBindings" | "removedOrphans" | "notes">> {
 	let lostBindings = 0;
 	let removedOrphans = 0;
+	const notes: RecoverResult["notes"] = [];
 	const kept = new Set<string>();
 
 	for (const binding of await store.listBindings()) {
@@ -83,6 +90,19 @@ async function reconcileSandboxes({
 		if (status !== binding.state) {
 			await store.updateBinding(binding.sessionId, { state: status }, { state: binding.state });
 		}
+		// 停机期间容器被停了，里面的进程都没了：和巡检发现时一样告诉模型，会话改为 idle
+		if (binding.state === "running" && status === "stopped") {
+			notes.push({
+				sessionId: binding.sessionId,
+				note: {
+					kind: "tether.sandbox",
+					data: { state: "stopped", reason: "stopped outside Tether" },
+					modelText: NOTES.stoppedOutside,
+				},
+			});
+			const session = await store.getSession(binding.sessionId);
+			if (session?.status === "active") await store.updateSession(binding.sessionId, { status: "idle" });
+		}
 	}
 
 	for (const { sandboxId, sessionId } of await provider.listManaged()) {
@@ -91,5 +111,5 @@ async function reconcileSandboxes({
 		removedOrphans++;
 		log.warn(`removed orphan sandbox ${sandboxId} (session ${sessionId})`);
 	}
-	return { lostBindings, removedOrphans };
+	return { lostBindings, removedOrphans, notes };
 }

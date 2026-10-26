@@ -12,6 +12,8 @@ describe("loadConfig", () => {
 			sandboxImage: "tether-sandbox:dev",
 			setupTimeoutMs: 600_000,
 			maxRunningSandboxes: 4,
+			stopAfterMs: 3_600_000,
+			sweepIntervalMs: 60_000,
 		});
 	});
 
@@ -24,6 +26,8 @@ describe("loadConfig", () => {
 			TETHER_SANDBOX_IMAGE: "custom:1",
 			TETHER_SETUP_TIMEOUT_SECONDS: "90",
 			TETHER_MAX_RUNNING_SANDBOXES: "2",
+			TETHER_STOP_AFTER_SECONDS: "1800",
+			TETHER_SWEEP_INTERVAL_SECONDS: "0.5",
 		});
 
 		expect(config).toEqual({
@@ -35,6 +39,8 @@ describe("loadConfig", () => {
 			sandboxImage: "custom:1",
 			setupTimeoutMs: 90_000,
 			maxRunningSandboxes: 2,
+			stopAfterMs: 1_800_000,
+			sweepIntervalMs: 500,
 		});
 	});
 
@@ -47,9 +53,11 @@ describe("loadConfig", () => {
 		expect(() => loadConfig({ TETHER_PORT: "70000" })).toThrow(/TETHER_PORT/);
 	});
 
-	it("rejects a setup timeout that is not a positive number of seconds", () => {
-		for (const value of ["0", "-5", "ten"]) {
-			expect(() => loadConfig({ TETHER_SETUP_TIMEOUT_SECONDS: value }), value).toThrow(/TETHER_SETUP_TIMEOUT_SECONDS/);
+	it("rejects durations that are not a positive number of seconds", () => {
+		for (const name of ["TETHER_SETUP_TIMEOUT_SECONDS", "TETHER_STOP_AFTER_SECONDS", "TETHER_SWEEP_INTERVAL_SECONDS"]) {
+			for (const value of ["0", "-5", "ten"]) {
+				expect(() => loadConfig({ [name]: value }), `${name}=${value}`).toThrow(new RegExp(name));
+			}
 		}
 	});
 

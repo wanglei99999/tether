@@ -20,6 +20,17 @@ export class FakeClock implements Clock {
 	}
 }
 
+/** 时间不自己走，advance 往后拨。 */
+export class ManualClock implements Clock {
+	#at = Date.UTC(2026, 9, 25);
+	now(): string {
+		return new Date(this.#at).toISOString();
+	}
+	advance(ms: number): void {
+		this.#at += ms;
+	}
+}
+
 export class FakeIds implements Ids {
 	#next = 1;
 	next(prefix: "agt" | "ses"): string {
@@ -33,7 +44,16 @@ export class FakeEngine implements AgentEngine {
 	/** 在 createSession 里调用，测试用它检查调用那一刻的应用表。 */
 	onCreate: (config: EngineAgentConfig) => Promise<void> = async () => {};
 	failCreate = false;
+	/** 正在运行的引擎会话，isRunning 按它回答。 */
+	readonly running = new Set<string>();
 	#sessions = 0;
+
+	async isRunning(engineSessionId: string): Promise<boolean> {
+		if (!(await this.hasSession(engineSessionId))) {
+			throw new TetherError("not_found", `engine session ${engineSessionId} not found`);
+		}
+		return this.running.has(engineSessionId);
+	}
 
 	async createSession(config: EngineAgentConfig): Promise<string> {
 		this.created.push(config);
@@ -113,7 +133,7 @@ export class FakeProvider implements SandboxProvider {
 		return { killed: 0 };
 	}
 	async listManaged() {
-		return [...this.containers].map(([sandboxId, { sessionId }]) => ({ sandboxId, sessionId }));
+		return [...this.containers].map(([sandboxId, { sessionId, state }]) => ({ sandboxId, sessionId, status: state }));
 	}
 	daemonCommand(sandboxId: string, epoch: number): string[] {
 		return ["fake-daemon", sandboxId, String(epoch)];

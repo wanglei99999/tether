@@ -10,5 +10,6 @@ export * from "./services/agents.ts";
 export * from "./services/sandboxes.ts";
 export * from "./services/sessions.ts";
 export * from "./startup.ts";
+export * from "./sweeper.ts";
 export * from "./tools.ts";
 export * from "./validate.ts";

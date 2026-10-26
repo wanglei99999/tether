@@ -53,6 +53,7 @@ async function sessionWith(setup: string[], variables: Record<string, string>, s
 		store,
 		provider,
 		exec,
+		engine: { isRunning: async () => false },
 		clock: { now: () => new Date().toISOString() },
 		record: async () => {},
 		log: { warn: () => {} },

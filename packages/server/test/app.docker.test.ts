@@ -117,6 +117,40 @@ describe("createTether on docker", () => {
 		await shutdown(tether);
 	});
 
+	it("stops an idle sandbox, and the next tool call starts it again with the note in the transcript", async () => {
+		const config = newConfig({ TETHER_STOP_AFTER_SECONDS: "1", TETHER_SWEEP_INTERVAL_SECONDS: "0.2" });
+		const requests: string[][] = [];
+		const script: ScriptStep[] = [
+			{ toolCall: { name: "bash", args: { command: "echo kept > kept.txt" } } },
+			{ text: "written" },
+			{ toolCall: { name: "bash", args: { command: "cat kept.txt" } } },
+			{ text: "read" },
+		];
+		const tether = await createTether(config, { models: fauxModels(script, requests) });
+		opened.push(tether);
+		const { agents, sessions, sandboxes, engine, store } = tether.services;
+		const { agent } = await agents.create({ name: "idle", spec: bashSpec() });
+		const session = await sessions.create({ agentId: agent.id });
+
+		await engine.waitSubmission((await sessions.sendMessage(session.id, { content: "a", requestId: "r1" })).submissionId);
+		const stopped = await waitFor(async () => (await sandboxes.status(session.id))?.state === "stopped", 20_000);
+		expect(stopped).toBe(true);
+		const binding = await sandboxes.status(session.id);
+		const { stdout } = await run("docker", ["inspect", "--format", "{{.State.Status}}", binding!.sandboxId]);
+		expect(stdout.trim()).toBe("exited");
+		expect((await store.getSession(session.id))?.status).toBe("idle");
+
+		await engine.waitSubmission((await sessions.sendMessage(session.id, { content: "b", requestId: "r2" })).submissionId);
+
+		expect((await store.getSession(session.id))?.status).toBe("active");
+		const { items } = await sessions.transcript(session.id, { limit: 50 });
+		expect(items.find((e) => e.kind === "tether.sandbox" && (e.data as { reason?: string }).reason === "idle")).toBeDefined();
+		const read = items.find((e) => e.role === "tool");
+		expect(read?.toolResult).toMatchObject({ isError: false, text: expect.stringContaining("kept") });
+		expect(requests.at(-2)?.join("\n")).toMatch(/The sandbox was stopped after \d+ minutes without activity/);
+		await shutdown(tether);
+	});
+
 	it("creates no sandbox for a run without tool calls", async () => {
 		const config = newConfig();
 		const tether = await open(config, [{ text: "just chatting" }]);
@@ -191,6 +225,16 @@ describe("createTether on docker", () => {
 		await shutdown(recovered);
 	});
 });
+
+/** 每 100 毫秒检查一次，条件成立返回 true，超时返回 false。 */
+async function waitFor(check: () => Promise<boolean>, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (await check()) return true;
+		await sleep(100);
+	}
+	return false;
+}
 
 /** 等子进程提交了消息、bash 已经在容器里开始执行，然后 SIGKILL。返回提交 ID。 */
 async function killWhenStarted(child: ChildProcess, marker: string): Promise<string> {

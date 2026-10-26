@@ -8,7 +8,7 @@ import {
 	type SandboxNote,
 	SandboxService,
 } from "../src/index.ts";
-import { FakeClock, FakeExecChannel, FakeProvider } from "./fakes.ts";
+import { FakeClock, FakeEngine, FakeExecChannel, FakeProvider, ManualClock } from "./fakes.ts";
 
 type Recorded = { sessionId: string; kind: SandboxNote["kind"]; state: SandboxBinding["state"]; reason?: string };
 
@@ -26,12 +26,14 @@ class SpyStore extends MemoryAppStore {
 	}
 }
 
-async function setUp(
-	setup: string[] = [],
-	variables: Record<string, string> = {},
-	setupTimeoutMs?: number,
-	maxRunning?: number,
-) {
+interface SetUpOptions {
+	setupTimeoutMs?: number;
+	maxRunning?: number;
+	stopAfterMs?: number;
+}
+
+async function setUp(setup: string[] = [], variables: Record<string, string> = {}, options: SetUpOptions = {}) {
+	const { setupTimeoutMs, maxRunning, stopAfterMs } = options;
 	const store = new SpyStore();
 	const spec = sampleSpec();
 	spec.sandbox.setup = setup;
@@ -40,6 +42,9 @@ async function setUp(
 	await store.createSession(sampleSession("ses_1", { engineSessionId: "eng_1", variables }));
 	const provider = new FakeProvider();
 	const exec = new FakeExecChannel();
+	const engine = new FakeEngine();
+	await engine.createSession({ model: spec.model, instructions: "", tools: [], cwd: "/workspace" });
+	const clock = new ManualClock();
 	const recorded: Recorded[] = [];
 	const notes: SandboxNote[] = [];
 	const warnings: string[] = [];
@@ -47,7 +52,8 @@ async function setUp(
 		store,
 		provider,
 		exec,
-		clock: new FakeClock(),
+		engine,
+		clock,
 		record: async (sessionId, note) => {
 			notes.push(note);
 			recorded.push({ sessionId, kind: note.kind, ...(note.data as { state: SandboxBinding["state"]; reason?: string }) });
@@ -55,14 +61,16 @@ async function setUp(
 		log: { warn: (message) => warnings.push(message) },
 		...(setupTimeoutMs !== undefined && { setupTimeoutMs }),
 		...(maxRunning !== undefined && { maxRunning }),
+		...(stopAfterMs !== undefined && { stopAfterMs }),
 	});
-	return { store, provider, exec, recorded, notes, warnings, sandboxes };
+	return { store, provider, exec, engine, clock, recorded, notes, warnings, sandboxes };
 }
 
-/** ses_1 到 ses_<count> 共用一个 SandboxService，上限为 maxRunning。 */
-async function setUpSessions(count: number, maxRunning?: number) {
-	const made = await setUp([], {}, undefined, maxRunning);
+/** ses_1 到 ses_<count> 共用一个 SandboxService；每个会话都有引擎会话 eng_<i>。 */
+async function setUpSessions(count: number, options: SetUpOptions = {}) {
+	const made = await setUp([], {}, options);
 	for (let i = 2; i <= count; i++) {
+		await made.engine.createSession({ model: sampleSpec().model, instructions: "", tools: [], cwd: "/workspace" });
 		await made.store.createSession(sampleSession(`ses_${i}`, { engineSessionId: `eng_${i}` }));
 	}
 	return made;
@@ -86,7 +94,7 @@ describe("SandboxService.ensureSandbox", () => {
 	});
 
 	it("bounds every setup command with the configured timeout", async () => {
-		const { exec, sandboxes } = await setUp(["a", "b"], {}, 1_500);
+		const { exec, sandboxes } = await setUp(["a", "b"], {}, { setupTimeoutMs: 1_500 });
 		await sandboxes.ensureSandbox("ses_1");
 		expect(exec.calls.map((call) => call.timeoutMs)).toEqual([1_500, 1_500]);
 	});
@@ -249,7 +257,7 @@ describe("SandboxService.ensureSandbox", () => {
 
 describe("SandboxService admission", () => {
 	it("refuses a new sandbox at the limit with sandbox_limit and records tether.admission", async () => {
-		const { store, provider, notes, sandboxes } = await setUpSessions(2, 1);
+		const { store, provider, notes, sandboxes } = await setUpSessions(2, { maxRunning: 1 });
 		await sandboxes.ensureSandbox("ses_1");
 		notes.length = 0;
 
@@ -265,7 +273,7 @@ describe("SandboxService admission", () => {
 	});
 
 	it("admits again after another sandbox stops", async () => {
-		const { store, provider, sandboxes } = await setUpSessions(2, 1);
+		const { store, provider, sandboxes } = await setUpSessions(2, { maxRunning: 1 });
 		const first = await sandboxes.ensureSandbox("ses_1");
 		await expect(sandboxes.ensureSandbox("ses_2")).rejects.toMatchObject({ code: "sandbox_limit" });
 		await provider.stop(first.sandboxId);
@@ -277,7 +285,7 @@ describe("SandboxService admission", () => {
 	});
 
 	it("admits exactly the limit when first tool calls in more sessions arrive at once", async () => {
-		const { provider, notes, sandboxes } = await setUpSessions(5, 4);
+		const { provider, notes, sandboxes } = await setUpSessions(5, { maxRunning: 4 });
 		provider.createDelayMs = 20;
 
 		const results = await Promise.allSettled(
@@ -295,7 +303,7 @@ describe("SandboxService admission", () => {
 	});
 
 	it("never refuses tool calls on a sandbox that is already running", async () => {
-		const { store, provider, sandboxes } = await setUpSessions(2, 1);
+		const { store, provider, sandboxes } = await setUpSessions(2, { maxRunning: 1 });
 		const first = await sandboxes.ensureSandbox("ses_1");
 		// 上限调低之前留下的第二个运行中的沙箱：现在已经超过上限
 		await store.createBinding({ ...first, sessionId: "ses_2", sandboxId: "sbx_other" });
@@ -307,7 +315,7 @@ describe("SandboxService admission", () => {
 	});
 
 	it("applies the limit to starting a stopped sandbox", async () => {
-		const { store, provider, sandboxes } = await setUpSessions(2, 1);
+		const { store, provider, sandboxes } = await setUpSessions(2, { maxRunning: 1 });
 		const first = await sandboxes.ensureSandbox("ses_1");
 		await provider.stop(first.sandboxId);
 		await store.updateBinding("ses_1", { state: "stopped" }, { state: "running" });
@@ -325,6 +333,158 @@ describe("SandboxService admission", () => {
 		for (const id of ["ses_1", "ses_2", "ses_3", "ses_4"]) await sandboxes.ensureSandbox(id);
 
 		await expect(sandboxes.ensureSandbox("ses_5")).rejects.toMatchObject({ code: "sandbox_limit" });
+	});
+});
+
+const HOUR = 3_600_000;
+const NOTHING = { stoppedIdle: 0, stoppedOutside: 0, lost: 0 };
+
+describe("SandboxService.sweep", () => {
+	it("stops a sandbox idle for stopAfter, writes the model-visible note and marks the session idle", async () => {
+		const { store, provider, exec, clock, notes, sandboxes } = await setUp();
+		const { sandboxId } = await sandboxes.ensureSandbox("ses_1");
+		clock.advance(HOUR);
+
+		const result = await sandboxes.sweep();
+
+		expect(result).toEqual({ ...NOTHING, stoppedIdle: 1 });
+		expect(provider.containers.get(sandboxId)?.state).toBe("stopped");
+		expect((await store.getBinding("ses_1"))?.state).toBe("stopped");
+		expect(exec.closed).toEqual([sandboxId]);
+		expect(notes.at(-1)).toEqual({
+			kind: "tether.sandbox",
+			data: { state: "stopped", reason: "idle" },
+			modelText: NOTES.stoppedIdle(60),
+		});
+		expect((await store.getSession("ses_1"))?.status).toBe("idle");
+	});
+
+	it("does not stop a sandbox whose session is running, and refreshes lastUsedAt", async () => {
+		const { store, engine, clock, sandboxes } = await setUp();
+		await sandboxes.ensureSandbox("ses_1");
+		engine.running.add("eng_1");
+		clock.advance(2 * HOUR);
+
+		const result = await sandboxes.sweep();
+
+		expect(result).toEqual(NOTHING);
+		expect(await store.getBinding("ses_1")).toMatchObject({ state: "running", lastUsedAt: clock.now() });
+	});
+
+	it("does not stop a sandbox used within stopAfter", async () => {
+		const { store, clock, sandboxes } = await setUp();
+		await sandboxes.ensureSandbox("ses_1");
+		clock.advance(HOUR - 60_000);
+		// 每次工具调用都刷新最后使用时间
+		await sandboxes.ensureSandbox("ses_1");
+		clock.advance(HOUR - 60_000);
+
+		expect(await sandboxes.sweep()).toEqual(NOTHING);
+		expect((await store.getBinding("ses_1"))?.state).toBe("running");
+	});
+
+	it("uses the configured stopAfter", async () => {
+		const { clock, sandboxes } = await setUp([], {}, { stopAfterMs: 1_000 });
+		await sandboxes.ensureSandbox("ses_1");
+		clock.advance(1_000);
+
+		expect(await sandboxes.sweep()).toEqual({ ...NOTHING, stoppedIdle: 1 });
+	});
+
+	it("restarts the stopped sandbox on the next tool call", async () => {
+		const { provider, clock, recorded, sandboxes } = await setUp();
+		const first = await sandboxes.ensureSandbox("ses_1");
+		clock.advance(HOUR);
+		await sandboxes.sweep();
+
+		const again = await sandboxes.ensureSandbox("ses_1");
+
+		expect(again).toMatchObject({ sandboxId: first.sandboxId, state: "running" });
+		expect(provider.containers.get(first.sandboxId)?.state).toBe("running");
+		expect(recorded.at(-1)).toMatchObject({ state: "running", reason: "started" });
+	});
+
+	it("runs a tool call that arrives during a sweep's stop after the stop, restarting the sandbox", async () => {
+		const { store, provider, clock, recorded, sandboxes } = await setUp();
+		const { sandboxId } = await sandboxes.ensureSandbox("ses_1");
+		clock.advance(HOUR);
+		let stopping!: () => void;
+		const stopStarted = new Promise<void>((resolve) => {
+			stopping = resolve;
+		});
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const stop = provider.stop.bind(provider);
+		provider.stop = async (id) => {
+			stopping();
+			await gate;
+			await stop(id);
+		};
+
+		const sweep = sandboxes.sweep();
+		await stopStarted;
+		const toolCall = sandboxes.ensureSandbox("ses_1");
+		release();
+		const [result, binding] = await Promise.all([sweep, toolCall]);
+
+		expect(result).toEqual({ ...NOTHING, stoppedIdle: 1 });
+		expect(binding).toMatchObject({ sandboxId, state: "running" });
+		expect(provider.containers.get(sandboxId)?.state).toBe("running");
+		expect((await store.getBinding("ses_1"))?.state).toBe("running");
+		expect(recorded.slice(-2).map((r) => [r.state, r.reason])).toEqual([
+			["stopped", "idle"],
+			["running", "started"],
+		]);
+	});
+
+	it("marks a running binding stopped with the outside-stop note when the container is stopped", async () => {
+		const { store, provider, notes, sandboxes } = await setUp();
+		const { sandboxId } = await sandboxes.ensureSandbox("ses_1");
+		await provider.stop(sandboxId);
+
+		const result = await sandboxes.sweep();
+
+		expect(result).toEqual({ ...NOTHING, stoppedOutside: 1 });
+		expect((await store.getBinding("ses_1"))?.state).toBe("stopped");
+		expect(notes.at(-1)).toEqual({
+			kind: "tether.sandbox",
+			data: { state: "stopped", reason: "stopped outside Tether" },
+			modelText: NOTES.stoppedOutside,
+		});
+		expect((await store.getSession("ses_1"))?.status).toBe("idle");
+	});
+
+	it("marks a binding lost when its container is gone", async () => {
+		const { store, provider, notes, sandboxes } = await setUp();
+		await sandboxes.ensureSandbox("ses_1");
+		provider.containers.clear();
+
+		const result = await sandboxes.sweep();
+
+		expect(result).toEqual({ ...NOTHING, lost: 1 });
+		expect((await store.getBinding("ses_1"))?.state).toBe("lost");
+		expect(notes.at(-1)).toEqual({ kind: "tether.sandbox", data: { state: "lost", reason: "missing" } });
+	});
+
+	it("keeps sweeping other sessions when one fails", async () => {
+		const { store, provider, clock, warnings, sandboxes } = await setUpSessions(2);
+		const broken = await sandboxes.ensureSandbox("ses_1");
+		await sandboxes.ensureSandbox("ses_2");
+		clock.advance(HOUR);
+		const stop = provider.stop.bind(provider);
+		provider.stop = async (id) => {
+			if (id === broken.sandboxId) throw new Error("docker stop hung up");
+			await stop(id);
+		};
+
+		const result = await sandboxes.sweep();
+
+		expect(result).toEqual({ ...NOTHING, stoppedIdle: 1 });
+		expect((await store.getBinding("ses_1"))?.state).toBe("running");
+		expect((await store.getBinding("ses_2"))?.state).toBe("stopped");
+		expect(warnings.some((w) => w.includes("ses_1"))).toBe(true);
 	});
 });
 
@@ -391,6 +551,7 @@ describe("SandboxService.connect", () => {
 			store,
 			provider,
 			exec,
+			engine: new FakeEngine(),
 			clock: new FakeClock(),
 			record: async (_sessionId, note) => {
 				notes.push(note);

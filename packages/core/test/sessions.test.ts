@@ -91,6 +91,16 @@ describe("SessionService", () => {
 		expect(updated && updated.lastActiveAt > session.lastActiveAt).toBe(true);
 	});
 
+	it("turns an idle session active again when a message is sent", async () => {
+		const { store, sessions, agentId } = await setUp();
+		const session = await sessions.create({ agentId });
+		await store.updateSession(session.id, { status: "idle" });
+
+		await sessions.sendMessage(session.id, { content: "back", requestId: "r1" });
+
+		expect((await store.getSession(session.id))?.status).toBe("active");
+	});
+
 	it("rejects messages to a session whose engine session was never created", async () => {
 		const { engine, sessions, agentId } = await setUp();
 		engine.failCreate = true;

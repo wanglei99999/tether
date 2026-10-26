@@ -3,7 +3,7 @@ import { TetherError } from "../errors.ts";
 import { KeyedLock } from "../lock.ts";
 import type { BindingPatch, SandboxBinding, SandboxState } from "../model.ts";
 import { NOTES, type SandboxNote } from "../notes.ts";
-import type { AppStore, Clock, ExecChannel, SandboxProvider } from "../ports.ts";
+import type { AgentEngine, AppStore, Clock, ExecChannel, SandboxProvider } from "../ports.ts";
 import { nextState, type SandboxEvent } from "../sandbox-lifecycle.ts";
 import type { Log } from "../startup.ts";
 
@@ -13,6 +13,8 @@ export interface SandboxServiceDeps {
 	store: AppStore;
 	provider: SandboxProvider;
 	exec: ExecChannel;
+	/** 巡检用它判断会话是否正在运行：正在跑的会话不算闲置。 */
+	engine: Pick<AgentEngine, "isRunning">;
 	clock: Clock;
 	/** 写一条条目进会话记录（设计文档 §4.4），由组装层接到引擎的 appendEntry。 */
 	record: SandboxRecord;
@@ -21,11 +23,21 @@ export interface SandboxServiceDeps {
 	setupTimeoutMs?: number;
 	/** 同时运行（含创建中）的沙箱上限，默认 DEFAULT_MAX_RUNNING_SANDBOXES（spec §4.6）。 */
 	maxRunning?: number;
+	/** 会话不在运行、沙箱这么久没用就停止，默认 DEFAULT_STOP_AFTER_MS（spec §8.5）。 */
+	stopAfterMs?: number;
+}
+
+/** 一轮巡检停掉和标记丢失的沙箱数。 */
+export interface SweepResult {
+	stoppedIdle: number;
+	stoppedOutside: number;
+	lost: number;
 }
 
 export const WORKSPACE = "/workspace";
 export const DEFAULT_SETUP_TIMEOUT_MS = 10 * 60 * 1000;
 export const DEFAULT_MAX_RUNNING_SANDBOXES = 4;
+export const DEFAULT_STOP_AFTER_MS = 60 * 60 * 1000;
 /** 准入锁只有一把，所有会话共用这个键。 */
 const ADMISSION = "admission";
 /** setup 失败时错误消息里保留的输出长度。 */
@@ -95,10 +107,86 @@ export class SandboxService {
 		return provider.daemonCommand(binding.sandboxId, epoch);
 	}
 
+	/**
+	 * 定期巡检：和后端核对每个 running、stopped 的绑定，停掉闲置的沙箱。
+	 * 每个会话在自己的锁里处理，和工具调用排队；一个会话出错只记日志，不影响其他会话。
+	 */
+	async sweep(): Promise<SweepResult> {
+		const { store, provider, log } = this.#deps;
+		const result: SweepResult = { stoppedIdle: 0, stoppedOutside: 0, lost: 0 };
+		// 先取绑定再取容器：之后才建的沙箱不在这一轮里，不会因为列表里没有它而被误判丢失
+		const bindings = (await store.listBindings()).filter((b) => b.state === "running" || b.state === "stopped");
+		const listed = new Map((await provider.listManaged()).map((s) => [s.sandboxId, s.status]));
+		for (const { sessionId } of bindings) {
+			try {
+				const outcome = await this.#lock.run(sessionId, () => this.#sweepOne(sessionId, listed));
+				if (outcome) result[outcome]++;
+			} catch (error) {
+				log.warn(`sweeping the sandbox of session ${sessionId} failed`, error);
+			}
+		}
+		return result;
+	}
+
+	async #sweepOne(
+		sessionId: string,
+		listed: ReadonlyMap<string, "running" | "stopped">,
+	): Promise<keyof SweepResult | undefined> {
+		const { store, provider, exec, engine, clock } = this.#deps;
+		// 等锁期间工具调用可能已经改了绑定，以锁内读到的为准
+		const binding = await store.getBinding(sessionId);
+		if (binding?.state !== "running" && binding?.state !== "stopped") return undefined;
+		let status: "running" | "stopped" | "missing" = listed.get(binding.sandboxId) ?? "missing";
+		// 列表是锁外取的，和绑定不一致时再问一次后端
+		if (status !== binding.state) status = await provider.status(binding.sandboxId);
+
+		if (status === "missing") {
+			exec.close(binding.sandboxId);
+			await this.#transition(binding, "vanish");
+			// 不告诉模型：下次工具调用重建时再写模型可见的说明（Task 6）
+			await this.#note(sessionId, { state: "lost", reason: "missing" });
+			return "lost";
+		}
+		if (binding.state === "stopped") return undefined;
+
+		if (status === "stopped") {
+			exec.close(binding.sandboxId);
+			await this.#transition(binding, "stop");
+			await this.#stoppedNote(sessionId, "stopped outside Tether", NOTES.stoppedOutside);
+			return "stoppedOutside";
+		}
+
+		const session = await store.getSession(sessionId);
+		if (session?.engineSessionId && (await engine.isRunning(session.engineSessionId))) {
+			// 正在跑（例如一条长命令）不算闲置；闲置从这一轮结束后算起
+			await store.updateBinding(sessionId, { lastUsedAt: clock.now() }, { state: "running" });
+			return undefined;
+		}
+		const stopAfterMs = this.#deps.stopAfterMs ?? DEFAULT_STOP_AFTER_MS;
+		if (Date.parse(clock.now()) - Date.parse(binding.lastUsedAt) < stopAfterMs) return undefined;
+
+		await provider.stop(binding.sandboxId);
+		exec.close(binding.sandboxId);
+		await this.#transition(binding, "stop");
+		await this.#stoppedNote(sessionId, "idle", NOTES.stoppedIdle(Math.round(stopAfterMs / 60_000)));
+		return "stoppedIdle";
+	}
+
+	/** 沙箱停了：写模型可见的说明，活动中的会话改为 idle。 */
+	async #stoppedNote(sessionId: string, reason: string, modelText: string): Promise<void> {
+		await this.#deps.record(sessionId, { kind: "tether.sandbox", data: { state: "stopped", reason }, modelText });
+		const session = await this.#deps.store.getSession(sessionId);
+		if (session?.status === "active") await this.#deps.store.updateSession(sessionId, { status: "idle" });
+	}
+
 	async #ensure(sessionId: string): Promise<SandboxBinding> {
-		const binding = await this.#deps.store.getBinding(sessionId);
-		// 每次工具调用都走这里，运行中的直接用，不过准入；容器在运行中丢失由执行通道的报错暴露（Task 5 做巡检）。
-		if (binding?.state === "running") return binding;
+		const { store, clock } = this.#deps;
+		const binding = await store.getBinding(sessionId);
+		// 每次工具调用都走这里，运行中的直接用，不过准入，只刷新最后使用时间。
+		// 容器在运行中丢失由巡检或执行通道的报错发现。
+		if (binding?.state === "running") {
+			return store.updateBinding(sessionId, { lastUsedAt: clock.now() }, { state: "running" });
+		}
 		if (binding?.state === "stopped") return this.#admit(sessionId, () => this.#start(binding));
 		// 其余状态先按状态表检查能不能重建，再作废旧绑定（Task 6 换成正式重建并写说明）
 		nextState(binding?.state, "create");

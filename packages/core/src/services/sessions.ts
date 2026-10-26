@@ -83,6 +83,8 @@ export class SessionService {
 	): Promise<{ submissionId: string }> {
 		const session = await this.get(id);
 		if (session.status === "archived") throw new TetherError("conflict", `session ${id} is archived`);
+		// 沙箱闲置停止后会话是 idle；有新消息就回到 active，沙箱等下次工具调用再启动
+		if (session.status === "idle") await this.#deps.store.updateSession(id, { status: "active" });
 		const result = await this.#deps.engine.submit(this.#engineId(session), input);
 		await this.#deps.store.updateSession(id, { lastActiveAt: this.#deps.clock.now() });
 		return result;

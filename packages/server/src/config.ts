@@ -14,6 +14,21 @@ export interface Config {
 	setupTimeoutMs: number;
 	/** 同时运行的沙箱上限（TETHER_MAX_RUNNING_SANDBOXES，默认 4）。 */
 	maxRunningSandboxes: number;
+	/** 沙箱闲置多久后停止（TETHER_STOP_AFTER_SECONDS，默认 3600 秒）。 */
+	stopAfterMs: number;
+	/** 巡检间隔（TETHER_SWEEP_INTERVAL_SECONDS，默认 60 秒）。 */
+	sweepIntervalMs: number;
+}
+
+/** 以秒配置的时长，转成毫秒；必须是正数。 */
+function duration(env: NodeJS.ProcessEnv, name: string, defaultSeconds: number): number {
+	const raw = setting(env, name);
+	if (raw === undefined) return defaultSeconds * 1000;
+	const seconds = Number(raw);
+	if (!Number.isFinite(seconds) || seconds <= 0) {
+		throw new TetherError("invalid_request", `${name} must be a positive number, got ${raw}`);
+	}
+	return Math.round(seconds * 1000);
 }
 
 function maxRunningSandboxes(raw: string | undefined): number {
@@ -23,15 +38,6 @@ function maxRunningSandboxes(raw: string | undefined): number {
 		throw new TetherError("invalid_request", `TETHER_MAX_RUNNING_SANDBOXES must be a positive integer, got ${raw}`);
 	}
 	return limit;
-}
-
-function setupTimeoutMs(raw: string | undefined): number {
-	if (raw === undefined) return 600_000;
-	const seconds = Number(raw);
-	if (!Number.isFinite(seconds) || seconds <= 0) {
-		throw new TetherError("invalid_request", `TETHER_SETUP_TIMEOUT_SECONDS must be a positive number, got ${raw}`);
-	}
-	return Math.round(seconds * 1000);
 }
 
 /** 空字符串和未设置同样处理：`TETHER_DATA_DIR=` 不应该把数据写进当前目录。 */
@@ -55,7 +61,9 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
 		...(token !== undefined && { token }),
 		workspaceRoot: resolve(dataDir, "workspaces"),
 		sandboxImage: setting(env, "TETHER_SANDBOX_IMAGE") ?? "tether-sandbox:dev",
-		setupTimeoutMs: setupTimeoutMs(setting(env, "TETHER_SETUP_TIMEOUT_SECONDS")),
+		setupTimeoutMs: duration(env, "TETHER_SETUP_TIMEOUT_SECONDS", 600),
 		maxRunningSandboxes: maxRunningSandboxes(setting(env, "TETHER_MAX_RUNNING_SANDBOXES")),
+		stopAfterMs: duration(env, "TETHER_STOP_AFTER_SECONDS", 3600),
+		sweepIntervalMs: duration(env, "TETHER_SWEEP_INTERVAL_SECONDS", 60),
 	};
 }

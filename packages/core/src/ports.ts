@@ -73,6 +73,8 @@ export interface AgentEngine {
 	): Promise<{ submissionId: string }>;
 	waitSubmission(submissionId: string): Promise<{ status: "done" | "unanswered"; answer?: TranscriptEntry }>;
 	abort(engineSessionId: string): Promise<void>;
+	/** 是否有一轮正在运行，与 SessionView.running 同一来源。未知会话报 not_found。 */
+	isRunning(engineSessionId: string): Promise<boolean>;
 	/** 新的在前。 */
 	transcript(
 		engineSessionId: string,
@@ -105,7 +107,8 @@ export interface SandboxProvider {
 	stop(sandboxId: string): Promise<void>;
 	/** 同时删除工作区目录；沙箱不存在不报错。 */
 	destroy(sandboxId: string): Promise<void>;
-	listManaged(): Promise<{ sandboxId: string; sessionId: string }[]>;
+	/** Tether 管理的全部沙箱及其状态，一次后端调用（巡检每轮用它和绑定核对）。 */
+	listManaged(): Promise<{ sandboxId: string; sessionId: string; status: "running" | "stopped" }[]>;
 	/**
 	 * 杀掉沙箱里除 init 以外的全部进程（旧 daemon 和它启动的命令），删除 epoch 更小的 daemon 记录（ADR-007）。
 	 * 沙箱没有自己的 PID 命名空间、init 不对或执行失败时抛 sandbox_failed。

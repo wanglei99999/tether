@@ -11,8 +11,11 @@ import {
 	BUILTIN_TOOLS,
 	type Log,
 	recover,
+	type SandboxRecord,
 	SandboxService,
 	SessionService,
+	startSweeper,
+	TetherError,
 	WORKSPACE,
 } from "@tether/core";
 import { openPiEngine } from "./adapters/engine-pi/index.ts";
@@ -81,24 +84,32 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 	const exec = createPiEnvExecChannel({ connect: (binding) => sandboxes.connect(binding.sessionId) });
 
 	let engine: AgentEngine | undefined;
+	const record: SandboxRecord = async (sessionId, { kind, data, modelText }) => {
+		const session = await store.getSession(sessionId);
+		if (engine && session?.engineSessionId) {
+			await engine.appendEntry(session.engineSessionId, {
+				kind,
+				data,
+				...(modelText !== undefined && { modelText }),
+			});
+		}
+	};
 	const sandboxes: SandboxService = new SandboxService({
 		store,
 		provider,
 		exec,
+		engine: {
+			isRunning: (engineSessionId) => {
+				if (!engine) throw new TetherError("internal", "the engine is not open yet");
+				return engine.isRunning(engineSessionId);
+			},
+		},
 		clock: systemClock,
 		setupTimeoutMs: config.setupTimeoutMs,
 		maxRunning: config.maxRunningSandboxes,
+		stopAfterMs: config.stopAfterMs,
 		log,
-		record: async (sessionId, { kind, data, modelText }) => {
-			const session = await store.getSession(sessionId);
-			if (engine && session?.engineSessionId) {
-				await engine.appendEntry(session.engineSessionId, {
-					kind,
-					data,
-					...(modelText !== undefined && { modelText }),
-				});
-			}
-		},
+		record,
 	});
 
 	const opened = await openPiEngine({
@@ -123,14 +134,22 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 	const agents = new AgentService({ store, clock: systemClock, ids, catalog: BUILTIN_TOOLS });
 	const sessions = new SessionService({ store, engine: opened, agents, clock: systemClock, ids });
 
+	let recovered: Awaited<ReturnType<typeof recover>>;
 	try {
-		await recover({ store, engine: opened, provider, sessions, log });
+		recovered = await recover({ store, engine: opened, provider, sessions, log });
 	} catch (error) {
 		await opened.close();
 		exec.closeAll();
 		await closeStore();
 		throw error;
 	}
+	// resume 之后才写：在 resume 之前写引擎条目会让 pi 提前续跑。写不进去只少一条说明，不影响启动
+	for (const { sessionId, note } of recovered.notes) {
+		await record(sessionId, note).catch((error: unknown) =>
+			log.warn(`recording the startup note for session ${sessionId} failed`, error),
+		);
+	}
+	const sweeper = startSweeper(() => sandboxes.sweep(), config.sweepIntervalMs, log);
 
 	const http = createHttpApp({
 		agents,
@@ -143,6 +162,8 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 		...http,
 		services: { store, engine: opened, agents, sessions, sandboxes },
 		close: async () => {
+			// 先停巡检并等进行中的那次结束，它会用到下面要关的引擎、通道和存储
+			await sweeper.stop();
 			http.closeEventStreams();
 			await opened.close();
 			exec.closeAll();

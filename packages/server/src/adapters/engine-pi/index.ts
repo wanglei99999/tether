@@ -133,6 +133,17 @@ export async function openPiEngine(options: PiEngineOptions): Promise<AgentEngin
 			await (await require(engineSessionId)).abort(context);
 		},
 
+		async isRunning(engineSessionId) {
+			const conversation = await require(engineSessionId);
+			// 和订阅的快照同一来源（SessionView.running）；只要快照，不启动这个流
+			const stream = await watchEvents(harness, conversation.id, context);
+			try {
+				return stream.snapshot.run !== undefined;
+			} finally {
+				await stream.stop();
+			}
+		},
+
 		async transcript(engineSessionId, page) {
 			const conversation = await require(engineSessionId);
 			const before = page.before === undefined ? undefined : parseId(page.before);
