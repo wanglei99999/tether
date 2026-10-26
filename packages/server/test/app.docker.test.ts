@@ -12,6 +12,7 @@ import { buildSandboxImage } from "../src/adapters/sandbox-docker/index.ts";
 import { createTether, type Tether } from "../src/app.ts";
 import { type Config, loadConfig } from "../src/config.ts";
 import { FAUX_MODEL, fauxModels } from "./fixtures/faux.ts";
+import { runtimeEnv } from "./fixtures/runtime.ts";
 
 const run = promisify(execFile);
 const IMAGE = "tether-sandbox:dev";
@@ -22,7 +23,7 @@ const opened: Tether[] = [];
 function newConfig(env: Record<string, string> = {}): Config {
 	const dataDir = mkdtempSync(join(tmpdir(), "tether-app-"));
 	dirs.push(dataDir);
-	return loadConfig({ TETHER_DATA_DIR: dataDir, TETHER_PORT: "0", TETHER_SANDBOX_IMAGE: IMAGE, ...env });
+	return loadConfig({ TETHER_DATA_DIR: dataDir, TETHER_PORT: "0", TETHER_SANDBOX_IMAGE: IMAGE, ...runtimeEnv(), ...env });
 }
 
 function bashSpec(): AgentVersionSpec {

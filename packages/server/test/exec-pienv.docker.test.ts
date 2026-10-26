@@ -9,6 +9,7 @@ import { sampleSandboxSpec } from "@tether/testkit";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createPiEnvExecChannel } from "../src/adapters/exec-pienv/index.ts";
 import { buildSandboxImage, createDockerSandboxProvider } from "../src/adapters/sandbox-docker/index.ts";
+import { runtimeOption } from "./fixtures/runtime.ts";
 
 const run = promisify(execFile);
 const IMAGE = "tether-sandbox:dev";
@@ -19,6 +20,7 @@ const provider = createDockerSandboxProvider({
 	workspaceRoot,
 	user: `${process.getuid?.()}:${process.getgid?.()}`,
 	defaultImage: IMAGE,
+	...runtimeOption(),
 });
 /** 只测通道本身：不经 SandboxService，不隔离，固定用绑定里的 epoch。 */
 let connects = 0;

@@ -8,6 +8,7 @@ import { MemoryAppStore, sampleAgent, sampleSession, sampleSpec } from "@tether/
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createPiEnvExecChannel } from "../src/adapters/exec-pienv/index.ts";
 import { buildSandboxImage, createDockerSandboxProvider } from "../src/adapters/sandbox-docker/index.ts";
+import { runtimeOption } from "./fixtures/runtime.ts";
 
 const run = promisify(execFile);
 const IMAGE = "tether-sandbox:dev";
@@ -16,6 +17,7 @@ const provider = createDockerSandboxProvider({
 	workspaceRoot,
 	user: `${process.getuid?.()}:${process.getgid?.()}`,
 	defaultImage: IMAGE,
+	...runtimeOption(),
 });
 /** 测试里每个会话一个 SandboxService，按会话 ID 找到对应的服务来连接。 */
 const services = new Map<string, SandboxService>();

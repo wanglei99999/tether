@@ -7,6 +7,7 @@ import type { SandboxProvider } from "@tether/core";
 import { registerSandboxProviderConformance, sampleSandboxSpec } from "@tether/testkit";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { buildSandboxImage, createDockerSandboxProvider } from "../src/adapters/sandbox-docker/index.ts";
+import { runtimeOption } from "./fixtures/runtime.ts";
 
 const run = promisify(execFile);
 const IMAGE = "tether-sandbox:dev";
@@ -28,9 +29,9 @@ beforeAll(async () => {
 });
 
 /** 每个用例一个独立的工作区根目录，结束时销毁这次建过的所有沙箱。 */
-async function makeProvider() {
+async function makeProvider(options: { runtime?: string } = {}) {
 	const workspaceRoot = mkdtempSync(join(tmpdir(), "tether-ws-"));
-	const provider = createDockerSandboxProvider({ workspaceRoot, user: USER, defaultImage: IMAGE });
+	const provider = createDockerSandboxProvider({ workspaceRoot, user: USER, defaultImage: IMAGE, ...runtimeOption(), ...options });
 	const created: string[] = [];
 	const tracked: SandboxProvider = {
 		...provider,
@@ -51,7 +52,7 @@ async function makeProvider() {
 	};
 }
 
-registerSandboxProviderConformance({ describe, it, expect, beforeEach }, "docker", makeProvider);
+registerSandboxProviderConformance({ describe, it, expect, beforeEach }, "docker", () => makeProvider());
 
 describe("docker sandbox specifics", () => {
 	let made: Awaited<ReturnType<typeof makeProvider>>;
@@ -116,6 +117,27 @@ describe("docker sandbox specifics", () => {
 
 		expect(await inspect(sandboxId, '{{index .Config.Labels "tether.managed"}}')).toBe("1");
 		expect(await inspect(sandboxId, '{{index .Config.Labels "tether.session"}}')).toBe(sessionId);
+	});
+
+	it("runs the sandbox with no capabilities and no-new-privileges", async () => {
+		const { sandboxId } = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec() });
+
+		expect(await inspect(sandboxId, "{{json .HostConfig.CapDrop}}")).toBe('["ALL"]');
+		expect(await inspect(sandboxId, "{{json .HostConfig.CapAdd}}")).toBe("null");
+		expect(await inspect(sandboxId, "{{json .HostConfig.SecurityOpt}}")).toBe('["no-new-privileges"]');
+		// 进程里看到的有效能力集也是空的
+		expect(await docker("exec", sandboxId, "sh", "-c", "grep CapEff /proc/self/status")).toMatch(/CapEff:\s+0+$/);
+	});
+
+	// 用 runsc 而不是默认的 runc：传不传都是 runc 的话测不出来。需要测试机装了 gVisor（Task 9）
+	it("passes the configured runtime to docker run", async () => {
+		const gvisor = await makeProvider({ runtime: "runsc" });
+		try {
+			const { sandboxId } = await gvisor.provider.create({ sessionId: gvisor.sessionId(), spec: sampleSandboxSpec() });
+			expect(await inspect(sandboxId, "{{.HostConfig.Runtime}}")).toBe("runsc");
+		} finally {
+			await gvisor.cleanup();
+		}
 	});
 
 	it("rejects a session id that is not a plain name", async () => {

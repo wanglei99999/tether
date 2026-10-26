@@ -44,6 +44,12 @@ describe("loadConfig", () => {
 		});
 	});
 
+	it("reads TETHER_SANDBOX_RUNTIME, and leaves it unset by default", () => {
+		expect(loadConfig({ TETHER_SANDBOX_RUNTIME: "runsc" }).sandboxRuntime).toBe("runsc");
+		expect("sandboxRuntime" in loadConfig({})).toBe(false);
+		expect("sandboxRuntime" in loadConfig({ TETHER_SANDBOX_RUNTIME: "" })).toBe(false);
+	});
+
 	it("treats empty values as unset", () => {
 		expect(loadConfig({ TETHER_DATA_DIR: "", TETHER_PORT: "", TETHER_TOKEN: "" })).toEqual(loadConfig({}));
 	});

@@ -12,9 +12,30 @@ export function checkSchema(schema: TSchema, value: unknown, what: string): void
 	throw new TetherError("invalid_request", `${what} is invalid at ${path}: ${first?.message ?? "unknown error"}`);
 }
 
-export function validateVersionSpec(spec: unknown, catalog: readonly ToolDescriptor[]): AgentVersionSpec {
+/** spec 里已经定义、但还没有实现的配置；为 true 时填了就拒绝，不悄悄忽略。 */
+export interface Unsupported {
+	/** sandbox.resources.diskMb：Docker 限制磁盘要 overlay2 + xfs pquota。 */
+	diskMb: boolean;
+	/** permissions.requireApproval：审批在 M3。 */
+	approval: boolean;
+	/** checkpointPolicy "perRun"：检查点在 M3。 */
+	checkpoints: boolean;
+}
+
+export const UNSUPPORTED_IN_M2: Unsupported = { diskMb: true, approval: true, checkpoints: true };
+
+export function validateVersionSpec(
+	spec: unknown,
+	catalog: readonly ToolDescriptor[],
+	unsupported: Unsupported = UNSUPPORTED_IN_M2,
+): AgentVersionSpec {
 	checkSchema(AgentVersionSpec, spec, "agent version spec");
 	const typed = spec as AgentVersionSpec;
+
+	const notYet = (field: string) => new TetherError("invalid_request", `${field} is not supported yet`);
+	if (unsupported.diskMb && typed.sandbox.resources.diskMb !== undefined) throw notYet("sandbox.resources.diskMb");
+	if (unsupported.approval && typed.permissions.requireApproval.length > 0) throw notYet("permissions.requireApproval");
+	if (unsupported.checkpoints && typed.checkpointPolicy === "perRun") throw notYet("checkpointPolicy perRun");
 
 	const known = new Set(catalog.map((tool) => tool.name));
 	const unknown = typed.tools.filter((name) => !known.has(name));

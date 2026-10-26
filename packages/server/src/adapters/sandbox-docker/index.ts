@@ -22,6 +22,8 @@ export interface DockerSandboxOptions {
 	user: string;
 	/** spec.template 为空时用的镜像。 */
 	defaultImage: string;
+	/** docker run --runtime，例如 gVisor 的 runsc；不设则用 Docker 默认的 runc。 */
+	runtime?: string;
 }
 
 /** 构建默认沙箱镜像：Dockerfile、launch.sh 和 pi-env daemon 二进制放进临时构建上下文。 */
@@ -75,7 +77,7 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 			const sandboxId = `${NAME_PREFIX}${sessionId}`;
 			const workspace = workspaceOf(sessionId);
 			await mkdir(workspace, { recursive: true });
-			// spec.resources.diskMb 在 M1 忽略：Docker 限制磁盘依赖存储驱动（overlay2 + xfs pquota），测试机不满足。
+			// spec.resources.diskMb 不会到这里：校验时就拒绝（UNSUPPORTED_IN_M2）。Docker 限制磁盘依赖存储驱动（overlay2 + xfs pquota），测试机不满足。
 			await dockerOrThrow([
 				"run",
 				"--detach",
@@ -91,6 +93,12 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 				`${spec.resources.memoryMb}m`,
 				"--pids-limit",
 				"512",
+				// 容器里的进程以普通用户运行，用不到任何 Linux 能力；也不许经 setuid 程序提权
+				"--cap-drop",
+				"ALL",
+				"--security-opt",
+				"no-new-privileges",
+				...(options.runtime ? ["--runtime", options.runtime] : []),
 				"--network",
 				spec.network === "egress" ? "bridge" : "none",
 				"--user",

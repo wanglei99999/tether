@@ -16,6 +16,7 @@ import {
 	SessionService,
 	startSweeper,
 	TetherError,
+	UNSUPPORTED_IN_M2,
 	WORKSPACE,
 } from "@tether/core";
 import { openPiEngine } from "./adapters/engine-pi/index.ts";
@@ -79,6 +80,7 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 		workspaceRoot: config.workspaceRoot,
 		user: hostUser(),
 		defaultImage: config.sandboxImage,
+		...(config.sandboxRuntime !== undefined && { runtime: config.sandboxRuntime }),
 	});
 	// 每次启动 daemon 前先隔离旧的（ADR-007）。sandboxes 在下面才建好，回调只在运行时调用。
 	const exec = createPiEnvExecChannel({ connect: (binding) => sandboxes.connect(binding.sessionId) });
@@ -131,7 +133,7 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 	engine = opened;
 
 	const ids = createIds();
-	const agents = new AgentService({ store, clock: systemClock, ids, catalog: BUILTIN_TOOLS });
+	const agents = new AgentService({ store, clock: systemClock, ids, catalog: BUILTIN_TOOLS, unsupported: UNSUPPORTED_IN_M2 });
 	const sessions = new SessionService({ store, engine: opened, agents, sandboxes, clock: systemClock, ids });
 
 	let recovered: Awaited<ReturnType<typeof recover>>;

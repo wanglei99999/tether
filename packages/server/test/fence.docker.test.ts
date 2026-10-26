@@ -10,6 +10,7 @@ import { MemoryAppStore, sampleAgent, sampleSession, sampleSpec } from "@tether/
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createPiEnvExecChannel } from "../src/adapters/exec-pienv/index.ts";
 import { buildSandboxImage, createDockerSandboxProvider } from "../src/adapters/sandbox-docker/index.ts";
+import { runtimeOption } from "./fixtures/runtime.ts";
 
 const run = promisify(execFile);
 const IMAGE = "tether-sandbox:dev";
@@ -17,7 +18,7 @@ const USER = `${process.getuid?.()}:${process.getgid?.()}`;
 const HOLDER = fileURLToPath(new URL("./fixtures/holder.ts", import.meta.url));
 const PID_HOST = `tether-pidhost-${process.pid}`;
 const workspaceRoot = mkdtempSync(join(tmpdir(), "tether-ws-"));
-const provider = createDockerSandboxProvider({ workspaceRoot, user: USER, defaultImage: IMAGE });
+const provider = createDockerSandboxProvider({ workspaceRoot, user: USER, defaultImage: IMAGE, ...runtimeOption() });
 let counter = 0;
 
 async function dockerExec(sandboxId: string, script: string): Promise<{ code: number; stdout: string }> {

@@ -10,6 +10,8 @@ export interface Config {
 	token?: string;
 	workspaceRoot: string;
 	sandboxImage: string;
+	/** 沙箱容器的运行时（TETHER_SANDBOX_RUNTIME，例如 gVisor 的 runsc）；不设则用 Docker 默认的 runc。 */
+	sandboxRuntime?: string;
 	/** 每条 setup 命令的上限（TETHER_SETUP_TIMEOUT_SECONDS，默认 600 秒）。 */
 	setupTimeoutMs: number;
 	/** 同时运行的沙箱上限（TETHER_MAX_RUNNING_SANDBOXES，默认 4）。 */
@@ -54,6 +56,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
 		throw new TetherError("invalid_request", `TETHER_PORT must be a port number, got ${rawPort}`);
 	}
 	const token = setting(env, "TETHER_TOKEN");
+	const sandboxRuntime = setting(env, "TETHER_SANDBOX_RUNTIME");
 	return {
 		dataDir,
 		host: setting(env, "TETHER_HOST") ?? "127.0.0.1",
@@ -61,6 +64,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
 		...(token !== undefined && { token }),
 		workspaceRoot: resolve(dataDir, "workspaces"),
 		sandboxImage: setting(env, "TETHER_SANDBOX_IMAGE") ?? "tether-sandbox:dev",
+		...(sandboxRuntime !== undefined && { sandboxRuntime }),
 		setupTimeoutMs: duration(env, "TETHER_SETUP_TIMEOUT_SECONDS", 600),
 		maxRunningSandboxes: maxRunningSandboxes(setting(env, "TETHER_MAX_RUNNING_SANDBOXES")),
 		stopAfterMs: duration(env, "TETHER_STOP_AFTER_SECONDS", 3600),

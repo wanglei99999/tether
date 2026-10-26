@@ -22,6 +22,26 @@ describe("AgentService", () => {
 		).rejects.toMatchObject({ code: "invalid_request", message: expect.stringContaining("teleport") });
 	});
 
+	it("rejects unsupported fields on create and on a new version, and accepts them when the service supports them", async () => {
+		const { agents } = service();
+		const perRun = { ...sampleSpec(), checkpointPolicy: "perRun" as const };
+		const unsupported = { code: "invalid_request", message: "checkpointPolicy perRun is not supported yet" };
+
+		await expect(agents.create({ name: "a", spec: perRun })).rejects.toMatchObject(unsupported);
+		const { agent } = await agents.create({ name: "a", spec: sampleSpec() });
+		await expect(agents.addVersion(agent.id, perRun)).rejects.toMatchObject(unsupported);
+
+		const store = new MemoryAppStore();
+		const later = new AgentService({
+			store,
+			clock: new FakeClock(),
+			ids: new FakeIds(),
+			catalog: BUILTIN_TOOLS,
+			unsupported: { diskMb: true, approval: true, checkpoints: false },
+		});
+		await expect(later.create({ name: "b", spec: perRun })).resolves.toMatchObject({ version: { version: 1 } });
+	});
+
 	it("accepts only an image reference as the sandbox template", async () => {
 		const { agents } = service();
 		const withTemplate = (template: string) => {
