@@ -45,6 +45,25 @@ describe("lazyEnv", () => {
 		expect(source.calls()).toBe(1);
 	});
 
+	it("returns undefined for properties that are not ExecutionEnv methods", () => {
+		const env = lazyEnv({ id: "tether:ses_3", cwd: dir, resolve: counted().resolve });
+		const record = env as unknown as Record<string, unknown>;
+
+		expect(record.notAMethod).toBeUndefined();
+		expect(record.toJSON).toBeUndefined();
+		expect(typeof record.readTextFile).toBe("function");
+		expect(typeof record.exec).toBe("function");
+	});
+
+	it("resolves the environment once for two concurrent first calls", async () => {
+		const source = counted();
+		const env = lazyEnv({ id: "tether:ses_4", cwd: dir, resolve: source.resolve });
+
+		await Promise.all([env.exists(".", context), env.exists(".", context)]);
+
+		expect(source.calls()).toBe(1);
+	});
+
 	it("rejects a call when resolving fails, and resolves again on the next call", async () => {
 		const source = counted(1);
 		const env = lazyEnv({ id: "tether:ses_2", cwd: dir, resolve: source.resolve });

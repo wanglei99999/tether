@@ -17,7 +17,15 @@ const provider = createDockerSandboxProvider({
 	user: `${process.getuid?.()}:${process.getgid?.()}`,
 	defaultImage: IMAGE,
 });
-const exec = createPiEnvExecChannel({ daemonCommand: (id, epoch) => provider.daemonCommand(id, epoch) });
+/** 测试里每个会话一个 SandboxService，按会话 ID 找到对应的服务来连接。 */
+const services = new Map<string, SandboxService>();
+const exec = createPiEnvExecChannel({
+	connect: (binding) => {
+		const service = services.get(binding.sessionId);
+		if (!service) throw new Error(`no service for ${binding.sessionId}`);
+		return service.connect(binding.sessionId);
+	},
+});
 let counter = 0;
 
 beforeAll(async () => {
@@ -50,6 +58,7 @@ async function sessionWith(setup: string[], variables: Record<string, string>, s
 		log: { warn: () => {} },
 		...(setupTimeoutMs !== undefined && { setupTimeoutMs }),
 	});
+	services.set(sessionId, sandboxes);
 	return { store, sandboxes, sessionId, workspace: join(workspaceRoot, sessionId) };
 }
 

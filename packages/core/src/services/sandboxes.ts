@@ -2,7 +2,7 @@ import type { ExecResult } from "../env.ts";
 import { TetherError } from "../errors.ts";
 import { KeyedLock } from "../lock.ts";
 import type { BindingPatch, SandboxBinding, SandboxState } from "../model.ts";
-import type { SandboxNote } from "../notes.ts";
+import { NOTES, type SandboxNote } from "../notes.ts";
 import type { AppStore, Clock, ExecChannel, SandboxProvider } from "../ports.ts";
 import { nextState, type SandboxEvent } from "../sandbox-lifecycle.ts";
 import type { Log } from "../startup.ts";
@@ -46,6 +46,11 @@ export class SandboxService {
 	readonly #deps: SandboxServiceDeps;
 	/** 同一个会话的沙箱操作排队执行：工具调用、巡检、重建、归档不会交错。 */
 	readonly #lock = new KeyedLock();
+	/**
+	 * 刚创建或刚启动、还没连过 daemon 的会话：容器里没有旧进程，这次连接不用告诉模型。
+	 * 其余连接都是重连。只在内存里：服务重启后为空，重启后的第一次连接也写说明（崩溃时 daemon 退出会带走后台进程）。
+	 */
+	readonly #fresh = new Set<string>();
 
 	constructor(deps: SandboxServiceDeps) {
 		this.#deps = deps;
@@ -57,6 +62,30 @@ export class SandboxService {
 
 	status(sessionId: string): Promise<SandboxBinding | undefined> {
 		return this.#deps.store.getBinding(sessionId);
+	}
+
+	/**
+	 * ExecChannel 每次启动 daemon 前调用：取新 epoch，杀掉旧 epoch 的 daemon 和它的命令，返回新 daemon 的启动命令。
+	 * 不拿会话锁：setup 在 ensureSandbox 持锁时经 ExecChannel 发命令，这里再拿同一把锁会死锁。
+	 * epoch 的原子性由 nextEpoch 保证；一个容器同一时刻只有一条连接由 ExecChannel 按 sandboxId 复用连接保证。
+	 */
+	async connect(sessionId: string): Promise<readonly string[]> {
+		const { store, provider } = this.#deps;
+		const binding = await store.getBinding(sessionId);
+		if (binding?.state !== "creating" && binding?.state !== "running") {
+			throw new TetherError("conflict", `cannot connect a sandbox that is ${binding?.state ?? "absent"}`);
+		}
+		const epoch = await store.nextEpoch(sessionId);
+		const { killed } = await provider.fence(binding.sandboxId, epoch);
+		// 不是创建或启动后的第一次连接，就是重连：旧连接的后台进程刚被杀掉，告诉模型
+		if (!this.#fresh.delete(sessionId)) {
+			await this.#deps.record(sessionId, {
+				kind: "tether.sandbox",
+				data: { state: binding.state, reason: "reconnected", epoch, killed },
+				modelText: NOTES.reconnected,
+			});
+		}
+		return provider.daemonCommand(binding.sandboxId, epoch);
 	}
 
 	async #ensure(sessionId: string): Promise<SandboxBinding> {
@@ -78,6 +107,7 @@ export class SandboxService {
 			throw new TetherError("sandbox_failed", `sandbox ${binding.sandboxId} of session ${binding.sessionId} is gone`);
 		}
 		await provider.start(binding.sandboxId);
+		this.#fresh.add(binding.sessionId);
 		const running = await this.#transition(binding, "start", { lastUsedAt: this.#deps.clock.now() });
 		await this.#note(binding.sessionId, { state: "running", reason: "started" });
 		return running;
@@ -106,6 +136,7 @@ export class SandboxService {
 			lastUsedAt: at,
 		};
 		await store.createBinding(creating);
+		this.#fresh.add(sessionId);
 
 		try {
 			await this.#runSetup(creating, spec.setup, session.variables);

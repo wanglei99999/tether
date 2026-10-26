@@ -30,7 +30,7 @@ export async function buildSandboxImage(tag: string): Promise<void> {
 	try {
 		const arch = process.arch as Parameters<typeof packagedDaemon>[0]["arch"];
 		await copyFile(packagedDaemon({ platform: "linux", arch }), join(context, "pi-env"));
-		await copyFile(join(SANDBOX_DIR, "launch.sh"), join(context, "launch.sh"));
+		for (const script of ["launch.sh", "fence.sh"]) await copyFile(join(SANDBOX_DIR, script), join(context, script));
 		await dockerOrThrow(["build", "--quiet", "--tag", tag, "--file", join(SANDBOX_DIR, "Dockerfile"), context]);
 	} finally {
 		await rm(context, { recursive: true, force: true });
@@ -146,6 +146,29 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 					const [sandboxId = "", sessionId = ""] = line.split("\t");
 					return { sandboxId, sessionId };
 				});
+		},
+
+		async fence(sandboxId, epoch) {
+			// kill -1 在共享宿主 PID 命名空间的容器里会杀掉宿主上的进程：先确认容器有自己的命名空间
+			const inspect = await docker(["inspect", "--format", "{{.HostConfig.PidMode}}", sandboxId]);
+			if (inspect.code !== 0) {
+				throw new TetherError("sandbox_failed", `cannot fence ${sandboxId}: ${inspect.stderr.trim()}`);
+			}
+			const pidMode = inspect.stdout.trim();
+			if (pidMode !== "") {
+				throw new TetherError(
+					"sandbox_failed",
+					`refusing to fence ${sandboxId}: it does not have its own PID namespace (PidMode=${pidMode})`,
+				);
+			}
+			const result = await docker(["exec", sandboxId, "/opt/tether/fence.sh", String(epoch)]);
+			if (result.code !== 0) {
+				throw new TetherError(
+					"sandbox_failed",
+					`fence of ${sandboxId} at epoch ${epoch} failed (${result.code}): ${result.stderr.trim()}`,
+				);
+			}
+			return { killed: result.stdout.trim().split(/\s+/).filter(Boolean).length };
 		},
 
 		/** 给 pi-env 的 Connection 用；Connection 会在末尾追加 serve --token <hex>。 */

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
 	type BindingPatch,
 	type ExpectedState,
+	NOTES,
 	type SandboxBinding,
 	type SandboxNote,
 	SandboxService,
@@ -35,6 +36,7 @@ async function setUp(setup: string[] = [], variables: Record<string, string> = {
 	const provider = new FakeProvider();
 	const exec = new FakeExecChannel();
 	const recorded: Recorded[] = [];
+	const notes: SandboxNote[] = [];
 	const warnings: string[] = [];
 	const sandboxes = new SandboxService({
 		store,
@@ -42,12 +44,13 @@ async function setUp(setup: string[] = [], variables: Record<string, string> = {
 		exec,
 		clock: new FakeClock(),
 		record: async (sessionId, note) => {
+			notes.push(note);
 			recorded.push({ sessionId, kind: note.kind, ...(note.data as { state: SandboxBinding["state"]; reason?: string }) });
 		},
 		log: { warn: (message) => warnings.push(message) },
 		...(setupTimeoutMs !== undefined && { setupTimeoutMs }),
 	});
-	return { store, provider, exec, recorded, warnings, sandboxes };
+	return { store, provider, exec, recorded, notes, warnings, sandboxes };
 }
 
 describe("SandboxService.ensureSandbox", () => {
@@ -226,5 +229,103 @@ describe("SandboxService.ensureSandbox", () => {
 	it("returns not_found for an unknown session", async () => {
 		const { sandboxes } = await setUp();
 		await expect(sandboxes.ensureSandbox("ses_missing")).rejects.toMatchObject({ code: "not_found" });
+	});
+});
+
+describe("SandboxService.connect", () => {
+	it("takes a new epoch and fences before returning the daemon command", async () => {
+		const { store, provider, sandboxes } = await setUp();
+		const { sandboxId } = await sandboxes.ensureSandbox("ses_1");
+		provider.calls.length = 0;
+
+		const command = await sandboxes.connect("ses_1");
+
+		expect(provider.calls).toEqual(["fence"]);
+		expect(provider.fenced).toEqual([{ sandboxId, epoch: 1 }]);
+		expect(command).toEqual(["fake-daemon", sandboxId, "1"]);
+		expect((await store.getBinding("ses_1"))?.epoch).toBe(1);
+	});
+
+	it("does not write a reconnect note for the first connection after create", async () => {
+		const { recorded, sandboxes } = await setUp();
+		await sandboxes.ensureSandbox("ses_1");
+		recorded.length = 0;
+
+		await sandboxes.connect("ses_1");
+
+		expect(recorded).toEqual([]);
+	});
+
+	it("writes a model-visible reconnect note for a second connection", async () => {
+		const { notes, sandboxes } = await setUp();
+		await sandboxes.ensureSandbox("ses_1");
+		await sandboxes.connect("ses_1");
+		notes.length = 0;
+
+		await sandboxes.connect("ses_1");
+
+		expect(notes).toEqual([
+			{
+				kind: "tether.sandbox",
+				data: { state: "running", reason: "reconnected", epoch: 2, killed: 0 },
+				modelText: NOTES.reconnected,
+			},
+		]);
+	});
+
+	it("does not write a reconnect note for the first connection after a start", async () => {
+		const { store, provider, notes, sandboxes } = await setUp();
+		const first = await sandboxes.ensureSandbox("ses_1");
+		await sandboxes.connect("ses_1");
+		await provider.stop(first.sandboxId);
+		await store.updateBinding("ses_1", { state: "stopped" }, { state: "running" });
+		await sandboxes.ensureSandbox("ses_1");
+		notes.length = 0;
+
+		await sandboxes.connect("ses_1");
+
+		expect(notes).toEqual([]);
+	});
+
+	it("writes a reconnect note for the first connection after the service restarts", async () => {
+		const { store, provider, exec, sandboxes } = await setUp();
+		await sandboxes.ensureSandbox("ses_1");
+		const notes: SandboxNote[] = [];
+		const restarted = new SandboxService({
+			store,
+			provider,
+			exec,
+			clock: new FakeClock(),
+			record: async (_sessionId, note) => {
+				notes.push(note);
+			},
+			log: { warn: () => {} },
+		});
+
+		await restarted.connect("ses_1");
+
+		expect(notes).toMatchObject([{ data: { reason: "reconnected", epoch: 1 }, modelText: NOTES.reconnected }]);
+	});
+
+	it("fails the connection when fencing fails, without returning a command", async () => {
+		const { provider, notes, sandboxes } = await setUp();
+		await sandboxes.ensureSandbox("ses_1");
+		await sandboxes.connect("ses_1");
+		notes.length = 0;
+		provider.failFence = true;
+
+		await expect(sandboxes.connect("ses_1")).rejects.toMatchObject({ code: "sandbox_failed" });
+		expect(notes).toEqual([]);
+	});
+
+	it("refuses to connect a stopped or lost sandbox with conflict", async () => {
+		const { store, provider, sandboxes } = await setUp();
+		await sandboxes.ensureSandbox("ses_1");
+		await store.updateBinding("ses_1", { state: "stopped" }, { state: "running" });
+		await expect(sandboxes.connect("ses_1")).rejects.toMatchObject({ code: "conflict" });
+
+		await store.updateBinding("ses_1", { state: "lost" }, { state: "stopped" });
+		await expect(sandboxes.connect("ses_1")).rejects.toMatchObject({ code: "conflict" });
+		expect(provider.fenced).toEqual([]);
 	});
 });

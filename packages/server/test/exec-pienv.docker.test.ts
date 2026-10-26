@@ -20,7 +20,14 @@ const provider = createDockerSandboxProvider({
 	user: `${process.getuid?.()}:${process.getgid?.()}`,
 	defaultImage: IMAGE,
 });
-const channel = createPiEnvExecChannel({ daemonCommand: (id, epoch) => provider.daemonCommand(id, epoch) });
+/** 只测通道本身：不经 SandboxService，不隔离，固定用绑定里的 epoch。 */
+let connects = 0;
+const channel = createPiEnvExecChannel({
+	connect: async (b) => {
+		connects++;
+		return provider.daemonCommand(b.sandboxId, b.epoch);
+	},
+});
 let binding: SandboxBinding;
 
 async function dockerExec(script: string): Promise<string> {
@@ -108,12 +115,14 @@ describe("exec-pienv TetherEnv", () => {
 		await expect(env.readText("does/not/exist.txt")).rejects.toMatchObject({ name: "TetherError", code: "not_found" });
 	});
 
-	it("reuses one connection for the same sandbox and epoch", async () => {
+	it("reuses one connection for the same sandbox", async () => {
 		await channel.env(binding, { cwd: "/workspace" }).exists("a");
+		const before = connects;
 		await channel.env(binding, { cwd: "/tmp" }).exists("b");
 
 		const records = (await dockerExec("ls /run/tether/daemons")).split("\n");
 
+		expect(connects).toBe(before);
 		expect(records).toHaveLength(1);
 		expect(records[0]).toMatch(/^1\.\d+$/);
 	});

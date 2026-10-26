@@ -74,6 +74,9 @@ export class FakeProvider implements SandboxProvider {
 	createDelayMs = 0;
 	/** 为 true 时 destroy 抛错，模拟清理失败。 */
 	failDestroy = false;
+	/** 为 true 时 fence 抛错，模拟隔离失败（例如容器共享宿主 PID 命名空间）。 */
+	failFence = false;
+	readonly fenced: { sandboxId: string; epoch: number }[] = [];
 	#created = 0;
 
 	async create({ sessionId }: SandboxCreate) {
@@ -102,6 +105,12 @@ export class FakeProvider implements SandboxProvider {
 		this.calls.push("destroy");
 		if (this.failDestroy) throw new TetherError("sandbox_failed", `cannot remove ${sandboxId}`);
 		this.containers.delete(sandboxId);
+	}
+	async fence(sandboxId: string, epoch: number) {
+		this.calls.push("fence");
+		if (this.failFence) throw new TetherError("sandbox_failed", `cannot fence ${sandboxId}`);
+		this.fenced.push({ sandboxId, epoch });
+		return { killed: 0 };
 	}
 	async listManaged() {
 		return [...this.containers].map(([sandboxId, { sessionId }]) => ({ sandboxId, sessionId }));

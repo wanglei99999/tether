@@ -77,10 +77,11 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 		user: hostUser(),
 		defaultImage: config.sandboxImage,
 	});
-	const exec = createPiEnvExecChannel({ daemonCommand: (id, epoch) => provider.daemonCommand(id, epoch) });
+	// 每次启动 daemon 前先隔离旧的（ADR-007）。sandboxes 在下面才建好，回调只在运行时调用。
+	const exec = createPiEnvExecChannel({ connect: (binding) => sandboxes.connect(binding.sessionId) });
 
 	let engine: AgentEngine | undefined;
-	const sandboxes = new SandboxService({
+	const sandboxes: SandboxService = new SandboxService({
 		store,
 		provider,
 		exec,

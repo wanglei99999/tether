@@ -69,6 +69,24 @@ export function registerSandboxProviderConformance(
 			expect(await made.provider.status(sandboxId)).toBe("running");
 		});
 
+		it("fences a fresh sandbox and reports how many processes it killed", async () => {
+			const sessionId = made.sessionId();
+			const { sandboxId } = await made.provider.create({ sessionId, spec: sampleSandboxSpec() });
+
+			const { killed } = await made.provider.fence(sandboxId, 1);
+
+			expect(killed).toBeGreaterThanOrEqual(0);
+			expect(await made.provider.status(sandboxId)).toBe("running");
+		});
+
+		it("fails to fence a missing sandbox with sandbox_failed", async () => {
+			const sessionId = made.sessionId();
+			const { sandboxId } = await made.provider.create({ sessionId, spec: sampleSandboxSpec() });
+			await made.provider.destroy(sandboxId);
+
+			await expect(made.provider.fence(sandboxId, 1)).rejects.toMatchObject({ code: "sandbox_failed" });
+		});
+
 		it("returns a daemon command that ends with the epoch", async () => {
 			const sessionId = made.sessionId();
 			const { sandboxId } = await made.provider.create({ sessionId, spec: sampleSandboxSpec() });

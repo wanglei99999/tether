@@ -106,6 +106,11 @@ export interface SandboxProvider {
 	/** 同时删除工作区目录；沙箱不存在不报错。 */
 	destroy(sandboxId: string): Promise<void>;
 	listManaged(): Promise<{ sandboxId: string; sessionId: string }[]>;
+	/**
+	 * 杀掉沙箱里除 init 以外的全部进程（旧 daemon 和它启动的命令），删除 epoch 更小的 daemon 记录（ADR-007）。
+	 * 沙箱没有自己的 PID 命名空间、init 不对或执行失败时抛 sandbox_failed。
+	 */
+	fence(sandboxId: string, epoch: number): Promise<{ killed: number }>;
 	/** 在沙箱里启动 daemon 的命令，ExecChannel 用它建立连接。 */
 	daemonCommand(sandboxId: string, epoch: number): string[];
 }

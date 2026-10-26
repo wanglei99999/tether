@@ -10,5 +10,6 @@ RUN mkdir -p /workspace /run/tether/daemons && chmod 1777 /run/tether/daemons
 
 COPY --chmod=755 pi-env /opt/tether/pi-env
 COPY --chmod=755 launch.sh /opt/tether/launch.sh
+COPY --chmod=755 fence.sh /opt/tether/fence.sh
 
 WORKDIR /workspace
