@@ -413,6 +413,69 @@ describe("SandboxService rebuild", () => {
 	});
 });
 
+describe("SandboxService.destroy", () => {
+	it("destroys the sandbox and keeps the binding as destroyed", async () => {
+		const { store, provider, exec, notes, sandboxes } = await setUp();
+		const { sandboxId } = await sandboxes.ensureSandbox("ses_1");
+
+		await sandboxes.destroy("ses_1", "archived");
+
+		expect(provider.containers.size).toBe(0);
+		expect(exec.closed).toContain(sandboxId);
+		expect(await store.getBinding("ses_1")).toMatchObject({ sandboxId, state: "destroyed" });
+		expect(notes.at(-1)).toEqual({ kind: "tether.sandbox", data: { state: "destroyed", reason: "archived" } });
+		expect(await sandboxes.sweep()).toEqual(NOTHING);
+	});
+
+	it("does nothing for destroy without a binding or of a destroyed one", async () => {
+		const { provider, notes, sandboxes } = await setUp();
+		await sandboxes.destroy("ses_1", "archived");
+		expect(provider.calls).toEqual([]);
+
+		await sandboxes.ensureSandbox("ses_1");
+		await sandboxes.destroy("ses_1", "archived");
+		provider.calls.length = 0;
+		notes.length = 0;
+		await sandboxes.destroy("ses_1", "archived");
+
+		expect(provider.calls).toEqual([]);
+		expect(notes).toEqual([]);
+	});
+
+	it("destroys a lost sandbox's leftovers", async () => {
+		const { store, provider, sandboxes } = await setUp();
+		await sandboxes.ensureSandbox("ses_1");
+		provider.containers.clear();
+		await sandboxes.sweep();
+		provider.calls.length = 0;
+
+		await sandboxes.destroy("ses_1", "archived");
+
+		expect(provider.calls).toEqual(["destroy"]);
+		expect((await store.getBinding("ses_1"))?.state).toBe("destroyed");
+	});
+
+	it("keeps the binding when the provider fails to destroy, so it can be retried", async () => {
+		const { store, provider, sandboxes } = await setUp();
+		await sandboxes.ensureSandbox("ses_1");
+		provider.failDestroy = true;
+
+		await expect(sandboxes.destroy("ses_1", "archived")).rejects.toMatchObject({ code: "sandbox_failed" });
+
+		expect((await store.getBinding("ses_1"))?.state).toBe("running");
+	});
+
+	it("refuses ensureSandbox for a destroyed sandbox with conflict", async () => {
+		const { provider, sandboxes } = await setUp();
+		await sandboxes.ensureSandbox("ses_1");
+		await sandboxes.destroy("ses_1", "archived");
+		provider.calls.length = 0;
+
+		await expect(sandboxes.ensureSandbox("ses_1")).rejects.toMatchObject({ code: "conflict" });
+		expect(provider.calls).toEqual([]);
+	});
+});
+
 const HOUR = 3_600_000;
 const NOTHING = { stoppedIdle: 0, stoppedOutside: 0, lost: 0 };
 

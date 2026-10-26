@@ -186,6 +186,29 @@ describe("createTether on docker", () => {
 		await shutdown(tether);
 	});
 
+	it("destroys the container and the workspace directory when a session is archived", async () => {
+		const config = newConfig();
+		const tether = await open(config, [
+			{ toolCall: { name: "bash", args: { command: "echo bye > a.txt" } } },
+			{ text: "done" },
+		]);
+		const { agents, sessions, sandboxes, engine } = tether.services;
+		const { agent } = await agents.create({ name: "archive", spec: bashSpec() });
+		const session = await sessions.create({ agentId: agent.id });
+		await engine.waitSubmission((await sessions.sendMessage(session.id, { content: "go", requestId: "r" })).submissionId);
+		const workspace = join(config.workspaceRoot, session.id);
+		expect(existsSync(join(workspace, "a.txt"))).toBe(true);
+
+		const archived = await sessions.archive(session.id);
+
+		expect(archived.status).toBe("archived");
+		expect(await sandboxes.status(session.id)).toMatchObject({ state: "destroyed" });
+		const { stdout } = await run("docker", ["ps", "-aq", "--filter", `label=tether.session=${session.id}`]);
+		expect(stdout.trim()).toBe("");
+		expect(existsSync(workspace)).toBe(false);
+		await shutdown(tether);
+	});
+
 	it("creates no sandbox for a run without tool calls", async () => {
 		const config = newConfig();
 		const tether = await open(config, [{ text: "just chatting" }]);

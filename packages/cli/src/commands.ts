@@ -9,6 +9,7 @@ export const USAGE = `usage:
   tether agent create --file <agent.json>
   tether agent list
   tether session create <agentId> [--version N] [--var KEY=VALUE]...
+  tether session archive <sessionId>
   tether send <sessionId> <text> [--follow]
   tether sandbox <sessionId>
 
@@ -133,6 +134,11 @@ async function dispatch(client: TetherClient, args: Parsed, io: Io): Promise<num
 			...(agentVersion !== undefined && { agentVersion }),
 		});
 		print({ session }, `${session.id} (agent ${session.agentId} version ${session.agentVersion})`);
+		return 0;
+	}
+	if (group === "session" && action === "archive") {
+		const session = await client.sessions.archive(need(rest[0], "<sessionId>"));
+		print({ session }, `${session.id} archived`);
 		return 0;
 	}
 	if (group === "send") {

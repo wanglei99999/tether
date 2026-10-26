@@ -1,7 +1,7 @@
 import { MemoryAppStore, sampleBinding, sampleSpec } from "@tether/testkit";
 import { describe, expect, it } from "vitest";
 import { AgentService, BUILTIN_TOOLS, NOTES, recover, SessionService } from "../src/index.ts";
-import { FakeClock, FakeEngine, FakeIds, FakeProvider } from "./fakes.ts";
+import { FakeClock, FakeEngine, FakeIds, FakeProvider, FakeSandboxes } from "./fakes.ts";
 
 /** 按调用顺序记下引擎和 Docker 被调用了什么。 */
 async function setUp() {
@@ -32,7 +32,7 @@ async function setUp() {
 		return listManaged();
 	};
 	const agents = new AgentService({ store, clock, ids, catalog: BUILTIN_TOOLS });
-	const sessions = new SessionService({ store, engine, agents, clock, ids });
+	const sessions = new SessionService({ store, engine, agents, sandboxes: new FakeSandboxes(), clock, ids });
 	const warnings: string[] = [];
 	const log = { warn: (message: string) => warnings.push(message) };
 	const { agent } = await agents.create({ name: "fixer", spec: sampleSpec() });

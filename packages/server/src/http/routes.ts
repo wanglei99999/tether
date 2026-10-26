@@ -138,6 +138,7 @@ function sessionRoutes(sessions: SessionService, sandboxes: HttpDeps["sandboxes"
 		await sessions.abort(c.req.param("id"));
 		return ok(c, {});
 	});
+	r.post("/:id/archive", async (c) => ok(c, { session: await sessions.archive(c.req.param("id")) }));
 	r.get("/:id/transcript", async (c) => {
 		const page = { limit: limitParam(c.req.query("limit")), ...optional("before", c.req.query("before")) };
 		return ok(c, await sessions.transcript(c.req.param("id"), page));

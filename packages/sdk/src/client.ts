@@ -93,6 +93,9 @@ export class TetherClient {
 			this.#request<Page<TranscriptEntry>>("GET", `/v1/sessions/${enc(id)}/transcript${query(page)}`),
 		sandbox: async (id: string) =>
 			(await this.#request<{ binding: SandboxBinding | null }>("GET", `/v1/sessions/${enc(id)}/sandbox`)).binding,
+		/** 归档：之后的消息被拒绝，沙箱的容器和工作区被删除。 */
+		archive: async (id: string) =>
+			(await this.#request<{ session: SessionRecord }>("POST", `/v1/sessions/${enc(id)}/archive`)).session,
 	};
 
 	/** 实时跟随一个会话：每个事件叠加到本地状态后回调一次，断线自动重连。 */

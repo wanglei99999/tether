@@ -89,6 +89,26 @@ describe("HTTP API", () => {
 		expect(sandbox.body).toEqual({ ok: true, data: { binding: null } });
 	});
 
+	it("archives a session and returns it", async () => {
+		const { app } = await makeApi([]);
+		const id = await newSession(app);
+
+		const archived = await call(app, "POST", `/v1/sessions/${id}/archive`);
+
+		expect(archived.status).toBe(200);
+		expect(archived.body).toEqual({ ok: true, data: { session: expect.objectContaining({ id, status: "archived" }) } });
+		const sent = await call(app, "POST", `/v1/sessions/${id}/messages`, { content: "hi", requestId: "r" });
+		expect(sent.status).toBe(409);
+		expect(sent.body.error.code).toBe("conflict");
+	});
+
+	it("returns not_found when archiving an unknown session", async () => {
+		const { app } = await makeApi([]);
+		const response = await call(app, "POST", "/v1/sessions/ses_missing/archive");
+		expect(response.status).toBe(404);
+		expect(response.body.error.code).toBe("not_found");
+	});
+
 	it("requires requestId on messages", async () => {
 		const { app } = await makeApi([]);
 		const id = await newSession(app);

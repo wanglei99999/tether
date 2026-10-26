@@ -4,12 +4,14 @@ import type { SessionRecord } from "../model.ts";
 import type { AgentEngine, AppStore, Clock, Ids } from "../ports.ts";
 import { validateSessionVariables } from "../validate.ts";
 import { type AgentService, LOCAL_OWNER } from "./agents.ts";
-import { WORKSPACE } from "./sandboxes.ts";
+import { type SandboxService, WORKSPACE } from "./sandboxes.ts";
 
 export interface SessionServiceDeps {
 	store: AppStore;
 	engine: AgentEngine;
 	agents: AgentService;
+	/** 归档时销毁会话的沙箱。 */
+	sandboxes: Pick<SandboxService, "destroy">;
 	clock: Clock;
 	ids: Ids;
 }
@@ -94,6 +96,19 @@ export class SessionService {
 	async waitSubmission(id: string, submissionId: string): ReturnType<AgentEngine["waitSubmission"]> {
 		await this.get(id);
 		return this.#deps.engine.waitSubmission(submissionId);
+	}
+
+	/**
+	 * 归档：先改状态（之后的消息被拒绝），再中止正在跑的一轮，最后销毁沙箱。
+	 * 对已归档的会话再调用一次也会执行销毁，上次销毁失败可以这样重试。
+	 */
+	async archive(id: string): Promise<SessionRecord> {
+		const { store, engine, sandboxes } = this.#deps;
+		const session = await this.get(id);
+		if (session.status !== "archived") await store.updateSession(id, { status: "archived" });
+		if (session.engineSessionId !== null) await engine.abort(session.engineSessionId);
+		await sandboxes.destroy(id, "archived");
+		return this.get(id);
 	}
 
 	async abort(id: string): Promise<void> {

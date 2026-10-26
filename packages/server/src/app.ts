@@ -132,7 +132,7 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 
 	const ids = createIds();
 	const agents = new AgentService({ store, clock: systemClock, ids, catalog: BUILTIN_TOOLS });
-	const sessions = new SessionService({ store, engine: opened, agents, clock: systemClock, ids });
+	const sessions = new SessionService({ store, engine: opened, agents, sandboxes, clock: systemClock, ids });
 
 	let recovered: Awaited<ReturnType<typeof recover>>;
 	try {

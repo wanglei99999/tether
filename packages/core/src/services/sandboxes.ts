@@ -81,6 +81,24 @@ export class SandboxService {
 		return this.#lock.run(sessionId, () => this.#ensure(sessionId));
 	}
 
+	/**
+	 * 删掉会话的容器和工作区，绑定留作记录，状态为 destroyed（之后 ensureSandbox 报 conflict）。
+	 * 没有绑定或已经 destroyed 时什么都不做；后端删除失败时绑定不变，可以重试。
+	 */
+	destroy(sessionId: string, reason: string): Promise<void> {
+		return this.#lock.run(sessionId, async () => {
+			const { store, provider, exec } = this.#deps;
+			const binding = await store.getBinding(sessionId);
+			if (!binding || binding.state === "destroyed") return;
+			exec.close(binding.sandboxId);
+			await provider.destroy(binding.sandboxId);
+			await this.#transition(binding, "destroy");
+			this.#fresh.delete(sessionId);
+			this.#lostReasons.delete(sessionId);
+			await this.#note(sessionId, { state: "destroyed", reason });
+		});
+	}
+
 	status(sessionId: string): Promise<SandboxBinding | undefined> {
 		return this.#deps.store.getBinding(sessionId);
 	}

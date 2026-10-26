@@ -71,7 +71,10 @@ export class FakeEngine implements AgentEngine {
 	async waitSubmission() {
 		return { status: "done" as const };
 	}
-	async abort(): Promise<void> {}
+	readonly aborted: string[] = [];
+	async abort(engineSessionId: string): Promise<void> {
+		this.aborted.push(engineSessionId);
+	}
 	async transcript() {
 		return { items: [] };
 	}
@@ -137,6 +140,20 @@ export class FakeProvider implements SandboxProvider {
 	}
 	daemonCommand(sandboxId: string, epoch: number): string[] {
 		return ["fake-daemon", sandboxId, String(epoch)];
+	}
+}
+
+/** SessionService 用到的 SandboxService.destroy；fail 为 true 时抛错。 */
+export class FakeSandboxes {
+	readonly destroyed: { sessionId: string; reason: string }[] = [];
+	fail = false;
+	/** 在 destroy 里调用，测试用它检查调用那一刻的状态。 */
+	onDestroy: (sessionId: string) => Promise<void> = async () => {};
+
+	async destroy(sessionId: string, reason: string): Promise<void> {
+		await this.onDestroy(sessionId);
+		if (this.fail) throw new TetherError("sandbox_failed", `cannot destroy the sandbox of ${sessionId}`);
+		this.destroyed.push({ sessionId, reason });
 	}
 }
 
