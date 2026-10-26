@@ -82,6 +82,41 @@ npx tether sandbox ses_01a171fd998800009db3e7ce
 - 每个命令加 `--json` 打印 API 返回的 `data`。API 错误打印 `error: <错误码>: <消息>`，退出码 1；用法错误退出码 2。
 - 容器在第一次工具调用时才创建，`setup` 命令在那时依次执行。会话变量以环境变量传给 `setup`，不拼进命令，工具执行时看不到这些变量。
 
+查看和下载沙箱 `/workspace` 里的文件，以及归档会话：
+
+```bash
+npx tether files ses_01a171fd998800009db3e7ce          # 列 /workspace；可以再给一个相对路径
+# file             5  greeting.txt
+npx tether cat ses_01a171fd998800009db3e7ce greeting.txt
+# hello
+npx tether session archive ses_01a171fd998800009db3e7ce
+# ses_01a171fd998800009db3e7ce archived
+npx tether sandbox ses_01a171fd998800009db3e7ce
+# destroyed  tether-ses_01a171fd998800009db3e7ce
+```
+
+- `files` 每行是 `类型  大小  名字`；`cat` 把文件原样写到标准输出，最大 10 MiB。路径相对 `/workspace`，解析符号链接之后不在 `/workspace` 下的一律拒绝（`invalid_request: path is outside /workspace`）。还没有沙箱的会话报 `not_found`，不会为了看文件创建沙箱；沙箱停了会先启动。对应的 HTTP 端点是 `GET /v1/sessions/:id/sandbox/files?path=` 和 `GET /v1/sessions/:id/sandbox/file?path=`（成功时返回原始字节）。
+- `session archive` 先把会话标成 `archived`（之后发消息报 `conflict`），中止正在跑的一轮，再删除容器和工作区。删除失败时再执行一次即可重试。
+
+### 沙箱生命周期
+
+- **闲置停止**：会话不在运行、沙箱超过 `TETHER_STOP_AFTER_SECONDS` 没被工具调用用过，巡检就停止容器，文件保留，进程全部结束。会话记录里写一条模型能看到的说明，会话状态变成 `idle`；下一次工具调用重新启动容器。正在跑的长命令不算闲置。
+- **重连**：连接 daemon 时先杀掉容器里旧连接留下的全部进程（epoch 隔离，ADR-007），后台服务（`npm run dev &` 之类）会结束；如果不是新建或刚启动后的第一次连接，同样写一条模型可见的说明。
+- **丢失后重建**：容器被删掉（例如手动 `docker rm`）后，巡检把绑定标成 `lost`，下一次工具调用按模板重建、重新执行 `setup`，并告诉模型原来的文件和进程都没了。在容器外被停掉的容器同样会被发现并写说明。
+- **准入**：运行中和创建中的沙箱数达到 `TETHER_MAX_RUNNING_SANDBOXES` 时，需要新占名额的工具调用（新建、启动、重建）直接失败，模型收到的工具结果是 `sandbox limit reached: 4 of 4 sandboxes are running; try again after another session goes idle`（pi 会把它包在 `<harness>[error] …</harness>` 里，`send --follow` 打印成 `[failed]`），HTTP 层对应错误码 `sandbox_limit`（503）。已经在运行的沙箱不受影响。
+- 会话记录里的 `tether.sandbox` 条目（`data.state`、`data.reason`）和 `tether.admission` 条目让客户端看到上面每一件事。
+- **容器加固**：沙箱容器去掉全部 Linux 能力（`--cap-drop ALL`）并禁止提权（`no-new-privileges`），以服务进程的 `uid:gid` 运行，资源和网络按 agent 版本的 `sandbox` 配置限制。
+
+用 gVisor 运行沙箱（可选，宿主上执行一次）：按 [gVisor 文档](https://gvisor.dev/docs/user_guide/install/) 用 apt 安装 `runsc`，然后
+
+```bash
+sudo runsc install                # 在 /etc/docker/daemon.json 里注册 runsc
+sudo systemctl restart docker
+export TETHER_SANDBOX_RUNTIME=runsc
+```
+
+全部 Docker 测试在 gVisor release-20261019.0 下验证过（`TETHER_SANDBOX_RUNTIME=runsc npm run test:docker`），没有需要跳过的用例。
+
 ### 配置
 
 服务端从环境变量读配置，值为空字符串时按未设置处理。
@@ -94,9 +129,13 @@ npx tether sandbox ses_01a171fd998800009db3e7ce
 | `TETHER_TOKEN` | 不设置 | 设置后除 `/v1/health` 外都要 `Authorization: Bearer <token>`；事件流的 WebSocket 也接受 `?token=` |
 | `TETHER_SANDBOX_IMAGE` | `tether-sandbox:dev` | 沙箱镜像，`--build-sandbox` 构建的也是它 |
 | `TETHER_SETUP_TIMEOUT_SECONDS` | `600` | 每条 `setup` 命令的上限；超时算 `setup` 失败，容器删除，下一次工具调用重新创建 |
+| `TETHER_MAX_RUNNING_SANDBOXES` | `4` | 同时运行（含创建中）的沙箱上限，正整数；见下面的"沙箱生命周期" |
+| `TETHER_STOP_AFTER_SECONDS` | `3600` | 沙箱闲置这么久后停止容器 |
+| `TETHER_SWEEP_INTERVAL_SECONDS` | `60` | 巡检间隔：多久核对一次绑定与 Docker、停掉闲置的沙箱 |
+| `TETHER_SANDBOX_RUNTIME` | 不设置 | 沙箱容器的运行时，例如 gVisor 的 `runsc`（要先在 Docker 里注册，见下文）；不设置用 Docker 默认的 `runc` |
 | `ANTHROPIC_API_KEY`、`OPENAI_API_KEY` | 不设置 | 模型凭据，只在服务进程里，不进沙箱 |
 
-token 是单一的共享口令，M1 没有用户和权限。服务走明文 HTTP，监听非本机地址时前面要放一个提供 HTTPS 的反向代理；用 `?token=` 时注意它可能出现在代理的访问日志里。
+token 是单一的共享口令，目前没有用户和权限。服务走明文 HTTP，监听非本机地址时前面要放一个提供 HTTPS 的反向代理；用 `?token=` 时注意它可能出现在代理的访问日志里。
 
 ### 测试
 
@@ -106,19 +145,24 @@ token 是单一的共享口令，M1 没有用户和权限。服务走明文 HTTP
 npm run test:unit
 npm run test:docker   # 首次运行会构建沙箱镜像
 npm run typecheck
+TETHER_SANDBOX_RUNTIME=runsc npm run test:docker   # 可选：在 gVisor 下再跑一遍
 ```
 
 ### 当前限制
 
-以下能力属于后续里程碑，M1 没有实现，相应的端点也没有注册：
+以下能力属于后续里程碑，还没有实现，相应的端点也没有注册：
 
-- 会话分叉与检查点、工具审批（M3）
-- 会话归档与沙箱销毁、闲置后停止沙箱、准入控制、epoch 隔离（M2）
-- 沙箱文件浏览 `sandbox/files`、`sandbox/file`（M2）
+- 会话分叉与检查点、从检查点重建、工具审批（M3）
+- 闲置超过 `destroyAfter` 后删除沙箱（它要先做最终快照，和检查点一起在 M3）
 - `/v1/metrics`（M4）
-- 自定义工具：M1 只有内置的 `read`、`write`、`edit`、`bash`
+- 自定义工具：只有内置的 `read`、`write`、`edit`、`bash`
 
-另外两条：
+agent 版本里有三个字段已经定义但还没有实现：`sandbox.resources.diskMb`、`permissions.requireApproval`（非空）、`checkpointPolicy: "perRun"`。填了会直接报 `invalid_request: <字段> is not supported yet`，不会被悄悄忽略。
 
-- 一台 Docker 主机上只跑一个 Tether 实例。启动对账会删掉所有带 `tether.managed=1` 标签、但不在自己数据库里的容器，两个实例会互相删对方的沙箱。
+另外：
+
+- 一台 Docker 主机上只跑一个 Tether 实例。启动对账会删掉所有带 `tether.managed=1` 标签、但不在自己数据库里的容器，两个实例会互相删对方的沙箱。会话锁和准入锁也只在一个进程内有效。
 - 事件流断线重连时只能拿到新的完整快照，不补发断线期间的增量（设计文档 §7.3）。
+- `network: "egress"` 的沙箱能访问云厂商的元数据地址（例如阿里云的 `100.100.100.200`），拦截它需要宿主的防火墙规则，Tether 不改防火墙。部署在云主机上时请在宿主上自行拦截。
+- 文件浏览先把路径解析成真实路径、检查在 `/workspace` 下，再读取；沙箱里的进程在这两步之间把路径换成符号链接，理论上能让读取落到 `/workspace` 之外。读到的仍只是容器里的文件，不涉及宿主。
+- 丢失重建、重连的说明如果是在一轮运行中写下的，模型要到下一轮才看到；这一轮的工具结果已经反映了新环境。
