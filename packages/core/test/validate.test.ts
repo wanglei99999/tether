@@ -34,6 +34,28 @@ function rejection(run: () => unknown): TetherError {
 	throw new Error("expected a TetherError");
 }
 
+describe("validateVersionSpec unsupported fields", () => {
+	const variants: [string, AgentVersionSpec][] = [
+		["sandbox.resources.diskMb", { ...completeSpec(), sandbox: { ...completeSpec().sandbox, resources: { cpu: 1, memoryMb: 512, diskMb: 1024 } } }],
+		["permissions.requireApproval", { ...completeSpec(), permissions: { denyTools: [], requireApproval: ["bash"] } }],
+		["checkpointPolicy perRun", { ...completeSpec(), checkpointPolicy: "perRun" }],
+	];
+
+	it("rejects diskMb, requireApproval and perRun while they are unsupported", () => {
+		for (const [field, spec] of variants) {
+			const error = rejection(() => validateVersionSpec(spec, BUILTIN_TOOLS));
+			expect(error, field).toMatchObject({ code: "invalid_request", message: `${field} is not supported yet` });
+		}
+	});
+
+	it("accepts them when supported", () => {
+		const supported = { diskMb: false, approval: false, checkpoints: false };
+		for (const [field, spec] of variants) {
+			expect(validateVersionSpec(spec, BUILTIN_TOOLS, supported), field).toEqual(spec);
+		}
+	});
+});
+
 describe("validateVersionSpec", () => {
 	it("accepts a complete spec and returns it typed", () => {
 		const spec = completeSpec();

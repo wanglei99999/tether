@@ -1,17 +1,18 @@
 import { MemoryAppStore, sampleSpec } from "@tether/testkit";
 import { describe, expect, it } from "vitest";
 import { AgentService, BUILTIN_TOOLS, SessionService } from "../src/index.ts";
-import { FakeClock, FakeEngine, FakeIds } from "./fakes.ts";
+import { FakeClock, FakeEngine, FakeIds, FakeSandboxes } from "./fakes.ts";
 
 async function setUp() {
 	const store = new MemoryAppStore();
 	const clock = new FakeClock();
 	const ids = new FakeIds();
 	const engine = new FakeEngine();
+	const sandboxes = new FakeSandboxes();
 	const agents = new AgentService({ store, clock, ids, catalog: BUILTIN_TOOLS });
-	const sessions = new SessionService({ store, engine, agents, clock, ids });
+	const sessions = new SessionService({ store, engine, agents, sandboxes, clock, ids });
 	const { agent } = await agents.create({ name: "fixer", spec: sampleSpec("v1") });
-	return { store, engine, agents, sessions, agentId: agent.id };
+	return { store, engine, sandboxes, agents, sessions, agentId: agent.id };
 }
 
 describe("SessionService", () => {
@@ -89,6 +90,73 @@ describe("SessionService", () => {
 		expect(engine.submitted).toEqual([{ engineSessionId: "eng_1", content: "hi", requestId: "r1" }]);
 		const updated = await store.getSession(session.id);
 		expect(updated && updated.lastActiveAt > session.lastActiveAt).toBe(true);
+	});
+
+	it("turns an idle session active again when a message is sent", async () => {
+		const { store, sessions, agentId } = await setUp();
+		const session = await sessions.create({ agentId });
+		await store.updateSession(session.id, { status: "idle" });
+
+		await sessions.sendMessage(session.id, { content: "back", requestId: "r1" });
+
+		expect((await store.getSession(session.id))?.status).toBe("active");
+	});
+
+	it("archives a session: status archived, run aborted, sandbox destroyed", async () => {
+		const { store, engine, sandboxes, sessions, agentId } = await setUp();
+		const session = await sessions.create({ agentId });
+		let statusAtDestroy: string | undefined;
+		sandboxes.onDestroy = async (id) => {
+			statusAtDestroy = (await store.getSession(id))?.status;
+		};
+
+		const archived = await sessions.archive(session.id);
+
+		expect(archived).toMatchObject({ id: session.id, status: "archived" });
+		expect(await store.getSession(session.id)).toMatchObject({ status: "archived" });
+		expect(engine.aborted).toEqual(["eng_1"]);
+		expect(sandboxes.destroyed).toEqual([{ sessionId: session.id, reason: "archived" }]);
+		// 先改状态再销毁：销毁期间到达的消息已经会被拒绝
+		expect(statusAtDestroy).toBe("archived");
+	});
+
+	it("rejects messages to an archived session with conflict", async () => {
+		const { sessions, agentId } = await setUp();
+		const session = await sessions.create({ agentId });
+		await sessions.archive(session.id);
+
+		await expect(sessions.sendMessage(session.id, { content: "hi", requestId: "r" })).rejects.toMatchObject({
+			code: "conflict",
+		});
+	});
+
+	it("retries the sandbox destroy when archive is called again after a failure", async () => {
+		const { store, sandboxes, sessions, agentId } = await setUp();
+		const session = await sessions.create({ agentId });
+		sandboxes.fail = true;
+		await expect(sessions.archive(session.id)).rejects.toMatchObject({ code: "sandbox_failed" });
+		expect((await store.getSession(session.id))?.status).toBe("archived");
+		sandboxes.fail = false;
+
+		await sessions.archive(session.id);
+
+		expect(sandboxes.destroyed).toEqual([{ sessionId: session.id, reason: "archived" }]);
+	});
+
+	it("archives a session whose engine session was never created without aborting", async () => {
+		const { engine, sandboxes, sessions, agentId } = await setUp();
+		engine.failCreate = true;
+		await sessions.create({ agentId }).catch(() => {});
+		const [{ id }] = (await sessions.list({ limit: 1 })).items;
+
+		await expect(sessions.archive(id)).resolves.toMatchObject({ status: "archived" });
+		expect(engine.aborted).toEqual([]);
+		expect(sandboxes.destroyed).toHaveLength(1);
+	});
+
+	it("returns not_found when archiving an unknown session", async () => {
+		const { sessions } = await setUp();
+		await expect(sessions.archive("ses_missing")).rejects.toMatchObject({ code: "not_found" });
 	});
 
 	it("rejects messages to a session whose engine session was never created", async () => {

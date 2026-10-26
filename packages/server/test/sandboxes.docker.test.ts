@@ -8,6 +8,7 @@ import { MemoryAppStore, sampleAgent, sampleSession, sampleSpec } from "@tether/
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createPiEnvExecChannel } from "../src/adapters/exec-pienv/index.ts";
 import { buildSandboxImage, createDockerSandboxProvider } from "../src/adapters/sandbox-docker/index.ts";
+import { runtimeOption } from "./fixtures/runtime.ts";
 
 const run = promisify(execFile);
 const IMAGE = "tether-sandbox:dev";
@@ -16,8 +17,17 @@ const provider = createDockerSandboxProvider({
 	workspaceRoot,
 	user: `${process.getuid?.()}:${process.getgid?.()}`,
 	defaultImage: IMAGE,
+	...runtimeOption(),
 });
-const exec = createPiEnvExecChannel({ daemonCommand: (id, epoch) => provider.daemonCommand(id, epoch) });
+/** 测试里每个会话一个 SandboxService，按会话 ID 找到对应的服务来连接。 */
+const services = new Map<string, SandboxService>();
+const exec = createPiEnvExecChannel({
+	connect: (binding) => {
+		const service = services.get(binding.sessionId);
+		if (!service) throw new Error(`no service for ${binding.sessionId}`);
+		return service.connect(binding.sessionId);
+	},
+});
 let counter = 0;
 
 beforeAll(async () => {
@@ -45,10 +55,13 @@ async function sessionWith(setup: string[], variables: Record<string, string>, s
 		store,
 		provider,
 		exec,
+		engine: { isRunning: async () => false },
 		clock: { now: () => new Date().toISOString() },
 		record: async () => {},
+		log: { warn: () => {} },
 		...(setupTimeoutMs !== undefined && { setupTimeoutMs }),
 	});
+	services.set(sessionId, sandboxes);
 	return { store, sandboxes, sessionId, workspace: join(workspaceRoot, sessionId) };
 }
 

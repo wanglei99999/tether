@@ -21,6 +21,8 @@ const dataDir = mkdtempSync(join(tmpdir(), "tether-cli-"));
 const dirs = [dataDir];
 const servers: Server[] = [];
 let url = "";
+/** 第一个用例建的会话，归档用例接着用（这个服务的 faux 剧本只够一次运行）。 */
+let firstSessionId = "";
 
 /** 模型先调用 bash 读 setup 写的文件，再回答。 */
 const SCRIPT: ScriptStep[] = [{ toolCall: { name: "bash", args: { command: "cat who.txt" } } }, { text: "Read it." }];
@@ -190,6 +192,35 @@ describe("tether CLI", () => {
 		const who = await run("docker", ["exec", container, "cat", "/workspace/who.txt"]);
 		expect(who.stdout).toBe("tether");
 		await run("docker", ["exec", container, "test", "-f", "/workspace/ready"]);
+		firstSessionId = sessionId;
+	});
+
+	it("lists the workspace and prints a file from the command line", async () => {
+		const listed = await cli("files", firstSessionId);
+		expect(listed).toMatchObject({ code: 0, stderr: "" });
+		expect(listed.stdout).toMatch(/^file\s+6\s+who\.txt$/m);
+		expect(listed.stdout).toMatch(/^file\s+0\s+ready$/m);
+
+		const printed = await cli("cat", firstSessionId, "who.txt");
+		expect(printed).toMatchObject({ code: 0, stdout: "tether", stderr: "" });
+
+		const outside = await cli("cat", firstSessionId, "../../etc/passwd");
+		expect(outside.code).toBe(1);
+		expect(outside.stderr).toMatch(/invalid_request: path is outside \/workspace/);
+	});
+
+	it("archives a session from the command line", async () => {
+		const archived = await cli("session", "archive", firstSessionId);
+		expect(archived).toMatchObject({ code: 0, stderr: "" });
+		expect(archived.stdout).toMatch(new RegExp(`${firstSessionId} archived`));
+
+		const sandbox = await cli("sandbox", firstSessionId);
+		expect(sandbox.stdout).toMatch(/destroyed/);
+		const { stdout } = await run("docker", ["ps", "-aq", "--filter", `name=tether-${firstSessionId}`]);
+		expect(stdout.trim()).toBe("");
+		const sent = await cli("send", firstSessionId, "anyone there?");
+		expect(sent.code).toBe(1);
+		expect(sent.stderr).toMatch(/conflict/);
 	});
 
 	it("finishes send --follow when the server restarts mid-run", async () => {

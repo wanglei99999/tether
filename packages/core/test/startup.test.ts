@@ -1,7 +1,7 @@
 import { MemoryAppStore, sampleBinding, sampleSpec } from "@tether/testkit";
 import { describe, expect, it } from "vitest";
-import { AgentService, BUILTIN_TOOLS, recover, SessionService } from "../src/index.ts";
-import { FakeClock, FakeEngine, FakeIds, FakeProvider } from "./fakes.ts";
+import { AgentService, BUILTIN_TOOLS, NOTES, recover, SessionService } from "../src/index.ts";
+import { FakeClock, FakeEngine, FakeIds, FakeProvider, FakeSandboxes } from "./fakes.ts";
 
 /** 按调用顺序记下引擎和 Docker 被调用了什么。 */
 async function setUp() {
@@ -18,6 +18,13 @@ async function setUp() {
 	engine.onCreate = async () => {
 		order.push("engine.createSession");
 	};
+	for (const method of ["submit", "appendEntry", "isRunning", "abort", "subscribe", "transcript"] as const) {
+		const original = engine[method].bind(engine) as (...args: unknown[]) => Promise<unknown>;
+		(engine as unknown as Record<string, unknown>)[method] = (...args: unknown[]) => {
+			order.push(`engine.${method}`);
+			return original(...args);
+		};
+	}
 	const provider = new FakeProvider();
 	const listManaged = provider.listManaged.bind(provider);
 	provider.listManaged = async () => {
@@ -25,7 +32,7 @@ async function setUp() {
 		return listManaged();
 	};
 	const agents = new AgentService({ store, clock, ids, catalog: BUILTIN_TOOLS });
-	const sessions = new SessionService({ store, engine, agents, clock, ids });
+	const sessions = new SessionService({ store, engine, agents, sandboxes: new FakeSandboxes(), clock, ids });
 	const warnings: string[] = [];
 	const log = { warn: (message: string) => warnings.push(message) };
 	const { agent } = await agents.create({ name: "fixer", spec: sampleSpec() });
@@ -39,9 +46,18 @@ async function setUp() {
 		return latest!.id;
 	}
 
+	/** 有引擎会话、绑定写着 running、容器却在 Tether 停机期间被停掉的会话。 */
+	async function stoppedWhileDown(): Promise<string> {
+		const session = await sessions.create({ agentId: agent.id });
+		const { sandboxId } = await provider.create({ sessionId: session.id, spec: sampleSpec().sandbox });
+		await provider.stop(sandboxId);
+		await store.createBinding(sampleBinding(session.id, { sandboxId, state: "running" }));
+		return session.id;
+	}
+
 	order.length = 0;
 	const run = () => recover({ store, engine, provider, sessions, log });
-	return { order, store, engine, provider, warnings, halfCreatedSession, run };
+	return { order, store, engine, provider, warnings, halfCreatedSession, stoppedWhileDown, run };
 }
 
 describe("recover", () => {
@@ -94,8 +110,8 @@ describe("recover", () => {
 		const { store, provider, run } = await setUp();
 		const { sandboxId } = await provider.create({ sessionId: "ses_kept", spec: sampleSpec().sandbox });
 		await provider.stop(sandboxId);
-		await store.putBinding(sampleBinding("ses_kept", { sandboxId, state: "running" }));
-		await store.putBinding(sampleBinding("ses_gone", { sandboxId: "sbx_gone", state: "running" }));
+		await store.createBinding(sampleBinding("ses_kept", { sandboxId, state: "running" }));
+		await store.createBinding(sampleBinding("ses_gone", { sandboxId: "sbx_gone", state: "running" }));
 
 		const result = await run();
 
@@ -109,7 +125,7 @@ describe("recover", () => {
 		const { store, provider, run } = await setUp();
 		const bound = await provider.create({ sessionId: "ses_bound", spec: sampleSpec().sandbox });
 		const orphan = await provider.create({ sessionId: "ses_orphan", spec: sampleSpec().sandbox });
-		await store.putBinding(sampleBinding("ses_bound", { sandboxId: bound.sandboxId }));
+		await store.createBinding(sampleBinding("ses_bound", { sandboxId: bound.sandboxId }));
 
 		const result = await run();
 
@@ -121,12 +137,42 @@ describe("recover", () => {
 	it("destroys sandboxes left in creating and drops their bindings", async () => {
 		const { store, provider, run } = await setUp();
 		const { sandboxId } = await provider.create({ sessionId: "ses_half", spec: sampleSpec().sandbox });
-		await store.putBinding(sampleBinding("ses_half", { sandboxId, state: "creating" }));
+		await store.createBinding(sampleBinding("ses_half", { sandboxId, state: "creating" }));
 
 		await run();
 
 		expect(provider.containers.has(sandboxId)).toBe(false);
 		expect(await store.getBinding("ses_half")).toBeUndefined();
+	});
+
+	it("calls no engine method other than resume while reconciling", async () => {
+		const { order, stoppedWhileDown, run } = await setUp();
+		await stoppedWhileDown();
+		order.length = 0;
+
+		await run();
+
+		expect(order.filter((call) => call.startsWith("engine."))).toEqual(["engine.resume"]);
+	});
+
+	it("returns an outside-stop note for a binding whose container was stopped while Tether was down", async () => {
+		const { store, stoppedWhileDown, run } = await setUp();
+		const sessionId = await stoppedWhileDown();
+
+		const result = await run();
+
+		expect(result.notes).toEqual([
+			{
+				sessionId,
+				note: {
+					kind: "tether.sandbox",
+					data: { state: "stopped", reason: "stopped outside Tether" },
+					modelText: NOTES.stoppedOutside,
+				},
+			},
+		]);
+		expect((await store.getBinding(sessionId))?.state).toBe("stopped");
+		expect((await store.getSession(sessionId))?.status).toBe("idle");
 	});
 
 	it("reconciles sandboxes before resuming the engine", async () => {

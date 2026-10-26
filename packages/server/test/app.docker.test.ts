@@ -12,6 +12,7 @@ import { buildSandboxImage } from "../src/adapters/sandbox-docker/index.ts";
 import { createTether, type Tether } from "../src/app.ts";
 import { type Config, loadConfig } from "../src/config.ts";
 import { FAUX_MODEL, fauxModels } from "./fixtures/faux.ts";
+import { runtimeEnv } from "./fixtures/runtime.ts";
 
 const run = promisify(execFile);
 const IMAGE = "tether-sandbox:dev";
@@ -19,10 +20,10 @@ const RUN_TETHER = fileURLToPath(new URL("./fixtures/run-tether.ts", import.meta
 const dirs: string[] = [];
 const opened: Tether[] = [];
 
-function newConfig(): Config {
+function newConfig(env: Record<string, string> = {}): Config {
 	const dataDir = mkdtempSync(join(tmpdir(), "tether-app-"));
 	dirs.push(dataDir);
-	return loadConfig({ TETHER_DATA_DIR: dataDir, TETHER_PORT: "0", TETHER_SANDBOX_IMAGE: IMAGE });
+	return loadConfig({ TETHER_DATA_DIR: dataDir, TETHER_PORT: "0", TETHER_SANDBOX_IMAGE: IMAGE, ...runtimeEnv(), ...env });
 }
 
 function bashSpec(): AgentVersionSpec {
@@ -92,6 +93,165 @@ describe("createTether on docker", () => {
 		expect(bindingA?.sandboxId).not.toBe(bindingB?.sandboxId);
 		expect(readFileSync(join(config.workspaceRoot, a.id, "who.txt"), "utf8")).toBe("first\n");
 		expect(readFileSync(join(config.workspaceRoot, b.id, "who.txt"), "utf8")).toBe("second\n");
+		await shutdown(tether);
+	});
+
+	it("returns the sandbox limit as the second session's tool result and records tether.admission", async () => {
+		const config = newConfig({ TETHER_MAX_RUNNING_SANDBOXES: "1" });
+		const bash: ScriptStep = { toolCall: { name: "bash", args: { command: "echo hi" } } };
+		const tether = await open(config, [bash, { text: "ok" }, bash, { text: "no room" }]);
+		const { agents, sessions, sandboxes, engine } = tether.services;
+		const { agent } = await agents.create({ name: "limit", spec: bashSpec() });
+		const a = await sessions.create({ agentId: agent.id });
+		const b = await sessions.create({ agentId: agent.id });
+
+		await engine.waitSubmission((await sessions.sendMessage(a.id, { content: "go", requestId: "r" })).submissionId);
+		await engine.waitSubmission((await sessions.sendMessage(b.id, { content: "go", requestId: "r" })).submissionId);
+
+		expect(await sandboxes.status(a.id)).toMatchObject({ state: "running" });
+		expect(await sandboxes.status(b.id)).toBeUndefined();
+		const { items } = await sessions.transcript(b.id, { limit: 20 });
+		const result = items.find((e) => e.role === "tool");
+		expect(result?.toolResult).toMatchObject({ isError: true });
+		expect(result?.toolResult?.text).toMatch(/sandbox limit reached: 1 of 1 sandboxes are running/);
+		expect(items.find((e) => e.kind === "tether.admission")).toMatchObject({ data: { limit: 1, running: 1 } });
+		await shutdown(tether);
+	});
+
+	it("stops an idle sandbox, and the next tool call starts it again with the note in the transcript", async () => {
+		const config = newConfig({ TETHER_STOP_AFTER_SECONDS: "1", TETHER_SWEEP_INTERVAL_SECONDS: "0.2" });
+		const requests: string[][] = [];
+		const script: ScriptStep[] = [
+			{ toolCall: { name: "bash", args: { command: "echo kept > kept.txt" } } },
+			{ text: "written" },
+			{ toolCall: { name: "bash", args: { command: "cat kept.txt" } } },
+			{ text: "read" },
+		];
+		const tether = await createTether(config, { models: fauxModels(script, requests) });
+		opened.push(tether);
+		const { agents, sessions, sandboxes, engine, store } = tether.services;
+		const { agent } = await agents.create({ name: "idle", spec: bashSpec() });
+		const session = await sessions.create({ agentId: agent.id });
+
+		await engine.waitSubmission((await sessions.sendMessage(session.id, { content: "a", requestId: "r1" })).submissionId);
+		const stopped = await waitFor(async () => (await sandboxes.status(session.id))?.state === "stopped", 20_000);
+		expect(stopped).toBe(true);
+		const binding = await sandboxes.status(session.id);
+		const { stdout } = await run("docker", ["inspect", "--format", "{{.State.Status}}", binding!.sandboxId]);
+		expect(stdout.trim()).toBe("exited");
+		expect((await store.getSession(session.id))?.status).toBe("idle");
+
+		await engine.waitSubmission((await sessions.sendMessage(session.id, { content: "b", requestId: "r2" })).submissionId);
+
+		expect((await store.getSession(session.id))?.status).toBe("active");
+		const { items } = await sessions.transcript(session.id, { limit: 50 });
+		expect(items.find((e) => e.kind === "tether.sandbox" && (e.data as { reason?: string }).reason === "idle")).toBeDefined();
+		const read = items.find((e) => e.role === "tool");
+		expect(read?.toolResult).toMatchObject({ isError: false, text: expect.stringContaining("kept") });
+		expect(requests.at(-2)?.join("\n")).toMatch(/The sandbox was stopped after \d+ minutes without activity/);
+		await shutdown(tether);
+	});
+
+	it("rebuilds after the container is removed by hand; the old file is gone and the reset note is in the transcript", async () => {
+		const config = newConfig({ TETHER_SWEEP_INTERVAL_SECONDS: "0.2" });
+		const requests: string[][] = [];
+		const script: ScriptStep[] = [
+			{ toolCall: { name: "bash", args: { command: "echo old > old.txt" } } },
+			{ text: "written" },
+			{ toolCall: { name: "bash", args: { command: "test -e old.txt && echo present || echo absent" } } },
+			{ text: "checked" },
+			{ text: "understood" },
+		];
+		const tether = await createTether(config, { models: fauxModels(script, requests) });
+		opened.push(tether);
+		const { agents, sessions, sandboxes, engine } = tether.services;
+		const { agent } = await agents.create({ name: "lost", spec: bashSpec() });
+		const session = await sessions.create({ agentId: agent.id });
+		await engine.waitSubmission((await sessions.sendMessage(session.id, { content: "a", requestId: "r1" })).submissionId);
+		const before = await sandboxes.status(session.id);
+
+		await run("docker", ["rm", "--force", before!.sandboxId]);
+		expect(await waitFor(async () => (await sandboxes.status(session.id))?.state === "lost", 20_000)).toBe(true);
+		await engine.waitSubmission((await sessions.sendMessage(session.id, { content: "b", requestId: "r2" })).submissionId);
+
+		expect(await sandboxes.status(session.id)).toMatchObject({ state: "running", epoch: expect.any(Number) });
+		const { items } = await sessions.transcript(session.id, { limit: 50 });
+		const check = items.find((e) => e.role === "tool");
+		expect(check?.toolResult).toMatchObject({ isError: false, text: expect.stringContaining("absent") });
+		expect(
+			items.find((e) => e.kind === "tether.sandbox" && (e.data as { reason?: string }).reason === "recovered"),
+		).toBeDefined();
+		// 说明是在这一轮的工具调用里写下的，pi 把它排到这一轮结束后，模型下一轮看到
+		await engine.waitSubmission((await sessions.sendMessage(session.id, { content: "c", requestId: "r3" })).submissionId);
+		expect(requests.at(-1)?.join("\n")).toContain("The previous sandbox was lost (missing).");
+		await shutdown(tether);
+	});
+
+	it("destroys the container and the workspace directory when a session is archived", async () => {
+		const config = newConfig();
+		const tether = await open(config, [
+			{ toolCall: { name: "bash", args: { command: "echo bye > a.txt" } } },
+			{ text: "done" },
+		]);
+		const { agents, sessions, sandboxes, engine } = tether.services;
+		const { agent } = await agents.create({ name: "archive", spec: bashSpec() });
+		const session = await sessions.create({ agentId: agent.id });
+		await engine.waitSubmission((await sessions.sendMessage(session.id, { content: "go", requestId: "r" })).submissionId);
+		const workspace = join(config.workspaceRoot, session.id);
+		expect(existsSync(join(workspace, "a.txt"))).toBe(true);
+
+		const archived = await sessions.archive(session.id);
+
+		expect(archived.status).toBe("archived");
+		expect(await sandboxes.status(session.id)).toMatchObject({ state: "destroyed" });
+		const { stdout } = await run("docker", ["ps", "-aq", "--filter", `label=tether.session=${session.id}`]);
+		expect(stdout.trim()).toBe("");
+		expect(existsSync(workspace)).toBe(false);
+		await shutdown(tether);
+	});
+
+	it("lists and downloads a file the agent wrote", async () => {
+		const config = newConfig();
+		const tether = await open(config, [
+			{ toolCall: { name: "bash", args: { command: "mkdir -p out && printf '\\000\\377\\001bin' > out/data.bin" } } },
+			{ text: "done" },
+		]);
+		const { agents, sessions, sandboxes, engine } = tether.services;
+		const { agent } = await agents.create({ name: "files", spec: bashSpec() });
+		const session = await sessions.create({ agentId: agent.id });
+		await engine.waitSubmission((await sessions.sendMessage(session.id, { content: "go", requestId: "r" })).submissionId);
+
+		expect(await sandboxes.listFiles(session.id, "")).toContainEqual({ name: "out", kind: "dir", size: expect.any(Number) });
+		expect(await sandboxes.listFiles(session.id, "out")).toEqual([{ name: "data.bin", kind: "file", size: 6 }]);
+		const response = await tether.app.request(`/v1/sessions/${session.id}/sandbox/file?path=out/data.bin`);
+		expect(response.status).toBe(200);
+		expect(response.headers.get("content-type")).toBe("application/octet-stream");
+		expect(response.headers.get("content-disposition")).toMatch(/^attachment; filename="data.bin"/);
+		expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array([0, 255, 1, 98, 105, 110]));
+		await shutdown(tether);
+	});
+
+	it("refuses a symlink in the workspace that points to /etc", async () => {
+		const config = newConfig();
+		const tether = await open(config, [
+			{ toolCall: { name: "bash", args: { command: "ln -s /etc config" } } },
+			{ text: "linked" },
+		]);
+		const { agents, sessions, sandboxes, engine } = tether.services;
+		const { agent } = await agents.create({ name: "escape", spec: bashSpec() });
+		const session = await sessions.create({ agentId: agent.id });
+		await engine.waitSubmission((await sessions.sendMessage(session.id, { content: "go", requestId: "r" })).submissionId);
+
+		for (const read of [
+			() => sandboxes.listFiles(session.id, "config"),
+			() => sandboxes.readFile(session.id, "config/passwd"),
+			() => sandboxes.readFile(session.id, "../../etc/passwd"),
+		]) {
+			await expect(read()).rejects.toMatchObject({ code: "invalid_request", message: "path is outside /workspace" });
+		}
+		const response = await tether.app.request(`/v1/sessions/${session.id}/sandbox/file?path=config/passwd`);
+		expect(response.status).toBe(400);
+		expect(await response.json()).toMatchObject({ ok: false, error: { code: "invalid_request" } });
 		await shutdown(tether);
 	});
 
@@ -169,6 +329,16 @@ describe("createTether on docker", () => {
 		await shutdown(recovered);
 	});
 });
+
+/** 每 100 毫秒检查一次，条件成立返回 true，超时返回 false。 */
+async function waitFor(check: () => Promise<boolean>, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (await check()) return true;
+		await sleep(100);
+	}
+	return false;
+}
 
 /** 等子进程提交了消息、bash 已经在容器里开始执行，然后 SIGKILL。返回提交 ID。 */
 async function killWhenStarted(child: ChildProcess, marker: string): Promise<string> {

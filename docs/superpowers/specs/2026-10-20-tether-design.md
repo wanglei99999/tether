@@ -108,7 +108,7 @@ packages/
 
 **AgentEngine**：持久化的 agent 执行引擎。职责：创建会话、提交输入（带幂等 `requestId`）、中断、分叉、订阅事件、进程重启后恢复；**追加 Tether 自定义条目**（模型可见或不可见，见 §4.4）；**运行开始钩子**（一轮运行发出第一个模型请求之前回调 core，带上触发这一轮的提交 ID，core 由它解析出对齐用的条目 ID，用于 §8.3 的检查点；pi-durable 上的取法见 `docs/m0-findings.md` 第 7 节）；**工具审批挂起与恢复**（§6.4）。引擎通过 core 定义的 `EnvResolver.envFor(sessionId)` 拿执行环境，不直接依赖沙箱。第一阶段实现是对 `pi-durable` 的 `Harness` / `Conversation` 的适配。
 
-**SandboxProvider**：沙箱生命周期，不负责执行。职责：按模板创建、按 ID 查找、停止、启动、销毁；`daemonCommand(binding, epoch)` 返回启动沙箱内 daemon 的命令行（Docker 就是 `docker exec -i ...`），也就是一条到 daemon 的**字节管道**；可选能力：快照、从快照创建、原地回滚、分叉。能力用显式的 `capabilities` 标出，core 根据能力决定策略，不做"假装支持"。
+**SandboxProvider**：沙箱生命周期，不负责执行。职责：按模板创建、按 ID 查找、停止、启动、销毁、列出带状态的受管沙箱（`listManaged()`，巡检和启动对账用）；`daemonCommand(binding, epoch)` 返回启动沙箱内 daemon 的命令行（Docker 就是 `docker exec -i ...`），也就是一条到 daemon 的**字节管道**；`fence(sandboxId, epoch)` 在沙箱里杀掉旧 epoch 的 daemon 和它启动的全部进程（§8.2，Docker 上是 `kill -KILL -1` 加两道防护）；可选能力：快照、从快照创建、原地回滚、分叉。能力用显式的 `capabilities` 标出，core 根据能力决定策略，不做"假装支持"。
 
 | 能力 | Docker | E2B | CubeSandbox |
 |---|---|---|---|
@@ -123,7 +123,7 @@ packages/
 
 上表的 E2B 与 CubeSandbox 列来自它们的文档（E2B JS SDK v2.19、CubeSandbox v0.7 / `@cubesandbox/sdk` 0.7.3），接入这些后端时必须实测确认，以实测为准更新这张表。注意：CubeSandbox 的快照、回滚、分叉是它独有的扩展 API，不在 E2B 标准 SDK 里，所以 Cube 适配器使用 `@cubesandbox/sdk` 而不是 `e2b` 包。
 
-**ExecChannel**：沙箱内的文件与命令操作。对上实现 `TetherEnv`（文件读写、目录、`exec` 的最小子集，见下方说明），对下用 SandboxProvider 给的 daemon 命令建立连接。连接管理和 epoch 隔离（§8.2）都在这一层，与后端无关：以后加 E2B，只需实现生命周期和字节管道，隔离逻辑不用重写。第一阶段直接用 `pi-env` 的 `Connection` + `RemoteExecutionEnv` + Rust daemon。
+**ExecChannel**：沙箱内的文件与命令操作。对上实现 `TetherEnv`（文件读写、目录、`exec` 的最小子集，见下方说明），对下建立并复用到 daemon 的连接（一个沙箱一条）。每次（重新）启动 daemon 之前，它回调 core 的 `SandboxService.connect()` 取得启动命令。epoch 隔离（§8.2）的分工：什么时候隔离、epoch 怎么取、要不要告诉模型，由 core 的 `connect()` 决定，与后端无关；"在沙箱里杀掉旧进程"依赖后端，是 SandboxProvider 的 `fence()`（ADR-010）。以后加 E2B，只需实现生命周期、字节管道和 `fence()`，隔离策略不用重写。第一阶段直接用 `pi-env` 的 `Connection` + `RemoteExecutionEnv` + Rust daemon。
 
 > 关于 `ExecutionEnv` 这个类型：第一阶段它来自 `pi-durable`。Tether 不复制它的全部方法，`core` 里的 `TetherEnv` 只声明 Tether 自己用得到的最小子集；内置工具继续用 pi 的 `ExecutionEnv`，由 `exec-pienv` 在同一个连接上提供，pi 的类型只出现在适配器和组装层。理由和代价见 `docs/adr/ADR-009`。
 
@@ -164,7 +164,7 @@ packages/
 
 ### 4.6 准入控制
 
-配置项 `maxRunningSandboxes`（默认 4）。需要启动一个新沙箱而已达上限时，这次工具调用直接返回错误结果，说明"沙箱数量已达上限"，同时写一条 `tether.admission` 条目，模型和客户端都能看到。不做排队，也不自动停止别的沙箱。
+配置项 `maxRunningSandboxes`（默认 4，环境变量 `TETHER_MAX_RUNNING_SANDBOXES`）。运行中和创建中的沙箱都占名额。需要占一个新名额（创建、启动已停止的、重建丢失的）而已达上限时，这次工具调用直接返回错误结果，错误码 `sandbox_limit`（HTTP 503，客户端稍后重试），消息为 "sandbox limit reached: <running> of <limit> sandboxes are running; try again after another session goes idle"；同时写一条 `tether.admission` 条目给客户端看，不带模型文本（模型已经从工具的错误结果里看到原因）。已经在运行的沙箱上的工具调用不检查准入。数数和占位在同一把全局锁里完成，并发的第一次工具调用不会一起超过上限。不做排队，也不自动停止别的沙箱。
 
 ## 5. 数据模型
 
@@ -261,7 +261,7 @@ checkpoints
 
 1. 查 `sandbox_bindings`。没有绑定 → 检查准入（§4.6），按 agent 版本的沙箱配置创建，执行 `setup`，写绑定。
 2. 绑定状态是 `stopped` → 检查准入，启动容器。
-3. 返回一个包装了 ExecChannel 的 `ExecutionEnv`；连接按 `(sessionId, epoch)` 复用。
+3. 返回一个包装了 ExecChannel 的 `ExecutionEnv`；连接按沙箱复用，daemon 每次（重新）启动前经 `connect()` 取新 epoch 并隔离（§8.2）。
 4. 后端报告沙箱已不存在（过期、被手动删除）→ 走 §8.4 的重建流程。
 
 ### 6.4 需要审批的工具
@@ -271,7 +271,7 @@ checkpoints
 ### 6.5 中断、归档
 
 - 中断：调用引擎的 abort，排队中的输入撤回，运行中的工具收到取消信号，daemon 杀掉命令的进程组。
-- 归档：会话标记 archived，沙箱销毁，检查点按保留策略清理。
+- 归档：会话先标记 archived（之后的消息被拒绝），再中止正在跑的一轮，最后销毁沙箱（容器和工作区删除，绑定保留为 `destroyed`，之后的工具调用和文件浏览报 `conflict`），检查点按保留策略清理（M3）。销毁失败时再调用一次归档即可重试。
 
 ## 7. 对外 API
 
@@ -381,8 +381,8 @@ WebSocket 连接建立后，服务端先发一个 `snapshot`（会话当前完�
 
 - 沙箱后端报告沙箱不存在时，绑定状态改为 `lost`。
 - 如果有检查点：从最新的检查点重建，然后在会话里写一条系统说明（检查点之后的操作丢失了，同 §8.3 的说明格式）。
-- 如果没有检查点：按模板新建，写一条"工作区已重置"的说明。
-- 两种情况都在事件流里发 `sandbox_recovered` 事件，客户端能看到发生了什么。
+- 如果没有检查点：按模板新建，写一条"工作区已重置"的说明。（M2 实现了这一支：下次工具调用时重建，重建同样过准入；setup 失败时绑定留在 `lost`，下一次仍按重建处理。）
+- 两种情况都写一条 `tether.sandbox` 条目，`data.reason` 为 `recovered`，客户端从它得知发生了重建，不另设事件类型。说明在工具调用中途写入时，pi 把模型可见的条目排到这一轮结束，模型下一轮看到；这一轮的工具结果已经反映了新环境。
 
 原则：**永远不假装环境还是原来的样子。** 环境与对话不一致时，必须让模型和用户都知道。
 
@@ -392,7 +392,8 @@ WebSocket 连接建立后，服务端先发一个 `snapshot`（会话当前完�
 
 - 闲置不到 `stopAfter`（默认 1 小时）：什么都不做，容器继续运行，后台服务保持可用。
 - 闲置超过 `stopAfter`：`docker stop`，释放内存；文件系统保留，进程全部结束。同时写一条模型可见的 `tether.sandbox` 条目："容器因闲置被停止，此前启动的后台进程已结束"。**不允许悄悄停止。**下次工具调用时按 §6.3 启动容器。
-- 闲置超过 `destroyAfter`（默认 7 天）：做一次最终快照（如果策略不是 `none`），然后删除容器。之后再来消息，按 §8.4 从快照重建。
+- 闲置超过 `destroyAfter`（默认 7 天）：做一次最终快照（如果策略不是 `none`），然后删除容器。之后再来消息，按 §8.4 从快照重建。这一档依赖快照，和检查点一起在 M3 实现。
+- "闲置"的判断（M2）：巡检时会话正在运行（例如一条比 `stopAfter` 还长的命令）不算闲置，并把 `lastUsedAt` 刷新为当前时间；每次工具调用也刷新它；浏览文件不刷新。巡检间隔默认 60 秒（`TETHER_SWEEP_INTERVAL_SECONDS`），`stopAfter` 由 `TETHER_STOP_AFTER_SECONDS` 配置。
 - 远程后端（E2B / Cube）以后接入时，"停止"映射为它们的暂停（含内存），能保住进程，届时说明条目相应调整。
 - 服务端启动时做一次对账：列出后端上带 Tether 标签的所有沙箱，与 `sandbox_bindings` 比对，清理孤儿沙箱，修正状态。
 
@@ -417,11 +418,13 @@ WebSocket 连接建立后，服务端先发一个 `snapshot`（会话当前完�
 - SDK 与 CLI 的最小版本。
 
 **M2：沙箱生命周期**
-- Docker 后端的完整生命周期：懒创建、闲置两档（§8.5）、对账、准入控制（§4.6）、资源与网络限制、可选 gVisor 运行时。
+- Docker 后端的完整生命周期：懒创建、闲置停止（§8.5 的前两档）、定期与 Docker 对账、准入控制（§4.6）、资源与网络限制、去掉容器全部能力、可选 gVisor 运行时。
 - epoch 隔离（§8.2）。
+- 没有检查点时的丢失重建（§8.4 的第二支）、会话归档、沙箱文件浏览。
+- 2026-10-26 完成，规则的取舍见 ADR-010。范围调整（作者的决定）："闲置超过 `destroyAfter` 删除"要求先做最终快照，移到 M3；"没有检查点就按模板重建"不依赖快照，从 M3 移到 M2。
 
 **M3：检查点与分叉**
-- 检查点策略、快照记录、会话分叉、沙箱丢失重建（§8.3、§8.4）。
+- 检查点策略、快照记录、会话分叉、从检查点重建（§8.3、§8.4 的第一支）、闲置删除档（§8.5 的第三档）。
 - 审批工具（§6.4）。
 
 **M4：混沌测试与发布**

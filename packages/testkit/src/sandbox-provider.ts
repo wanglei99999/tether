@@ -43,7 +43,7 @@ export function registerSandboxProviderConformance(
 			const { sandboxId } = await made.provider.create({ sessionId, spec: sampleSandboxSpec() });
 
 			expect(await made.provider.status(sandboxId)).toBe("running");
-			expect(await made.provider.listManaged()).toContainEqual({ sandboxId, sessionId });
+			expect(await made.provider.listManaged()).toContainEqual({ sandboxId, sessionId, status: "running" });
 		});
 
 		it("reports missing after destroy, and destroy of a missing sandbox does not throw", async () => {
@@ -53,7 +53,7 @@ export function registerSandboxProviderConformance(
 			await made.provider.destroy(sandboxId);
 
 			expect(await made.provider.status(sandboxId)).toBe("missing");
-			expect(await made.provider.listManaged()).not.toContainEqual({ sandboxId, sessionId });
+			expect((await made.provider.listManaged()).map((sandbox) => sandbox.sandboxId)).not.toContain(sandboxId);
 			await expect(made.provider.destroy(sandboxId)).resolves.toBeUndefined();
 		});
 
@@ -63,10 +63,29 @@ export function registerSandboxProviderConformance(
 
 			await made.provider.stop(sandboxId);
 			expect(await made.provider.status(sandboxId)).toBe("stopped");
-			expect(await made.provider.listManaged()).toContainEqual({ sandboxId, sessionId });
+			expect(await made.provider.listManaged()).toContainEqual({ sandboxId, sessionId, status: "stopped" });
 
 			await made.provider.start(sandboxId);
 			expect(await made.provider.status(sandboxId)).toBe("running");
+			expect(await made.provider.listManaged()).toContainEqual({ sandboxId, sessionId, status: "running" });
+		});
+
+		it("fences a fresh sandbox and reports how many processes it killed", async () => {
+			const sessionId = made.sessionId();
+			const { sandboxId } = await made.provider.create({ sessionId, spec: sampleSandboxSpec() });
+
+			const { killed } = await made.provider.fence(sandboxId, 1);
+
+			expect(killed).toBeGreaterThanOrEqual(0);
+			expect(await made.provider.status(sandboxId)).toBe("running");
+		});
+
+		it("fails to fence a missing sandbox with sandbox_failed", async () => {
+			const sessionId = made.sessionId();
+			const { sandboxId } = await made.provider.create({ sessionId, spec: sampleSandboxSpec() });
+			await made.provider.destroy(sandboxId);
+
+			await expect(made.provider.fence(sandboxId, 1)).rejects.toMatchObject({ code: "sandbox_failed" });
 		});
 
 		it("returns a daemon command that ends with the epoch", async () => {

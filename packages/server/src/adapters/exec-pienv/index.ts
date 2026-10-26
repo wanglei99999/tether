@@ -16,19 +16,17 @@ import {
 export { type LazyEnvOptions, lazyEnv } from "./lazy.ts";
 
 export interface PiEnvExecChannelOptions {
-	/** 由 SandboxProvider 提供；Connection 会在末尾追加 serve --token <hex>。 */
-	daemonCommand: (sandboxId: string, epoch: number) => string[];
+	/**
+	 * 每次（重新）启动 daemon 前调用，返回启动命令；Connection 会在末尾追加 serve --token <hex>。
+	 * 组装层接到 SandboxService.connect：取新 epoch 并隔离旧 daemon（ADR-007）。它失败时这次启动失败，下一次请求重试。
+	 */
+	connect: (binding: SandboxBinding) => Promise<readonly string[]>;
 }
 
 export interface PiEnvExecChannel extends ExecChannel {
 	/** 给 pi 的内置工具用的环境，与 env() 共用同一条连接（ADR-009）。 */
 	piEnv(binding: SandboxBinding, cwd: string): ExecutionEnv;
 	closeAll(): void;
-}
-
-interface OpenConnection {
-	epoch: number;
-	connection: Connection;
 }
 
 function contextFor(signal: AbortSignal | undefined): Context {
@@ -71,6 +69,13 @@ function wrap(remote: RemoteExecutionEnv, cwd: string): TetherEnv {
 			const infos = await call(`list ${path}`, () => remote.listDir(path, context));
 			return infos.map(toDirEntry).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 		},
+		async readBytes(path) {
+			const bytes = await call(`read ${path}`, () => remote.readBinaryFile(path, context));
+			// pi 给的是 Node 的 Buffer；换成同一块内存上的普通 Uint8Array，core 只认端口里的类型
+			return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+		},
+		info: async (path) => toDirEntry(await call(`stat ${path}`, () => remote.fileInfo(path, context))),
+		realPath: (path) => call(`realpath ${path}`, () => remote.canonicalPath(path, context)),
 		async exec(command: string, options: ExecOptions = {}): Promise<ExecResult> {
 			const output = { stdout: "", stderr: "" };
 			const { exitCode } = await call(`exec`, () =>
@@ -93,18 +98,17 @@ function wrap(remote: RemoteExecutionEnv, cwd: string): TetherEnv {
 }
 
 /**
- * 经 pi-env daemon 访问沙箱。同一个 (sandboxId, epoch) 复用一条 Connection；epoch 变了就关掉旧的、建新的。
- * Connection 在 daemon 退出后（例如容器重启）会自己重新执行 daemon 命令。
+ * 经 pi-env daemon 访问沙箱。每个沙箱一条 Connection，一个容器同一时刻只有一个 daemon 在服务。
+ * Connection 在 daemon 退出后（例如容器重启）的下一次请求时重新启动它，每次启动前都经 options.connect 取命令。
  */
 export function createPiEnvExecChannel(options: PiEnvExecChannelOptions): PiEnvExecChannel {
-	const open = new Map<string, OpenConnection>();
+	const open = new Map<string, Connection>();
 
 	function connectionFor(binding: SandboxBinding): Connection {
 		const existing = open.get(binding.sandboxId);
-		if (existing?.epoch === binding.epoch) return existing.connection;
-		existing?.connection.close();
-		const connection = new Connection({ command: options.daemonCommand(binding.sandboxId, binding.epoch) });
-		open.set(binding.sandboxId, { epoch: binding.epoch, connection });
+		if (existing) return existing;
+		const connection = new Connection({ command: () => options.connect(binding) });
+		open.set(binding.sandboxId, connection);
 		return connection;
 	}
 
@@ -121,11 +125,11 @@ export function createPiEnvExecChannel(options: PiEnvExecChannelOptions): PiEnvE
 		env: (binding, { cwd, shellEnv }) => wrap(remoteEnv(binding, cwd, shellEnv), cwd),
 		piEnv: (binding, cwd) => remoteEnv(binding, cwd),
 		close(sandboxId) {
-			open.get(sandboxId)?.connection.close();
+			open.get(sandboxId)?.close();
 			open.delete(sandboxId);
 		},
 		closeAll() {
-			for (const { connection } of open.values()) connection.close();
+			for (const connection of open.values()) connection.close();
 			open.clear();
 		},
 	};

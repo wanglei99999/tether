@@ -4,12 +4,14 @@ import type { SessionRecord } from "../model.ts";
 import type { AgentEngine, AppStore, Clock, Ids } from "../ports.ts";
 import { validateSessionVariables } from "../validate.ts";
 import { type AgentService, LOCAL_OWNER } from "./agents.ts";
-import { WORKSPACE } from "./sandboxes.ts";
+import { type SandboxService, WORKSPACE } from "./sandboxes.ts";
 
 export interface SessionServiceDeps {
 	store: AppStore;
 	engine: AgentEngine;
 	agents: AgentService;
+	/** 归档时销毁会话的沙箱。 */
+	sandboxes: Pick<SandboxService, "destroy">;
 	clock: Clock;
 	ids: Ids;
 }
@@ -83,6 +85,8 @@ export class SessionService {
 	): Promise<{ submissionId: string }> {
 		const session = await this.get(id);
 		if (session.status === "archived") throw new TetherError("conflict", `session ${id} is archived`);
+		// 沙箱闲置停止后会话是 idle；有新消息就回到 active，沙箱等下次工具调用再启动
+		if (session.status === "idle") await this.#deps.store.updateSession(id, { status: "active" });
 		const result = await this.#deps.engine.submit(this.#engineId(session), input);
 		await this.#deps.store.updateSession(id, { lastActiveAt: this.#deps.clock.now() });
 		return result;
@@ -92,6 +96,19 @@ export class SessionService {
 	async waitSubmission(id: string, submissionId: string): ReturnType<AgentEngine["waitSubmission"]> {
 		await this.get(id);
 		return this.#deps.engine.waitSubmission(submissionId);
+	}
+
+	/**
+	 * 归档：先改状态（之后的消息被拒绝），再中止正在跑的一轮，最后销毁沙箱。
+	 * 对已归档的会话再调用一次也会执行销毁，上次销毁失败可以这样重试。
+	 */
+	async archive(id: string): Promise<SessionRecord> {
+		const { store, engine, sandboxes } = this.#deps;
+		const session = await this.get(id);
+		if (session.status !== "archived") await store.updateSession(id, { status: "archived" });
+		if (session.engineSessionId !== null) await engine.abort(session.engineSessionId);
+		await sandboxes.destroy(id, "archived");
+		return this.get(id);
 	}
 
 	async abort(id: string): Promise<void> {

@@ -6,6 +6,8 @@ export type ErrorCode =
 	| "conflict"
 	| "busy"
 	| "sandbox_failed"
+	/** 同时运行的沙箱已达上限，稍后重试（spec §4.6）。 */
+	| "sandbox_limit"
 	| "engine_failed"
 	| "internal";
 

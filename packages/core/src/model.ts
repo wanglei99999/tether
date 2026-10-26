@@ -1,4 +1,5 @@
 import Type from "typebox";
+import { TetherError } from "./errors.ts";
 
 /** 会话变量以环境变量形式交给 setup，名字必须是合法的 shell 标识符。 */
 export const VARIABLE_NAME = "^[A-Z_][A-Z0-9_]*$";
@@ -101,10 +102,29 @@ export interface SandboxBinding {
 	sessionId: string;
 	provider: "docker";
 	sandboxId: string;
-	/** M1 固定为 1；M2 的隔离每次重连加一。 */
+	/** 新绑定为 0，每次连接 daemon 前加一（ADR-007）。 */
 	epoch: number;
 	state: SandboxState;
 	template: string;
 	createdAt: string;
 	lastUsedAt: string;
+}
+
+/** 绑定建好后能改的字段。 */
+export type BindingPatch = Partial<Pick<SandboxBinding, "state" | "lastUsedAt">>;
+
+export interface ExpectedState {
+	state: SandboxState | readonly SandboxState[];
+}
+
+/** AppStore.updateBinding 的前置检查，各实现共用：当前状态不是期望值时报 conflict。 */
+export function assertBindingState(binding: SandboxBinding, expected: ExpectedState | undefined): void {
+	if (expected === undefined) return;
+	const allowed: readonly SandboxState[] = typeof expected.state === "string" ? [expected.state] : expected.state;
+	if (!allowed.includes(binding.state)) {
+		throw new TetherError(
+			"conflict",
+			`sandbox for ${binding.sessionId} is ${binding.state}, expected ${allowed.join(" or ")}`,
+		);
+	}
 }

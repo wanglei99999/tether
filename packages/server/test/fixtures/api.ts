@@ -37,13 +37,27 @@ export async function makeApi(script: ScriptStep[], options: TestApiOptions = {}
 	const engine = options.wrapEngine ? options.wrapEngine(opened) : opened;
 	const ids = createIds();
 	const agents = new AgentService({ store, clock: systemClock, ids, catalog: BUILTIN_TOOLS });
-	const sessions = new SessionService({ store, engine, agents, clock: systemClock, ids });
+	// 这里没有沙箱：归档只把绑定（如果测试放了一条）标成 destroyed
+	const sandboxes = {
+		destroy: async (id: string) => {
+			if ((await store.getBinding(id)) !== undefined) await store.updateBinding(id, { state: "destroyed" });
+		},
+	};
+	const sessions = new SessionService({ store, engine, agents, sandboxes, clock: systemClock, ids });
 	const warnings: unknown[] = [];
 	const log: Log = { warn: (message, detail) => warnings.push({ message, detail }) };
 	const http = createHttpApp({
 		agents,
 		sessions,
-		sandboxes: { status: (id) => store.getBinding(id) },
+		sandboxes: {
+			status: (id) => store.getBinding(id),
+			// 没有真实沙箱：列目录为空，读文件返回 "content of <path>"，名字取路径最后一段
+			listFiles: async () => [],
+			readFile: async (_id, path) => ({
+				name: path.slice(path.lastIndexOf("/") + 1),
+				content: new TextEncoder().encode(`content of ${path}`),
+			}),
+		},
 		log,
 		...(options.token !== undefined && { token: options.token }),
 	});

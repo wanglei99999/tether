@@ -4,6 +4,8 @@ import type {
 	AgentRecord,
 	AgentVersionRecord,
 	AgentVersionSpec,
+	BindingPatch,
+	ExpectedState,
 	ModelRef,
 	SandboxBinding,
 	SandboxSpec,
@@ -36,7 +38,19 @@ export interface AppStore {
 	updateSession(id: string, patch: Partial<Pick<SessionRecord, "status" | "title" | "lastActiveAt">>): Promise<void>;
 
 	getBinding(sessionId: string): Promise<SandboxBinding | undefined>;
-	putBinding(binding: SandboxBinding): Promise<void>;
+	/** 已存在时报 conflict。 */
+	createBinding(binding: SandboxBinding): Promise<void>;
+	/**
+	 * 只改状态和最后使用时间；epoch 只能经 nextEpoch 改变。
+	 * 给了 expected 时，当前状态不在其中就报 conflict，不写入。返回写入后的绑定。
+	 */
+	updateBinding(
+		sessionId: string,
+		patch: BindingPatch,
+		expected?: ExpectedState,
+	): Promise<SandboxBinding>;
+	/** epoch 原子地加一，返回新值。 */
+	nextEpoch(sessionId: string): Promise<number>;
 	deleteBinding(sessionId: string): Promise<void>;
 	listBindings(): Promise<SandboxBinding[]>;
 }
@@ -59,6 +73,8 @@ export interface AgentEngine {
 	): Promise<{ submissionId: string }>;
 	waitSubmission(submissionId: string): Promise<{ status: "done" | "unanswered"; answer?: TranscriptEntry }>;
 	abort(engineSessionId: string): Promise<void>;
+	/** 是否有一轮正在运行，与 SessionView.running 同一来源。未知会话报 not_found。 */
+	isRunning(engineSessionId: string): Promise<boolean>;
 	/** 新的在前。 */
 	transcript(
 		engineSessionId: string,
@@ -91,7 +107,13 @@ export interface SandboxProvider {
 	stop(sandboxId: string): Promise<void>;
 	/** 同时删除工作区目录；沙箱不存在不报错。 */
 	destroy(sandboxId: string): Promise<void>;
-	listManaged(): Promise<{ sandboxId: string; sessionId: string }[]>;
+	/** Tether 管理的全部沙箱及其状态，一次后端调用（巡检每轮用它和绑定核对）。 */
+	listManaged(): Promise<{ sandboxId: string; sessionId: string; status: "running" | "stopped" }[]>;
+	/**
+	 * 杀掉沙箱里除 init 以外的全部进程（旧 daemon 和它启动的命令），删除 epoch 更小的 daemon 记录（ADR-007）。
+	 * 沙箱没有自己的 PID 命名空间、init 不对或执行失败时抛 sandbox_failed。
+	 */
+	fence(sandboxId: string, epoch: number): Promise<{ killed: number }>;
 	/** 在沙箱里启动 daemon 的命令，ExecChannel 用它建立连接。 */
 	daemonCommand(sandboxId: string, epoch: number): string[];
 }

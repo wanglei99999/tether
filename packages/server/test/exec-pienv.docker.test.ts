@@ -9,6 +9,7 @@ import { sampleSandboxSpec } from "@tether/testkit";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createPiEnvExecChannel } from "../src/adapters/exec-pienv/index.ts";
 import { buildSandboxImage, createDockerSandboxProvider } from "../src/adapters/sandbox-docker/index.ts";
+import { runtimeOption } from "./fixtures/runtime.ts";
 
 const run = promisify(execFile);
 const IMAGE = "tether-sandbox:dev";
@@ -19,8 +20,16 @@ const provider = createDockerSandboxProvider({
 	workspaceRoot,
 	user: `${process.getuid?.()}:${process.getgid?.()}`,
 	defaultImage: IMAGE,
+	...runtimeOption(),
 });
-const channel = createPiEnvExecChannel({ daemonCommand: (id, epoch) => provider.daemonCommand(id, epoch) });
+/** 只测通道本身：不经 SandboxService，不隔离，固定用绑定里的 epoch。 */
+let connects = 0;
+const channel = createPiEnvExecChannel({
+	connect: async (b) => {
+		connects++;
+		return provider.daemonCommand(b.sandboxId, b.epoch);
+	},
+});
 let binding: SandboxBinding;
 
 async function dockerExec(script: string): Promise<string> {
@@ -102,18 +111,33 @@ describe("exec-pienv TetherEnv", () => {
 		expect(await env.exists("pwned2")).toBe(false);
 	});
 
+	it("reads bytes, file info and the real path through the daemon", async () => {
+		const env = channel.env(binding, { cwd: "/workspace" });
+		await env.writeFile("bin/data.bin", new Uint8Array([0, 255, 1, 2]));
+		await dockerExec("ln -sfn /etc /workspace/etc-link");
+
+		expect(await env.readBytes("bin/data.bin")).toEqual(new Uint8Array([0, 255, 1, 2]));
+		expect(await env.info("bin/data.bin")).toEqual({ name: "data.bin", kind: "file", size: 4 });
+		expect(await env.info("bin")).toMatchObject({ name: "bin", kind: "dir" });
+		expect(await env.realPath("bin/../bin/data.bin")).toBe("/workspace/bin/data.bin");
+		expect(await env.realPath("etc-link")).toBe("/etc");
+		await expect(env.realPath("nope")).rejects.toMatchObject({ code: "not_found" });
+	});
+
 	it("maps a missing file to TetherError not_found", async () => {
 		const env = channel.env(binding, { cwd: "/workspace" });
 
 		await expect(env.readText("does/not/exist.txt")).rejects.toMatchObject({ name: "TetherError", code: "not_found" });
 	});
 
-	it("reuses one connection for the same sandbox and epoch", async () => {
+	it("reuses one connection for the same sandbox", async () => {
 		await channel.env(binding, { cwd: "/workspace" }).exists("a");
+		const before = connects;
 		await channel.env(binding, { cwd: "/tmp" }).exists("b");
 
 		const records = (await dockerExec("ls /run/tether/daemons")).split("\n");
 
+		expect(connects).toBe(before);
 		expect(records).toHaveLength(1);
 		expect(records[0]).toMatch(/^1\.\d+$/);
 	});

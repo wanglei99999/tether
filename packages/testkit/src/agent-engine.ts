@@ -344,6 +344,32 @@ export function registerAgentEngineConformance(
 			}
 		});
 
+		it("reports running during a run and not running after it settles", async () => {
+			await withEngine([bash("sleep 1"), { text: "slept" }], async ({ engine, model }) => {
+				const id = await engine.createSession(bashConfig(model));
+				expect(await engine.isRunning(id)).toBe(false);
+				const recorded = await record(engine, id);
+				try {
+					const { submissionId } = await engine.submit(id, { content: "sleep", requestId: "r" });
+					await recorded.until((e) => e.type === "tool_start");
+
+					expect(await engine.isRunning(id)).toBe(true);
+
+					await engine.waitSubmission(submissionId);
+					await recorded.until(runEndOf(submissionId));
+					expect(await engine.isRunning(id)).toBe(false);
+				} finally {
+					await recorded.stop();
+				}
+			});
+		});
+
+		it("reports an unknown session from isRunning with not_found", async () => {
+			await withEngine([], async ({ engine }) => {
+				await expect(engine.isRunning("999999")).rejects.toMatchObject({ code: "not_found" });
+			});
+		});
+
 		it("reports an unknown session", async () => {
 			await withEngine([], async ({ engine }) => {
 				expect(await engine.hasSession("999999")).toBe(false);

@@ -9,8 +9,11 @@ export const USAGE = `usage:
   tether agent create --file <agent.json>
   tether agent list
   tether session create <agentId> [--version N] [--var KEY=VALUE]...
+  tether session archive <sessionId>
   tether send <sessionId> <text> [--follow]
   tether sandbox <sessionId>
+  tether files <sessionId> [path]
+  tether cat <sessionId> <path>
 
 options:
   --json   print the API's data as JSON
@@ -20,7 +23,8 @@ environment:
   TETHER_TOKEN  bearer token, if the server sets one`;
 
 export interface Io {
-	out(text: string): void;
+	/** 字节原样写出（cat 下载的文件可能是二进制）。 */
+	out(text: string | Uint8Array): void;
 	err(text: string): void;
 	env: Record<string, string | undefined>;
 }
@@ -135,6 +139,11 @@ async function dispatch(client: TetherClient, args: Parsed, io: Io): Promise<num
 		print({ session }, `${session.id} (agent ${session.agentId} version ${session.agentVersion})`);
 		return 0;
 	}
+	if (group === "session" && action === "archive") {
+		const session = await client.sessions.archive(need(rest[0], "<sessionId>"));
+		print({ session }, `${session.id} archived`);
+		return 0;
+	}
 	if (group === "send") {
 		const sessionId = need(action, "<sessionId>");
 		const text = need(rest[0], "<text>");
@@ -146,6 +155,17 @@ async function dispatch(client: TetherClient, args: Parsed, io: Io): Promise<num
 	if (group === "sandbox") {
 		const binding = await client.sessions.sandbox(need(action, "<sessionId>"));
 		print({ binding }, binding ? `${binding.state}  ${binding.sandboxId}` : "no sandbox yet");
+		return 0;
+	}
+	if (group === "files") {
+		const items = await client.sessions.files(need(action, "<sessionId>"), rest[0]);
+		const lines = items.map((item) => `${item.kind.padEnd(7)} ${String(item.size).padStart(10)}  ${item.name}`);
+		print({ items }, lines.join("\n") || "empty");
+		return 0;
+	}
+	if (group === "cat") {
+		const sessionId = need(action, "<sessionId>");
+		io.out(await client.sessions.file(sessionId, need(rest[0], "<path>")));
 		return 0;
 	}
 	throw new UsageError(group === undefined ? "missing command" : `unknown command: ${args.positionals.join(" ")}`);

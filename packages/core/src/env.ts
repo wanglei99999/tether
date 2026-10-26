@@ -27,5 +27,10 @@ export interface TetherEnv {
 	writeFile(path: string, content: string | Uint8Array): Promise<void>;
 	exists(path: string): Promise<boolean>;
 	list(path: string): Promise<DirEntry[]>;
+	readBytes(path: string): Promise<Uint8Array>;
+	/** 不跟随最后一级的符号链接（lstat）。 */
+	info(path: string): Promise<DirEntry>;
+	/** 解析成绝对路径，沿途的符号链接都跟到底（realpath）。 */
+	realPath(path: string): Promise<string>;
 	exec(command: string, options?: ExecOptions): Promise<ExecResult>;
 }

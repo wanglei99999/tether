@@ -17,7 +17,7 @@ import { eventStream } from "./events.ts";
 export interface HttpDeps {
 	agents: AgentService;
 	sessions: SessionService;
-	sandboxes: Pick<SandboxService, "status">;
+	sandboxes: Pick<SandboxService, "status" | "listFiles" | "readFile">;
 	log: Log;
 	/** 设置后除 /v1/health 外都要 `Authorization: Bearer <token>`。 */
 	token?: string;
@@ -42,6 +42,16 @@ const SendMessageBody = Type.Object({
 });
 
 const SESSION_STATUSES: readonly SessionStatus[] = ["active", "idle", "archived", "failed"];
+
+/**
+ * 下载的 content-disposition。文件名来自沙箱，可能带引号、换行或非 ASCII：
+ * filename= 里只留可打印 ASCII（其余换成 _），完整名字放进 RFC 5987 的 filename*。
+ */
+function attachment(name: string): string {
+	const fallback = name.replace(/[^\x20-\x7e]|["\\]/g, "_");
+	const encoded = encodeURIComponent(name).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+	return `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+}
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 
@@ -138,6 +148,7 @@ function sessionRoutes(sessions: SessionService, sandboxes: HttpDeps["sandboxes"
 		await sessions.abort(c.req.param("id"));
 		return ok(c, {});
 	});
+	r.post("/:id/archive", async (c) => ok(c, { session: await sessions.archive(c.req.param("id")) }));
 	r.get("/:id/transcript", async (c) => {
 		const page = { limit: limitParam(c.req.query("limit")), ...optional("before", c.req.query("before")) };
 		return ok(c, await sessions.transcript(c.req.param("id"), page));
@@ -145,6 +156,20 @@ function sessionRoutes(sessions: SessionService, sandboxes: HttpDeps["sandboxes"
 	r.get("/:id/sandbox", async (c) => {
 		const session = await sessions.get(c.req.param("id"));
 		return ok(c, { binding: (await sandboxes.status(session.id)) ?? null });
+	});
+	r.get("/:id/sandbox/files", async (c) =>
+		ok(c, { items: await sandboxes.listFiles(c.req.param("id"), c.req.query("path") ?? "") }),
+	);
+	// 成功时返回原始字节，出错仍是 JSON 信封
+	r.get("/:id/sandbox/file", async (c) => {
+		const path = c.req.query("path");
+		if (path === undefined || path === "") throw new TetherError("invalid_request", "path is required");
+		const { name, content } = await sandboxes.readFile(c.req.param("id"), path);
+		// 复制一份成 Hono 要的 Uint8Array<ArrayBuffer>（内容不超过 10 MiB）
+		return c.body(new Uint8Array(content), 200, {
+			"content-type": "application/octet-stream",
+			"content-disposition": attachment(name),
+		});
 	});
 	return r;
 }

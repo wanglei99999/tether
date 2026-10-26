@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createTether } from "../../server/src/app.ts";
 import { loadConfig } from "../../server/src/config.ts";
 import { FAUX_MODEL, fauxModels } from "../../server/test/fixtures/faux.ts";
+import { runtimeEnv } from "../../server/test/fixtures/runtime.ts";
 import { TetherApiError, TetherClient } from "../src/index.ts";
 
 const TOKEN = "sdk-secret";
@@ -27,7 +28,7 @@ interface Running {
 
 /** createTether + 监听；port 为 0 时随机分配。同一个 dataDir 可以停了再起。 */
 async function start(dataDir: string, script: ScriptStep[], port = 0): Promise<Running> {
-	const config = loadConfig({ TETHER_DATA_DIR: dataDir, TETHER_PORT: String(port), TETHER_TOKEN: TOKEN });
+	const config = loadConfig({ TETHER_DATA_DIR: dataDir, TETHER_PORT: String(port), TETHER_TOKEN: TOKEN, ...runtimeEnv() });
 	const tether = await createTether(config, { models: fauxModels(script) });
 	const { server, info } = await new Promise<{ server: ReturnType<typeof serve>; info: AddressInfo }>((resolve) => {
 		const server = serve({ fetch: tether.app.fetch, hostname: "127.0.0.1", port }, (info) => resolve({ server, info }));

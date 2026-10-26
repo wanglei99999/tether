@@ -22,6 +22,8 @@ export interface DockerSandboxOptions {
 	user: string;
 	/** spec.template 为空时用的镜像。 */
 	defaultImage: string;
+	/** docker run --runtime，例如 gVisor 的 runsc；不设则用 Docker 默认的 runc。 */
+	runtime?: string;
 }
 
 /** 构建默认沙箱镜像：Dockerfile、launch.sh 和 pi-env daemon 二进制放进临时构建上下文。 */
@@ -30,7 +32,7 @@ export async function buildSandboxImage(tag: string): Promise<void> {
 	try {
 		const arch = process.arch as Parameters<typeof packagedDaemon>[0]["arch"];
 		await copyFile(packagedDaemon({ platform: "linux", arch }), join(context, "pi-env"));
-		await copyFile(join(SANDBOX_DIR, "launch.sh"), join(context, "launch.sh"));
+		for (const script of ["launch.sh", "fence.sh"]) await copyFile(join(SANDBOX_DIR, script), join(context, script));
 		await dockerOrThrow(["build", "--quiet", "--tag", tag, "--file", join(SANDBOX_DIR, "Dockerfile"), context]);
 	} finally {
 		await rm(context, { recursive: true, force: true });
@@ -75,12 +77,16 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 			const sandboxId = `${NAME_PREFIX}${sessionId}`;
 			const workspace = workspaceOf(sessionId);
 			await mkdir(workspace, { recursive: true });
-			// spec.resources.diskMb 在 M1 忽略：Docker 限制磁盘依赖存储驱动（overlay2 + xfs pquota），测试机不满足。
-			await dockerOrThrow([
+			// spec.resources.diskMb 不会到这里：校验时就拒绝（UNSUPPORTED_IN_M2）。Docker 限制磁盘依赖存储驱动（overlay2 + xfs pquota），测试机不满足。
+			const args = [
 				"run",
 				"--detach",
 				"--name",
 				sandboxId,
+				// PID 1 必须是 sleep（fence.sh 和 ADR-007 的防护都依赖它）：不让 daemon.json 的 init 或模板镜像的 ENTRYPOINT 换掉它
+				"--init=false",
+				"--entrypoint",
+				"sleep",
 				"--label",
 				MANAGED_LABEL,
 				"--label",
@@ -91,6 +97,12 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 				`${spec.resources.memoryMb}m`,
 				"--pids-limit",
 				"512",
+				// 容器里的进程以普通用户运行，用不到任何 Linux 能力；也不许经 setuid 程序提权
+				"--cap-drop",
+				"ALL",
+				"--security-opt",
+				"no-new-privileges",
+				...(options.runtime ? ["--runtime", options.runtime] : []),
 				"--network",
 				spec.network === "egress" ? "bridge" : "none",
 				"--user",
@@ -98,9 +110,16 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 				"--volume",
 				`${workspace}:/workspace`,
 				spec.template === "" ? options.defaultImage : spec.template,
-				"sleep",
 				"infinity",
-			]);
+			];
+			try {
+				await dockerOrThrow(args);
+			} catch (error) {
+				// docker run 可能已经建好容器、只是启动失败：删掉它和刚建的工作区，否则下次创建撞上同名容器
+				await docker(["rm", "--force", sandboxId]).catch(() => {});
+				await rm(workspace, { recursive: true, force: true }).catch(() => {});
+				throw error;
+			}
 			return { sandboxId };
 		},
 
@@ -137,15 +156,39 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 				"--filter",
 				`label=${MANAGED_LABEL}`,
 				"--format",
-				`{{.Names}}\t{{.Label "${SESSION_LABEL}"}}`,
+				`{{.Names}}\t{{.Label "${SESSION_LABEL}"}}\t{{.State}}`,
 			]);
 			return out
 				.split("\n")
 				.filter((line) => line.trim() !== "")
 				.map((line) => {
-					const [sandboxId = "", sessionId = ""] = line.split("\t");
-					return { sandboxId, sessionId };
+					const [sandboxId = "", sessionId = "", state = ""] = line.split("\t");
+					// 与 status() 一致：只有 running 算运行，created、exited、paused 等都算停止
+					return { sandboxId, sessionId, status: state === "running" ? "running" : "stopped" } as const;
 				});
+		},
+
+		async fence(sandboxId, epoch) {
+			// kill -1 在共享宿主 PID 命名空间的容器里会杀掉宿主上的进程：先确认容器有自己的命名空间
+			const inspect = await docker(["inspect", "--format", "{{.HostConfig.PidMode}}", sandboxId]);
+			if (inspect.code !== 0) {
+				throw new TetherError("sandbox_failed", `cannot fence ${sandboxId}: ${inspect.stderr.trim()}`);
+			}
+			const pidMode = inspect.stdout.trim();
+			if (pidMode !== "") {
+				throw new TetherError(
+					"sandbox_failed",
+					`refusing to fence ${sandboxId}: it does not have its own PID namespace (PidMode=${pidMode})`,
+				);
+			}
+			const result = await docker(["exec", sandboxId, "/opt/tether/fence.sh", String(epoch)]);
+			if (result.code !== 0) {
+				throw new TetherError(
+					"sandbox_failed",
+					`fence of ${sandboxId} at epoch ${epoch} failed (${result.code}): ${result.stderr.trim()}`,
+				);
+			}
+			return { killed: result.stdout.trim().split(/\s+/).filter(Boolean).length };
 		},
 
 		/** 给 pi-env 的 Connection 用；Connection 会在末尾追加 serve --token <hex>。 */

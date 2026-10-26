@@ -2,7 +2,7 @@ import { TetherError } from "../errors.ts";
 import type { AgentRecord, AgentVersionRecord } from "../model.ts";
 import type { AppStore, Clock, Ids } from "../ports.ts";
 import type { ToolDescriptor } from "../tools.ts";
-import { validateVersionSpec } from "../validate.ts";
+import { type Unsupported, validateVersionSpec } from "../validate.ts";
 
 export interface AgentServiceDeps {
 	store: AppStore;
@@ -10,6 +10,8 @@ export interface AgentServiceDeps {
 	ids: Ids;
 	/** 服务端已安装的工具目录，版本里的工具名按它校验。 */
 	catalog: readonly ToolDescriptor[];
+	/** 还没实现、填了就拒绝的配置，由组装层给出；默认 UNSUPPORTED_IN_M2。 */
+	unsupported?: Unsupported;
 }
 
 /** 单用户阶段所有记录都属于 "local"（设计文档 §5.1）。 */
@@ -30,7 +32,7 @@ export class AgentService {
 		if (typeof input.name !== "string" || input.name.trim() === "") {
 			throw new TetherError("invalid_request", "name must be a non-empty string");
 		}
-		const spec = validateVersionSpec(input.spec, this.#deps.catalog);
+		const spec = this.#validate(input.spec);
 		const at = this.#deps.clock.now();
 		const agent: AgentRecord = {
 			id: this.#deps.ids.next("agt"),
@@ -47,8 +49,12 @@ export class AgentService {
 	async addVersion(agentId: string, spec: unknown): Promise<AgentVersionRecord> {
 		const agent = await this.get(agentId);
 		if (agent.archivedAt !== undefined) throw new TetherError("conflict", `agent ${agentId} is archived`);
-		const valid = validateVersionSpec(spec, this.#deps.catalog);
+		const valid = this.#validate(spec);
 		return this.#deps.store.addVersion(agentId, valid, this.#deps.clock.now());
+	}
+
+	#validate(spec: unknown) {
+		return validateVersionSpec(spec, this.#deps.catalog, this.#deps.unsupported);
 	}
 
 	async get(id: string): Promise<AgentRecord> {

@@ -1,9 +1,12 @@
 import {
+	assertBindingState,
 	TetherError,
 	type AgentRecord,
 	type AgentVersionRecord,
 	type AgentVersionSpec,
 	type AppStore,
+	type BindingPatch,
+	type ExpectedState,
 	type SandboxBinding,
 	type SessionRecord,
 } from "@tether/core";
@@ -117,8 +120,35 @@ export class MemoryAppStore implements AppStore {
 		return structuredClone(this.#bindings.get(sessionId));
 	}
 
-	async putBinding(binding: SandboxBinding): Promise<void> {
+	async createBinding(binding: SandboxBinding): Promise<void> {
+		if (this.#bindings.has(binding.sessionId)) {
+			throw new TetherError("conflict", `sandbox binding for ${binding.sessionId} already exists`);
+		}
 		this.#bindings.set(binding.sessionId, structuredClone(binding));
+	}
+
+	async updateBinding(
+		sessionId: string,
+		patch: BindingPatch,
+		expected?: ExpectedState,
+	): Promise<SandboxBinding> {
+		const binding = this.#requireBinding(sessionId);
+		assertBindingState(binding, expected);
+		const { state, lastUsedAt } = patch;
+		const updated: SandboxBinding = {
+			...binding,
+			...(state !== undefined && { state }),
+			...(lastUsedAt !== undefined && { lastUsedAt }),
+		};
+		this.#bindings.set(sessionId, updated);
+		return structuredClone(updated);
+	}
+
+	async nextEpoch(sessionId: string): Promise<number> {
+		const binding = this.#requireBinding(sessionId);
+		const epoch = binding.epoch + 1;
+		this.#bindings.set(sessionId, { ...binding, epoch });
+		return epoch;
 	}
 
 	async deleteBinding(sessionId: string): Promise<void> {
@@ -141,5 +171,11 @@ export class MemoryAppStore implements AppStore {
 		const session = this.#sessions.get(id);
 		if (!session) throw new TetherError("not_found", `session ${id} not found`);
 		return session;
+	}
+
+	#requireBinding(sessionId: string): SandboxBinding {
+		const binding = this.#bindings.get(sessionId);
+		if (!binding) throw new TetherError("not_found", `sandbox binding for ${sessionId} not found`);
+		return binding;
 	}
 }
