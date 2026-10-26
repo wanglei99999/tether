@@ -1,17 +1,22 @@
 import type { ExecResult } from "../env.ts";
 import { TetherError } from "../errors.ts";
-import type { SandboxBinding } from "../model.ts";
+import { KeyedLock } from "../lock.ts";
+import type { BindingPatch, SandboxBinding, SandboxState } from "../model.ts";
+import type { SandboxNote } from "../notes.ts";
 import type { AppStore, Clock, ExecChannel, SandboxProvider } from "../ports.ts";
+import { nextState, type SandboxEvent } from "../sandbox-lifecycle.ts";
+import type { Log } from "../startup.ts";
 
-export type SandboxRecord = (sessionId: string, data: { state: SandboxBinding["state"]; reason?: string }) => Promise<void>;
+export type SandboxRecord = (sessionId: string, note: SandboxNote) => Promise<void>;
 
 export interface SandboxServiceDeps {
 	store: AppStore;
 	provider: SandboxProvider;
 	exec: ExecChannel;
 	clock: Clock;
-	/** 写一条 tether.sandbox 条目进会话记录（设计文档 §4.4），由组装层接到引擎的 appendEntry。 */
+	/** 写一条条目进会话记录（设计文档 §4.4），由组装层接到引擎的 appendEntry。 */
 	record: SandboxRecord;
+	log: Log;
 	/** 每条 setup 命令的上限。不设上限的话，一条不退出的命令（连不上的 git clone）会让会话一直等下去。 */
 	setupTimeoutMs?: number;
 }
@@ -36,22 +41,18 @@ function setupFailure(command: string, result: ExecResult): TetherError {
 	);
 }
 
-/** 会话的沙箱：第一次需要时创建并执行 setup，之后复用；停止了就启动。 */
+/** 会话的沙箱：第一次需要时创建并执行 setup，之后复用；停止了就启动。状态转换见 sandbox-lifecycle.ts。 */
 export class SandboxService {
 	readonly #deps: SandboxServiceDeps;
-	/** 单飞：同一个会话同时只有一次 ensure 在进行，并发调用拿到同一个结果。 */
-	readonly #inflight = new Map<string, Promise<SandboxBinding>>();
+	/** 同一个会话的沙箱操作排队执行：工具调用、巡检、重建、归档不会交错。 */
+	readonly #lock = new KeyedLock();
 
 	constructor(deps: SandboxServiceDeps) {
 		this.#deps = deps;
 	}
 
 	ensureSandbox(sessionId: string): Promise<SandboxBinding> {
-		const pending = this.#inflight.get(sessionId);
-		if (pending) return pending;
-		const started = this.#ensure(sessionId).finally(() => this.#inflight.delete(sessionId));
-		this.#inflight.set(sessionId, started);
-		return started;
+		return this.#lock.run(sessionId, () => this.#ensure(sessionId));
 	}
 
 	status(sessionId: string): Promise<SandboxBinding | undefined> {
@@ -60,32 +61,30 @@ export class SandboxService {
 
 	async #ensure(sessionId: string): Promise<SandboxBinding> {
 		const binding = await this.#deps.store.getBinding(sessionId);
-		// 每次工具调用都走这里，运行中的直接用；容器在运行中丢失由执行通道的报错暴露（M2 做巡检）。
+		// 每次工具调用都走这里，运行中的直接用；容器在运行中丢失由执行通道的报错暴露（Task 5 做巡检）。
 		if (binding?.state === "running") return binding;
 		if (binding?.state === "stopped") return this.#start(binding);
-		// 其余状态的旧绑定作废，重新创建（Task 6 换成按状态表重建并写说明）
+		// 其余状态先按状态表检查能不能重建，再作废旧绑定（Task 6 换成正式重建并写说明）
+		nextState(binding?.state, "create");
 		if (binding) await this.#deps.store.deleteBinding(sessionId);
 		return this.#create(sessionId);
 	}
 
 	async #start(binding: SandboxBinding): Promise<SandboxBinding> {
-		const { provider, store, record } = this.#deps;
+		const { provider } = this.#deps;
 		if ((await provider.status(binding.sandboxId)) === "missing") {
-			await store.updateBinding(binding.sessionId, { state: "lost" });
-			await record(binding.sessionId, { state: "lost", reason: "missing" });
+			await this.#transition(binding, "vanish");
+			await this.#note(binding.sessionId, { state: "lost", reason: "missing" });
 			throw new TetherError("sandbox_failed", `sandbox ${binding.sandboxId} of session ${binding.sessionId} is gone`);
 		}
 		await provider.start(binding.sandboxId);
-		const running = await store.updateBinding(binding.sessionId, {
-			state: "running",
-			lastUsedAt: this.#deps.clock.now(),
-		});
-		await record(binding.sessionId, { state: "running", reason: "started" });
+		const running = await this.#transition(binding, "start", { lastUsedAt: this.#deps.clock.now() });
+		await this.#note(binding.sessionId, { state: "running", reason: "started" });
 		return running;
 	}
 
 	async #create(sessionId: string): Promise<SandboxBinding> {
-		const { store, provider, exec, clock, record } = this.#deps;
+		const { store, provider, clock } = this.#deps;
 		const session = await store.getSession(sessionId);
 		if (!session) throw new TetherError("not_found", `session ${sessionId} not found`);
 		const version = await store.getVersion(session.agentId, session.agentVersion);
@@ -108,27 +107,79 @@ export class SandboxService {
 		};
 		await store.createBinding(creating);
 
-		const timeoutMs = this.#deps.setupTimeoutMs ?? DEFAULT_SETUP_TIMEOUT_MS;
 		try {
-			const env = exec.env(creating, { cwd: WORKSPACE });
-			for (const command of spec.setup) {
-				// 变量只经环境变量传入，命令原样执行（设计文档 §5.1）
-				const result = await env.exec(command, { env: session.variables, timeoutMs }).catch((error: unknown) => {
-					const reason = error instanceof Error ? error.message : String(error);
-					throw new TetherError("sandbox_failed", `sandbox setup failed: \`${command}\`: ${reason}`, { command });
-				});
-				if (result.exitCode !== 0) throw setupFailure(command, result);
-			}
+			await this.#runSetup(creating, spec.setup, session.variables);
 		} catch (error) {
-			exec.close(sandboxId);
-			await provider.destroy(sandboxId);
-			await store.deleteBinding(sessionId);
-			await record(sessionId, { state: "destroyed", reason: "setup failed" });
+			await this.#cleanUpFailedSetup(creating);
 			throw error;
 		}
 
-		const running = await store.updateBinding(sessionId, { state: "running" });
-		await record(sessionId, { state: "running", reason: "created" });
+		const running = await this.#transition(creating, "setup_done");
+		await this.#note(sessionId, { state: "running", reason: "created" });
 		return running;
 	}
+
+	async #runSetup(binding: SandboxBinding, setup: readonly string[], variables: Record<string, string>): Promise<void> {
+		const timeoutMs = this.#deps.setupTimeoutMs ?? DEFAULT_SETUP_TIMEOUT_MS;
+		const env = this.#deps.exec.env(binding, { cwd: WORKSPACE });
+		for (const command of setup) {
+			// 变量只经环境变量传入，命令原样执行（设计文档 §5.1）
+			const result = await env.exec(command, { env: variables, timeoutMs }).catch((error: unknown) => {
+				const reason = error instanceof Error ? error.message : String(error);
+				throw new TetherError("sandbox_failed", `sandbox setup failed: \`${command}\`: ${reason}`, { command });
+			});
+			if (result.exitCode !== 0) throw setupFailure(command, result);
+		}
+	}
+
+	/**
+	 * setup 失败后的清理。每一步失败只记日志，调用方随后抛出原始的 setup 错误。
+	 * 容器删掉了就删绑定（setup_failed）；没删掉就把绑定标成 lost（abandon），下次重建时再清。
+	 */
+	async #cleanUpFailedSetup(binding: SandboxBinding): Promise<void> {
+		const { exec, provider, store, log } = this.#deps;
+		const { sessionId, sandboxId } = binding;
+		try {
+			exec.close(sandboxId);
+		} catch (error) {
+			log.warn(`closing the connection to sandbox ${sandboxId} failed after setup failed`, error);
+		}
+		let destroyed = true;
+		try {
+			await provider.destroy(sandboxId);
+		} catch (error) {
+			destroyed = false;
+			log.warn(`destroy of sandbox ${sandboxId} failed after setup failed; binding marked lost`, error);
+		}
+		try {
+			if (destroyed) {
+				nextState(binding.state, "setup_failed");
+				await store.deleteBinding(sessionId);
+				await this.#note(sessionId, { state: "destroyed", reason: "setup failed" });
+			} else {
+				await this.#transition(binding, "abandon");
+				await this.#note(sessionId, { state: "lost", reason: "cleanup failed" });
+			}
+		} catch (error) {
+			log.warn(`recording the failed setup of sandbox ${sandboxId} failed`, error);
+		}
+	}
+
+	/** 唯一改状态的地方：按状态表算出新状态，并要求存储里的当前状态仍是 binding.state。 */
+	async #transition(
+		binding: SandboxBinding,
+		event: SandboxEvent,
+		patch: Omit<BindingPatch, "state"> = {},
+	): Promise<SandboxBinding> {
+		const state = nextState(binding.state, event);
+		if (state === undefined) {
+			throw new TetherError("internal", `${event} removes the binding; delete it instead of updating`);
+		}
+		return this.#deps.store.updateBinding(binding.sessionId, { ...patch, state }, { state: binding.state });
+	}
+
+	#note(sessionId: string, data: { state: SandboxState; reason: string }): Promise<void> {
+		return this.#deps.record(sessionId, { kind: "tether.sandbox", data });
+	}
 }
+

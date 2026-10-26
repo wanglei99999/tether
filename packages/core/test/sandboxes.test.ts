@@ -1,12 +1,32 @@
 import { MemoryAppStore, sampleAgent, sampleSession, sampleSpec } from "@tether/testkit";
 import { describe, expect, it } from "vitest";
-import { type SandboxBinding, SandboxService } from "../src/index.ts";
+import {
+	type BindingPatch,
+	type ExpectedState,
+	type SandboxBinding,
+	type SandboxNote,
+	SandboxService,
+} from "../src/index.ts";
 import { FakeClock, FakeExecChannel, FakeProvider } from "./fakes.ts";
 
-type Recorded = { sessionId: string; state: SandboxBinding["state"]; reason?: string };
+type Recorded = { sessionId: string; kind: SandboxNote["kind"]; state: SandboxBinding["state"]; reason?: string };
+
+/** 记下每次 updateBinding 带没带期望状态。 */
+class SpyStore extends MemoryAppStore {
+	readonly updates: { patch: BindingPatch; expected?: ExpectedState }[] = [];
+
+	override async updateBinding(
+		sessionId: string,
+		patch: BindingPatch,
+		expected?: ExpectedState,
+	): Promise<SandboxBinding> {
+		this.updates.push({ patch, ...(expected !== undefined && { expected }) });
+		return super.updateBinding(sessionId, patch, expected);
+	}
+}
 
 async function setUp(setup: string[] = [], variables: Record<string, string> = {}, setupTimeoutMs?: number) {
-	const store = new MemoryAppStore();
+	const store = new SpyStore();
 	const spec = sampleSpec();
 	spec.sandbox.setup = setup;
 	const { agent } = sampleAgent();
@@ -15,17 +35,19 @@ async function setUp(setup: string[] = [], variables: Record<string, string> = {
 	const provider = new FakeProvider();
 	const exec = new FakeExecChannel();
 	const recorded: Recorded[] = [];
+	const warnings: string[] = [];
 	const sandboxes = new SandboxService({
 		store,
 		provider,
 		exec,
 		clock: new FakeClock(),
-		record: async (sessionId, data) => {
-			recorded.push({ sessionId, ...data });
+		record: async (sessionId, note) => {
+			recorded.push({ sessionId, kind: note.kind, ...(note.data as { state: SandboxBinding["state"]; reason?: string }) });
 		},
+		log: { warn: (message) => warnings.push(message) },
 		...(setupTimeoutMs !== undefined && { setupTimeoutMs }),
 	});
-	return { store, provider, exec, recorded, sandboxes };
+	return { store, provider, exec, recorded, warnings, sandboxes };
 }
 
 describe("SandboxService.ensureSandbox", () => {
@@ -64,7 +86,7 @@ describe("SandboxService.ensureSandbox", () => {
 		expect(await store.getBinding("ses_1")).toBeUndefined();
 	});
 
-	it("creates only one sandbox for concurrent ensureSandbox calls on a new session", async () => {
+	it("serializes concurrent ensureSandbox calls for one session into one create", async () => {
 		const { provider, exec, sandboxes } = await setUp(["true"]);
 		provider.createDelayMs = 20;
 
@@ -117,6 +139,34 @@ describe("SandboxService.ensureSandbox", () => {
 		expect(provider.containers.size).toBe(0);
 		expect(exec.closed).toHaveLength(1);
 		expect(await store.getBinding("ses_1")).toBeUndefined();
+	});
+
+	it("keeps the setup error when cleanup also fails and marks the binding lost", async () => {
+		const { store, provider, exec, recorded, warnings, sandboxes } = await setUp(["make build"]);
+		exec.results.set("make build", { exitCode: 2, stdout: "", stderr: "error: missing header\n" });
+		provider.failDestroy = true;
+
+		const error = await sandboxes.ensureSandbox("ses_1").catch((e: unknown) => e);
+
+		expect(error).toMatchObject({ code: "sandbox_failed" });
+		expect((error as Error).message).toContain("make build");
+		expect((await store.getBinding("ses_1"))?.state).toBe("lost");
+		expect(recorded.at(-1)).toMatchObject({ kind: "tether.sandbox", state: "lost", reason: "cleanup failed" });
+		expect(warnings.some((w) => w.includes("destroy"))).toBe(true);
+	});
+
+	it("writes every state change with the expected current state", async () => {
+		const { store, provider, sandboxes } = await setUp(["true"]);
+		const first = await sandboxes.ensureSandbox("ses_1");
+		await provider.stop(first.sandboxId);
+		await store.updateBinding("ses_1", { state: "stopped" }, { state: "running" });
+		await sandboxes.ensureSandbox("ses_1");
+		provider.containers.clear();
+		await store.updateBinding("ses_1", { state: "stopped" }, { state: "running" });
+		await sandboxes.ensureSandbox("ses_1").catch(() => {});
+
+		expect(store.updates.length).toBeGreaterThanOrEqual(5);
+		expect(store.updates.filter((u) => u.expected === undefined)).toEqual([]);
 	});
 
 	it("keeps only the last 4 KB of long setup output", async () => {

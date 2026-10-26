@@ -47,6 +47,7 @@ async function sessionWith(setup: string[], variables: Record<string, string>, s
 		exec,
 		clock: { now: () => new Date().toISOString() },
 		record: async () => {},
+		log: { warn: () => {} },
 		...(setupTimeoutMs !== undefined && { setupTimeoutMs }),
 	});
 	return { store, sandboxes, sessionId, workspace: join(workspaceRoot, sessionId) };

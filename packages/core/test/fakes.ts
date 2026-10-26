@@ -72,6 +72,8 @@ export class FakeProvider implements SandboxProvider {
 	readonly calls: string[] = [];
 	/** create 完成前等待的毫秒数，用来让并发调用真正交错。 */
 	createDelayMs = 0;
+	/** 为 true 时 destroy 抛错，模拟清理失败。 */
+	failDestroy = false;
 	#created = 0;
 
 	async create({ sessionId }: SandboxCreate) {
@@ -98,6 +100,7 @@ export class FakeProvider implements SandboxProvider {
 	}
 	async destroy(sandboxId: string) {
 		this.calls.push("destroy");
+		if (this.failDestroy) throw new TetherError("sandbox_failed", `cannot remove ${sandboxId}`);
 		this.containers.delete(sandboxId);
 	}
 	async listManaged() {

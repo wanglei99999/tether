@@ -86,10 +86,15 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 		exec,
 		clock: systemClock,
 		setupTimeoutMs: config.setupTimeoutMs,
-		record: async (sessionId, data) => {
+		log,
+		record: async (sessionId, { kind, data, modelText }) => {
 			const session = await store.getSession(sessionId);
 			if (engine && session?.engineSessionId) {
-				await engine.appendEntry(session.engineSessionId, { kind: "tether.sandbox", data });
+				await engine.appendEntry(session.engineSessionId, {
+					kind,
+					data,
+					...(modelText !== undefined && { modelText }),
+				});
 			}
 		},
 	});
