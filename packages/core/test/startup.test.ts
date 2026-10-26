@@ -94,8 +94,8 @@ describe("recover", () => {
 		const { store, provider, run } = await setUp();
 		const { sandboxId } = await provider.create({ sessionId: "ses_kept", spec: sampleSpec().sandbox });
 		await provider.stop(sandboxId);
-		await store.putBinding(sampleBinding("ses_kept", { sandboxId, state: "running" }));
-		await store.putBinding(sampleBinding("ses_gone", { sandboxId: "sbx_gone", state: "running" }));
+		await store.createBinding(sampleBinding("ses_kept", { sandboxId, state: "running" }));
+		await store.createBinding(sampleBinding("ses_gone", { sandboxId: "sbx_gone", state: "running" }));
 
 		const result = await run();
 
@@ -109,7 +109,7 @@ describe("recover", () => {
 		const { store, provider, run } = await setUp();
 		const bound = await provider.create({ sessionId: "ses_bound", spec: sampleSpec().sandbox });
 		const orphan = await provider.create({ sessionId: "ses_orphan", spec: sampleSpec().sandbox });
-		await store.putBinding(sampleBinding("ses_bound", { sandboxId: bound.sandboxId }));
+		await store.createBinding(sampleBinding("ses_bound", { sandboxId: bound.sandboxId }));
 
 		const result = await run();
 
@@ -121,7 +121,7 @@ describe("recover", () => {
 	it("destroys sandboxes left in creating and drops their bindings", async () => {
 		const { store, provider, run } = await setUp();
 		const { sandboxId } = await provider.create({ sessionId: "ses_half", spec: sampleSpec().sandbox });
-		await store.putBinding(sampleBinding("ses_half", { sandboxId, state: "creating" }));
+		await store.createBinding(sampleBinding("ses_half", { sandboxId, state: "creating" }));
 
 		await run();
 

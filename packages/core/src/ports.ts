@@ -4,6 +4,8 @@ import type {
 	AgentRecord,
 	AgentVersionRecord,
 	AgentVersionSpec,
+	BindingPatch,
+	ExpectedState,
 	ModelRef,
 	SandboxBinding,
 	SandboxSpec,
@@ -36,7 +38,19 @@ export interface AppStore {
 	updateSession(id: string, patch: Partial<Pick<SessionRecord, "status" | "title" | "lastActiveAt">>): Promise<void>;
 
 	getBinding(sessionId: string): Promise<SandboxBinding | undefined>;
-	putBinding(binding: SandboxBinding): Promise<void>;
+	/** 已存在时报 conflict。 */
+	createBinding(binding: SandboxBinding): Promise<void>;
+	/**
+	 * 只改状态和最后使用时间；epoch 只能经 nextEpoch 改变。
+	 * 给了 expected 时，当前状态不在其中就报 conflict，不写入。返回写入后的绑定。
+	 */
+	updateBinding(
+		sessionId: string,
+		patch: BindingPatch,
+		expected?: ExpectedState,
+	): Promise<SandboxBinding>;
+	/** epoch 原子地加一，返回新值。 */
+	nextEpoch(sessionId: string): Promise<number>;
 	deleteBinding(sessionId: string): Promise<void>;
 	listBindings(): Promise<SandboxBinding[]>;
 }

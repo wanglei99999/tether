@@ -35,7 +35,7 @@ describe("SandboxService.ensureSandbox", () => {
 
 		const binding = await sandboxes.ensureSandbox("ses_1");
 
-		expect(binding).toMatchObject({ sessionId: "ses_1", provider: "docker", epoch: 1, state: "running", template: "" });
+		expect(binding).toMatchObject({ sessionId: "ses_1", provider: "docker", epoch: 0, state: "running", template: "" });
 		expect(provider.calls).toEqual(["create"]);
 		expect(exec.calls).toEqual([
 			{ sandboxId: binding.sandboxId, cwd: "/workspace", command: 'git clone "$REPO_URL" .', env: variables, timeoutMs: 600_000 },
@@ -90,7 +90,7 @@ describe("SandboxService.ensureSandbox", () => {
 		const { store, provider, exec, sandboxes } = await setUp(["true"]);
 		const first = await sandboxes.ensureSandbox("ses_1");
 		await provider.stop(first.sandboxId);
-		await store.putBinding({ ...first, state: "stopped" });
+		await store.updateBinding(first.sessionId, { state: "stopped" });
 		provider.calls.length = 0;
 
 		const started = await sandboxes.ensureSandbox("ses_1");
@@ -145,7 +145,7 @@ describe("SandboxService.ensureSandbox", () => {
 	it("marks the binding lost and throws sandbox_failed when the provider reports it missing", async () => {
 		const { store, provider, sandboxes } = await setUp();
 		const first = await sandboxes.ensureSandbox("ses_1");
-		await store.putBinding({ ...first, state: "stopped" });
+		await store.updateBinding(first.sessionId, { state: "stopped" });
 		provider.containers.clear();
 
 		await expect(sandboxes.ensureSandbox("ses_1")).rejects.toMatchObject({ code: "sandbox_failed" });
@@ -157,10 +157,10 @@ describe("SandboxService.ensureSandbox", () => {
 		const { store, provider, exec, recorded, sandboxes } = await setUp(["step"]);
 		const first = await sandboxes.ensureSandbox("ses_1");
 		await provider.stop(first.sandboxId);
-		await store.putBinding({ ...first, state: "stopped" });
+		await store.updateBinding(first.sessionId, { state: "stopped" });
 		await sandboxes.ensureSandbox("ses_1");
 		provider.containers.clear();
-		await store.putBinding({ ...first, state: "stopped" });
+		await store.updateBinding(first.sessionId, { state: "stopped" });
 		await sandboxes.ensureSandbox("ses_1").catch(() => {});
 		exec.results.set("step", { exitCode: 1, stdout: "", stderr: "" });
 		await sandboxes.ensureSandbox("ses_1").catch(() => {});

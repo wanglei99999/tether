@@ -74,13 +74,13 @@ async function reconcileSandboxes({
 		}
 		const status = await provider.status(binding.sandboxId);
 		if (status === "missing") {
-			await store.putBinding({ ...binding, state: "lost" });
+			await store.updateBinding(binding.sessionId, { state: "lost" });
 			lostBindings++;
 			log.warn(`sandbox ${binding.sandboxId} of session ${binding.sessionId} is gone; binding marked lost`);
 			continue;
 		}
 		kept.add(binding.sandboxId);
-		if (status !== binding.state) await store.putBinding({ ...binding, state: status });
+		if (status !== binding.state) await store.updateBinding(binding.sessionId, { state: status });
 	}
 
 	for (const { sandboxId, sessionId } of await provider.listManaged()) {

@@ -18,8 +18,6 @@ export interface SandboxServiceDeps {
 
 export const WORKSPACE = "/workspace";
 export const DEFAULT_SETUP_TIMEOUT_MS = 10 * 60 * 1000;
-/** M1 不做重连隔离，epoch 固定为 1（M2 实现 ADR-007）。 */
-const EPOCH = 1;
 /** setup 失败时错误消息里保留的输出长度。 */
 const OUTPUT_TAIL_BYTES = 4096;
 
@@ -65,19 +63,23 @@ export class SandboxService {
 		// 每次工具调用都走这里，运行中的直接用；容器在运行中丢失由执行通道的报错暴露（M2 做巡检）。
 		if (binding?.state === "running") return binding;
 		if (binding?.state === "stopped") return this.#start(binding);
+		// 其余状态的旧绑定作废，重新创建（Task 6 换成按状态表重建并写说明）
+		if (binding) await this.#deps.store.deleteBinding(sessionId);
 		return this.#create(sessionId);
 	}
 
 	async #start(binding: SandboxBinding): Promise<SandboxBinding> {
 		const { provider, store, record } = this.#deps;
 		if ((await provider.status(binding.sandboxId)) === "missing") {
-			await store.putBinding({ ...binding, state: "lost" });
+			await store.updateBinding(binding.sessionId, { state: "lost" });
 			await record(binding.sessionId, { state: "lost", reason: "missing" });
 			throw new TetherError("sandbox_failed", `sandbox ${binding.sandboxId} of session ${binding.sessionId} is gone`);
 		}
 		await provider.start(binding.sandboxId);
-		const running: SandboxBinding = { ...binding, state: "running", lastUsedAt: this.#deps.clock.now() };
-		await store.putBinding(running);
+		const running = await store.updateBinding(binding.sessionId, {
+			state: "running",
+			lastUsedAt: this.#deps.clock.now(),
+		});
 		await record(binding.sessionId, { state: "running", reason: "started" });
 		return running;
 	}
@@ -98,13 +100,13 @@ export class SandboxService {
 			sessionId,
 			provider: provider.name,
 			sandboxId,
-			epoch: EPOCH,
+			epoch: 0,
 			state: "creating",
 			template: spec.template,
 			createdAt: at,
 			lastUsedAt: at,
 		};
-		await store.putBinding(creating);
+		await store.createBinding(creating);
 
 		const timeoutMs = this.#deps.setupTimeoutMs ?? DEFAULT_SETUP_TIMEOUT_MS;
 		try {
@@ -125,8 +127,7 @@ export class SandboxService {
 			throw error;
 		}
 
-		const running: SandboxBinding = { ...creating, state: "running" };
-		await store.putBinding(running);
+		const running = await store.updateBinding(sessionId, { state: "running" });
 		await record(sessionId, { state: "running", reason: "created" });
 		return running;
 	}

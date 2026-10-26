@@ -68,7 +68,7 @@ export function sampleBinding(sessionId: string, overrides: Partial<SandboxBindi
 		sessionId,
 		provider: "docker",
 		sandboxId: `sbx_${sessionId}`,
-		epoch: 1,
+		epoch: 0,
 		state: "running",
 		template: "",
 		createdAt: T0,
@@ -205,20 +205,72 @@ export function registerAppStoreConformance(
 			);
 		});
 
-		it("replaces a binding on put and removes it on delete", async () => {
-			await store.putBinding(sampleBinding("ses_1"));
-			await store.putBinding(sampleBinding("ses_2"));
-			const replaced = sampleBinding("ses_1", { state: "stopped", lastUsedAt: "2026-10-25T06:00:00.000Z" });
-			await store.putBinding(replaced);
+		it("creates a binding once and rejects a second create with conflict", async () => {
+			await store.createBinding(sampleBinding("ses_1"));
 
-			expect(await store.getBinding("ses_1")).toEqual(replaced);
-			expect(await store.listBindings()).toHaveLength(2);
+			await expect(store.createBinding(sampleBinding("ses_1", { state: "stopped" }))).rejects.toMatchObject({
+				code: "conflict",
+			});
+			expect(await store.getBinding("ses_1")).toEqual(sampleBinding("ses_1"));
+		});
+
+		it("updates state and lastUsedAt without touching the epoch", async () => {
+			await store.createBinding(sampleBinding("ses_1"));
+			await store.nextEpoch("ses_1");
+			await store.nextEpoch("ses_1");
+
+			const updated = await store.updateBinding("ses_1", {
+				state: "stopped",
+				lastUsedAt: "2026-10-25T06:00:00.000Z",
+			});
+
+			const expected = sampleBinding("ses_1", { epoch: 2, state: "stopped", lastUsedAt: "2026-10-25T06:00:00.000Z" });
+			expect(updated).toEqual(expected);
+			expect(await store.getBinding("ses_1")).toEqual(expected);
+		});
+
+		it("rejects an update whose expected state does not match, leaving the binding unchanged", async () => {
+			await store.createBinding(sampleBinding("ses_1", { state: "stopped" }));
+
+			await expect(
+				store.updateBinding("ses_1", { state: "running" }, { state: "creating" }),
+			).rejects.toMatchObject({ code: "conflict" });
+			expect(await store.getBinding("ses_1")).toEqual(sampleBinding("ses_1", { state: "stopped" }));
+		});
+
+		it("accepts an update when the current state is one of several expected states", async () => {
+			await store.createBinding(sampleBinding("ses_1", { state: "stopped" }));
+
+			const updated = await store.updateBinding("ses_1", { state: "lost" }, { state: ["running", "stopped"] });
+
+			expect(updated.state).toBe("lost");
+		});
+
+		it("increments the epoch atomically", async () => {
+			await store.createBinding(sampleBinding("ses_1", { epoch: 0 }));
+
+			const epochs = await Promise.all(Array.from({ length: 10 }, () => store.nextEpoch("ses_1")));
+
+			expect([...epochs].sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+			expect((await store.getBinding("ses_1"))?.epoch).toBe(10);
+		});
+
+		it("removes a binding on delete", async () => {
+			await store.createBinding(sampleBinding("ses_1"));
+			await store.createBinding(sampleBinding("ses_2"));
 
 			await store.deleteBinding("ses_1");
 			await store.deleteBinding("ses_missing");
 
 			expect(await store.getBinding("ses_1")).toBeUndefined();
 			expect((await store.listBindings()).map((b) => b.sessionId)).toEqual(["ses_2"]);
+		});
+
+		it("rejects update and nextEpoch of a missing binding with not_found", async () => {
+			await expect(store.updateBinding("ses_missing", { state: "stopped" })).rejects.toMatchObject({
+				code: "not_found",
+			});
+			await expect(store.nextEpoch("ses_missing")).rejects.toMatchObject({ code: "not_found" });
 		});
 
 		it("round-trips variables with shell metacharacters", async () => {

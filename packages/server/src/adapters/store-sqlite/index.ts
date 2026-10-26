@@ -1,10 +1,13 @@
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import {
+	assertBindingState,
 	TetherError,
 	type AgentRecord,
 	type AgentVersionRecord,
 	type AgentVersionSpec,
 	type AppStore,
+	type BindingPatch,
+	type ExpectedState,
 	type SandboxBinding,
 	type SessionRecord,
 } from "@tether/core";
@@ -288,20 +291,59 @@ class SqliteAppStore implements AppStore {
 		return row && toBinding(row);
 	}
 
-	async putBinding(binding: SandboxBinding): Promise<void> {
-		this.#run(
-			`INSERT OR REPLACE INTO sandbox_bindings
-			   (session_id, provider, sandbox_id, epoch, state, template, created_at, last_used_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			binding.sessionId,
-			binding.provider,
-			binding.sandboxId,
-			binding.epoch,
-			binding.state,
-			binding.template,
-			binding.createdAt,
-			binding.lastUsedAt,
+	async createBinding(binding: SandboxBinding): Promise<void> {
+		try {
+			this.#run(
+				`INSERT INTO sandbox_bindings
+				   (session_id, provider, sandbox_id, epoch, state, template, created_at, last_used_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				binding.sessionId,
+				binding.provider,
+				binding.sandboxId,
+				binding.epoch,
+				binding.state,
+				binding.template,
+				binding.createdAt,
+				binding.lastUsedAt,
+			);
+		} catch (error) {
+			if (isConstraintError(error)) {
+				throw new TetherError("conflict", `sandbox binding for ${binding.sessionId} already exists`);
+			}
+			throw error;
+		}
+	}
+
+	async updateBinding(sessionId: string, patch: BindingPatch, expected?: ExpectedState): Promise<SandboxBinding> {
+		return this.#transaction(() => {
+			const current = this.#requireBinding(sessionId);
+			assertBindingState(current, expected);
+			this.#run(
+				`UPDATE sandbox_bindings SET
+				   state = COALESCE(?, state),
+				   last_used_at = COALESCE(?, last_used_at)
+				 WHERE session_id = ?`,
+				patch.state ?? null,
+				patch.lastUsedAt ?? null,
+				sessionId,
+			);
+			return this.#requireBinding(sessionId);
+		});
+	}
+
+	async nextEpoch(sessionId: string): Promise<number> {
+		const row = this.#get(
+			"UPDATE sandbox_bindings SET epoch = epoch + 1 WHERE session_id = ? RETURNING epoch",
+			sessionId,
 		);
+		if (!row) throw new TetherError("not_found", `sandbox binding for ${sessionId} not found`);
+		return Number(row.epoch);
+	}
+
+	#requireBinding(sessionId: string): SandboxBinding {
+		const row = this.#get("SELECT * FROM sandbox_bindings WHERE session_id = ?", sessionId);
+		if (!row) throw new TetherError("not_found", `sandbox binding for ${sessionId} not found`);
+		return toBinding(row);
 	}
 
 	async deleteBinding(sessionId: string): Promise<void> {
