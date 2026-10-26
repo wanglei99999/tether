@@ -218,34 +218,26 @@ describe("SandboxService.ensureSandbox", () => {
 		expect(await store.getBinding("ses_1")).toEqual(binding);
 	});
 
-	it("marks the binding lost and throws sandbox_failed when the provider reports it missing", async () => {
-		const { store, provider, sandboxes } = await setUp();
-		const first = await sandboxes.ensureSandbox("ses_1");
-		await store.updateBinding(first.sessionId, { state: "stopped" });
-		provider.containers.clear();
-
-		await expect(sandboxes.ensureSandbox("ses_1")).rejects.toMatchObject({ code: "sandbox_failed" });
-
-		expect((await store.getBinding("ses_1"))?.state).toBe("lost");
-	});
-
-	it("records a tether.sandbox entry on create, start, setup failure and loss", async () => {
+	it("records a tether.sandbox entry on create, start, loss, failed rebuild and rebuild", async () => {
 		const { store, provider, exec, recorded, sandboxes } = await setUp(["step"]);
 		const first = await sandboxes.ensureSandbox("ses_1");
 		await provider.stop(first.sandboxId);
 		await store.updateBinding(first.sessionId, { state: "stopped" });
 		await sandboxes.ensureSandbox("ses_1");
-		provider.containers.clear();
+		await provider.stop(first.sandboxId);
 		await store.updateBinding(first.sessionId, { state: "stopped" });
-		await sandboxes.ensureSandbox("ses_1").catch(() => {});
+		provider.containers.clear();
 		exec.results.set("step", { exitCode: 1, stdout: "", stderr: "" });
 		await sandboxes.ensureSandbox("ses_1").catch(() => {});
+		exec.results.delete("step");
+		await sandboxes.ensureSandbox("ses_1");
 
 		expect(recorded.map(({ sessionId, state, reason }) => [sessionId, state, reason])).toEqual([
 			["ses_1", "running", "created"],
 			["ses_1", "running", "started"],
 			["ses_1", "lost", "missing"],
-			["ses_1", "destroyed", "setup failed"],
+			["ses_1", "lost", "setup failed"],
+			["ses_1", "running", "recovered"],
 		]);
 	});
 
@@ -324,7 +316,8 @@ describe("SandboxService admission", () => {
 
 		await expect(sandboxes.ensureSandbox("ses_1")).rejects.toMatchObject({ code: "sandbox_limit" });
 
-		expect(provider.calls).toEqual([]);
+		// 准入之前会先查一次容器还在不在（不在就要重建），但不会启动
+		expect(provider.calls).toEqual(["status"]);
 		expect((await store.getBinding("ses_1"))?.state).toBe("stopped");
 	});
 
@@ -333,6 +326,90 @@ describe("SandboxService admission", () => {
 		for (const id of ["ses_1", "ses_2", "ses_3", "ses_4"]) await sandboxes.ensureSandbox(id);
 
 		await expect(sandboxes.ensureSandbox("ses_5")).rejects.toMatchObject({ code: "sandbox_limit" });
+	});
+});
+
+describe("SandboxService rebuild", () => {
+	it("rebuilds a lost sandbox from the template, reruns setup and writes the reset note", async () => {
+		const { store, provider, exec, notes, sandboxes } = await setUp(["prep"]);
+		const first = await sandboxes.ensureSandbox("ses_1");
+		await sandboxes.connect("ses_1");
+		provider.containers.clear();
+		await sandboxes.sweep();
+		expect((await store.getBinding("ses_1"))?.state).toBe("lost");
+		provider.calls.length = 0;
+		exec.calls.length = 0;
+
+		const rebuilt = await sandboxes.ensureSandbox("ses_1");
+
+		expect(rebuilt).toMatchObject({ state: "running", epoch: 0 });
+		expect(rebuilt.sandboxId).not.toBe(first.sandboxId);
+		expect(provider.calls).toEqual(["destroy", "create"]);
+		expect(exec.closed).toContain(first.sandboxId);
+		expect(exec.calls.map((c) => c.command)).toEqual(["prep"]);
+		expect(notes.at(-1)).toEqual({
+			kind: "tether.sandbox",
+			data: { state: "running", reason: "recovered" },
+			modelText: NOTES.reset("missing"),
+		});
+	});
+
+	it("rebuilds a stopped sandbox whose container is gone on the next tool call", async () => {
+		const { store, provider, notes, sandboxes } = await setUp();
+		const first = await sandboxes.ensureSandbox("ses_1");
+		await provider.stop(first.sandboxId);
+		await store.updateBinding("ses_1", { state: "stopped" }, { state: "running" });
+		provider.containers.clear();
+
+		const rebuilt = await sandboxes.ensureSandbox("ses_1");
+
+		expect(rebuilt.state).toBe("running");
+		expect(provider.containers.has(rebuilt.sandboxId)).toBe(true);
+		expect(notes.at(-1)).toMatchObject({ data: { reason: "recovered" }, modelText: NOTES.reset("missing") });
+	});
+
+	it("names a failed cleanup as the reason in the reset note", async () => {
+		const { exec, provider, notes, sandboxes } = await setUp(["make"]);
+		exec.results.set("make", { exitCode: 2, stdout: "", stderr: "" });
+		provider.failDestroy = true;
+		await sandboxes.ensureSandbox("ses_1").catch(() => {});
+		exec.results.delete("make");
+		provider.failDestroy = false;
+
+		await sandboxes.ensureSandbox("ses_1");
+
+		expect(notes.at(-1)).toMatchObject({ modelText: NOTES.reset("cleanup failed") });
+	});
+
+	it("applies the sandbox limit to a rebuild", async () => {
+		const { store, provider, sandboxes } = await setUpSessions(2, { maxRunning: 1 });
+		const first = await sandboxes.ensureSandbox("ses_1");
+		provider.containers.delete(first.sandboxId);
+		await sandboxes.sweep();
+		await sandboxes.ensureSandbox("ses_2");
+		provider.calls.length = 0;
+
+		await expect(sandboxes.ensureSandbox("ses_1")).rejects.toMatchObject({ code: "sandbox_limit" });
+
+		expect(provider.calls).toEqual([]);
+		expect((await store.getBinding("ses_1"))?.state).toBe("lost");
+	});
+
+	it("leaves the binding lost when the rebuild's setup fails", async () => {
+		const { store, provider, exec, notes, sandboxes } = await setUp(["prep"]);
+		await sandboxes.ensureSandbox("ses_1");
+		provider.containers.clear();
+		await sandboxes.sweep();
+		exec.results.set("prep", { exitCode: 1, stdout: "", stderr: "no network" });
+
+		await expect(sandboxes.ensureSandbox("ses_1")).rejects.toMatchObject({ code: "sandbox_failed" });
+
+		expect((await store.getBinding("ses_1"))?.state).toBe("lost");
+		expect(provider.containers.size).toBe(0);
+		exec.results.delete("prep");
+		await sandboxes.ensureSandbox("ses_1");
+		// 还是重建：模型照样被告知原来的文件没了
+		expect(notes.at(-1)).toMatchObject({ data: { reason: "recovered" }, modelText: NOTES.reset("missing") });
 	});
 });
 

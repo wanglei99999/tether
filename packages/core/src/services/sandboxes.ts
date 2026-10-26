@@ -70,6 +70,8 @@ export class SandboxService {
 	 * 其余连接都是重连。只在内存里：服务重启后为空，重启后的第一次连接也写说明（崩溃时 daemon 退出会带走后台进程）。
 	 */
 	readonly #fresh = new Set<string>();
+	/** 绑定变成 lost 的原因，重建时写进模型可见的说明。只在内存里：服务重启后缺省为 "missing"。 */
+	readonly #lostReasons = new Map<string, string>();
 
 	constructor(deps: SandboxServiceDeps) {
 		this.#deps = deps;
@@ -142,9 +144,7 @@ export class SandboxService {
 
 		if (status === "missing") {
 			exec.close(binding.sandboxId);
-			await this.#transition(binding, "vanish");
-			// 不告诉模型：下次工具调用重建时再写模型可见的说明（Task 6）
-			await this.#note(sessionId, { state: "lost", reason: "missing" });
+			await this.#markLost(binding, "vanish", "missing");
 			return "lost";
 		}
 		if (binding.state === "stopped") return undefined;
@@ -180,27 +180,36 @@ export class SandboxService {
 	}
 
 	async #ensure(sessionId: string): Promise<SandboxBinding> {
-		const { store, clock } = this.#deps;
-		const binding = await store.getBinding(sessionId);
+		const { store, provider, clock } = this.#deps;
+		let binding = await store.getBinding(sessionId);
 		// 每次工具调用都走这里，运行中的直接用，不过准入，只刷新最后使用时间。
 		// 容器在运行中丢失由巡检或执行通道的报错发现。
 		if (binding?.state === "running") {
 			return store.updateBinding(sessionId, { lastUsedAt: clock.now() }, { state: "running" });
 		}
-		if (binding?.state === "stopped") return this.#admit(sessionId, () => this.#start(binding));
-		// 其余状态先按状态表检查能不能重建，再作废旧绑定（Task 6 换成正式重建并写说明）
+		if (binding?.state === "stopped") {
+			if ((await provider.status(binding.sandboxId)) !== "missing") {
+				const stopped = binding;
+				return this.#admit(sessionId, () => this.#start(stopped));
+			}
+			// 停着的容器不见了：和巡检发现时一样标成 lost，接着重建
+			binding = await this.#markLost(binding, "vanish", "missing");
+		}
+		// 按状态表检查能不能创建：absent 和 lost 可以，destroyed（归档）不行
 		nextState(binding?.state, "create");
-		if (binding) await this.#deps.store.deleteBinding(sessionId);
-		return this.#create(sessionId);
+		return this.#create(sessionId, binding);
+	}
+
+	/** 标成 lost 并记下原因；客户端看得到，模型等重建时再告诉（NOTES.reset）。 */
+	async #markLost(binding: SandboxBinding, event: SandboxEvent, reason: string): Promise<SandboxBinding> {
+		const lost = await this.#transition(binding, event);
+		this.#lostReasons.set(binding.sessionId, reason);
+		await this.#note(binding.sessionId, { state: "lost", reason });
+		return lost;
 	}
 
 	async #start(binding: SandboxBinding): Promise<SandboxBinding> {
 		const { provider } = this.#deps;
-		if ((await provider.status(binding.sandboxId)) === "missing") {
-			await this.#transition(binding, "vanish");
-			await this.#note(binding.sessionId, { state: "lost", reason: "missing" });
-			throw new TetherError("sandbox_failed", `sandbox ${binding.sandboxId} of session ${binding.sessionId} is gone`);
-		}
 		await provider.start(binding.sandboxId);
 		this.#fresh.add(binding.sessionId);
 		const running = await this.#transition(binding, "start", { lastUsedAt: this.#deps.clock.now() });
@@ -208,8 +217,12 @@ export class SandboxService {
 		return running;
 	}
 
-	async #create(sessionId: string): Promise<SandboxBinding> {
-		const { store, provider, clock } = this.#deps;
+	/**
+	 * 按模板创建沙箱并执行 setup。给了 lost 的旧绑定就是重建：先删掉旧容器、工作区和绑定，成功后告诉模型环境重置了。
+	 * 重建在准入通过之后才删旧的：被准入拒绝时绑定还是 lost，下次仍按重建处理。
+	 */
+	async #create(sessionId: string, lost?: SandboxBinding): Promise<SandboxBinding> {
+		const { store, provider, exec, clock } = this.#deps;
 		const session = await store.getSession(sessionId);
 		if (!session) throw new TetherError("not_found", `session ${sessionId} not found`);
 		const version = await store.getVersion(session.agentId, session.agentVersion);
@@ -220,6 +233,11 @@ export class SandboxService {
 
 		// 写下 creating 就占住了名额，setup 可能跑几分钟，在准入锁外面跑
 		const creating = await this.#admit(sessionId, async () => {
+			if (lost) {
+				exec.close(lost.sandboxId);
+				await provider.destroy(lost.sandboxId);
+				await store.deleteBinding(sessionId);
+			}
 			const { sandboxId } = await provider.create({ sessionId, spec });
 			const at = clock.now();
 			const binding: SandboxBinding = {
@@ -240,12 +258,22 @@ export class SandboxService {
 		try {
 			await this.#runSetup(creating, spec.setup, session.variables);
 		} catch (error) {
-			await this.#cleanUpFailedSetup(creating);
+			await this.#cleanUpFailedSetup(creating, lost !== undefined);
 			throw error;
 		}
 
 		const running = await this.#transition(creating, "setup_done");
-		await this.#note(sessionId, { state: "running", reason: "created" });
+		if (lost) {
+			const reason = this.#lostReasons.get(sessionId) ?? "missing";
+			this.#lostReasons.delete(sessionId);
+			await this.#deps.record(sessionId, {
+				kind: "tether.sandbox",
+				data: { state: "running", reason: "recovered" },
+				modelText: NOTES.reset(reason),
+			});
+		} else {
+			await this.#note(sessionId, { state: "running", reason: "created" });
+		}
 		return running;
 	}
 
@@ -286,9 +314,10 @@ export class SandboxService {
 
 	/**
 	 * setup 失败后的清理。每一步失败只记日志，调用方随后抛出原始的 setup 错误。
-	 * 容器删掉了就删绑定（setup_failed）；没删掉就把绑定标成 lost（abandon），下次重建时再清。
+	 * 容器删掉了就删绑定（setup_failed），下次从头创建；没删掉，或这是一次重建，就把绑定标成 lost（abandon），
+	 * 下次按重建处理：再删一次残留，并告诉模型环境重置了。
 	 */
-	async #cleanUpFailedSetup(binding: SandboxBinding): Promise<void> {
+	async #cleanUpFailedSetup(binding: SandboxBinding, rebuilding: boolean): Promise<void> {
 		const { exec, provider, store, log } = this.#deps;
 		const { sessionId, sandboxId } = binding;
 		try {
@@ -304,13 +333,16 @@ export class SandboxService {
 			log.warn(`destroy of sandbox ${sandboxId} failed after setup failed; binding marked lost`, error);
 		}
 		try {
-			if (destroyed) {
+			if (!destroyed) {
+				await this.#markLost(binding, "abandon", "cleanup failed");
+			} else if (rebuilding) {
+				// 重建失败：绑定留在 lost，原来的丢失原因不变，下次仍按重建处理并告诉模型环境重置了
+				await this.#transition(binding, "abandon");
+				await this.#note(sessionId, { state: "lost", reason: "setup failed" });
+			} else {
 				nextState(binding.state, "setup_failed");
 				await store.deleteBinding(sessionId);
 				await this.#note(sessionId, { state: "destroyed", reason: "setup failed" });
-			} else {
-				await this.#transition(binding, "abandon");
-				await this.#note(sessionId, { state: "lost", reason: "cleanup failed" });
 			}
 		} catch (error) {
 			log.warn(`recording the failed setup of sandbox ${sandboxId} failed`, error);

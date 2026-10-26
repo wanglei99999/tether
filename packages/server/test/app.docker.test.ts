@@ -151,6 +151,41 @@ describe("createTether on docker", () => {
 		await shutdown(tether);
 	});
 
+	it("rebuilds after the container is removed by hand; the old file is gone and the reset note is in the transcript", async () => {
+		const config = newConfig({ TETHER_SWEEP_INTERVAL_SECONDS: "0.2" });
+		const requests: string[][] = [];
+		const script: ScriptStep[] = [
+			{ toolCall: { name: "bash", args: { command: "echo old > old.txt" } } },
+			{ text: "written" },
+			{ toolCall: { name: "bash", args: { command: "test -e old.txt && echo present || echo absent" } } },
+			{ text: "checked" },
+			{ text: "understood" },
+		];
+		const tether = await createTether(config, { models: fauxModels(script, requests) });
+		opened.push(tether);
+		const { agents, sessions, sandboxes, engine } = tether.services;
+		const { agent } = await agents.create({ name: "lost", spec: bashSpec() });
+		const session = await sessions.create({ agentId: agent.id });
+		await engine.waitSubmission((await sessions.sendMessage(session.id, { content: "a", requestId: "r1" })).submissionId);
+		const before = await sandboxes.status(session.id);
+
+		await run("docker", ["rm", "--force", before!.sandboxId]);
+		expect(await waitFor(async () => (await sandboxes.status(session.id))?.state === "lost", 20_000)).toBe(true);
+		await engine.waitSubmission((await sessions.sendMessage(session.id, { content: "b", requestId: "r2" })).submissionId);
+
+		expect(await sandboxes.status(session.id)).toMatchObject({ state: "running", epoch: expect.any(Number) });
+		const { items } = await sessions.transcript(session.id, { limit: 50 });
+		const check = items.find((e) => e.role === "tool");
+		expect(check?.toolResult).toMatchObject({ isError: false, text: expect.stringContaining("absent") });
+		expect(
+			items.find((e) => e.kind === "tether.sandbox" && (e.data as { reason?: string }).reason === "recovered"),
+		).toBeDefined();
+		// 说明是在这一轮的工具调用里写下的，pi 把它排到这一轮结束后，模型下一轮看到
+		await engine.waitSubmission((await sessions.sendMessage(session.id, { content: "c", requestId: "r3" })).submissionId);
+		expect(requests.at(-1)?.join("\n")).toContain("The previous sandbox was lost (missing).");
+		await shutdown(tether);
+	});
+
 	it("creates no sandbox for a run without tool calls", async () => {
 		const config = newConfig();
 		const tether = await open(config, [{ text: "just chatting" }]);
