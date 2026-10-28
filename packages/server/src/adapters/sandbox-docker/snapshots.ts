@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
-import { mkdir, readdir, rename, rm, stat, statfs } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { mkdir, readdir, rename, rm, rmdir, stat, statfs } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { TetherError } from "@tether/core";
 
 /** 快照 ID 是 <会话>/<16 位十六进制>，会拼进路径，只认这种形式。 */
@@ -65,6 +65,8 @@ export function createSnapshotFiles(checkpointRoot: string, suffix: string): Sna
 			const target = pathOf(snapshotId);
 			await rm(target, { recursive: true, force: true });
 			await rm(`${target}${PARTIAL}`, { recursive: true, force: true });
+			// 会话的最后一张删掉了就删目录；还有别的快照时 rmdir 报 ENOTEMPTY，不管它
+			await rmdir(dirname(target)).catch(() => {});
 		},
 
 		async list() {

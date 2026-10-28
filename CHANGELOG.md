@@ -31,6 +31,12 @@ Tether 还没有发布版本号，按里程碑记录。每个里程碑合进 `ma
 - 工作区快照：运行中的沙箱先 `docker pause` 再复制，存下的是暂停那一刻的一致状态，之后照常运行；后台进程会被冻结约 0.3 秒。快照只含 `/workspace`，不含进程和内存。镜像模式克隆 `disk.img`，目录模式用 `rsync --link-dest`（主机上需要 `rsync`）。快照在 `<数据目录>/checkpoints/<会话>/`。
 - 配置 `TETHER_WORKSPACE_STORAGE`（`auto`、`image`、`directory`，默认 `auto`）和 `TETHER_DEFAULT_DISK_MB`（没填 `diskMb` 时镜像的大小，默认 10240，镜像是稀疏文件，不预占）。存档目录固定为 `<数据目录>/checkpoints`，必须和 `workspaces/` 在同一个文件系统上。
 
+### 修复
+
+- 镜像模式下容器在 Tether 之外被删掉后，Docker 卷和容器同名（`tether-<会话>`），状态查询读到卷而报错，巡检永远标不成 `lost`。查容器的 `docker inspect` 一律限定 `--type container`（M3 端到端验收发现，`docs/acceptance/m3.md`）。
+- 删掉一个会话的最后一张快照时，连同 `checkpoints/<会话>/` 目录一起删除。
+- 目录模式的快照可能混进上一张的旧文件：`rsync --link-dest` 默认按整秒比较修改时间，同一秒内改过、长度没变的文件被当成没改，链接到上一张快照的旧内容。改为连纳秒一起比较（`--modify-window=-1`）。在 gVisor 下跑 Docker 测试时发现（目录模式的一致性用例 15 次失败 2 次），runc 下同样会发生。
+
 ### 升级注意
 
 - 从 M2 升级、数据目录又在 XFS 上时，M2 建的会话工作区还是目录，新代码会按镜像模式找 `disk.img`。目前没有正式部署，M3 不做迁移；升级前请归档全部会话，或者设 `TETHER_WORKSPACE_STORAGE=directory`。

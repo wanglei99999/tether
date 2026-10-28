@@ -44,6 +44,8 @@ export function createDirectoryStorage(options: DirectoryStorageOptions): Worksp
 			await run("rsync", [
 				"-a",
 				"--delete",
+				// 默认按整秒比较修改时间：同一秒内改过、长度不变的文件会被当成没改，硬链接到上一张的旧内容。-1 连纳秒一起比
+				"--modify-window=-1",
 				...(previous === undefined ? [] : [`--link-dest=${previous}`]),
 				`${workspaceOf(sessionId)}/`,
 				`${target}/`,

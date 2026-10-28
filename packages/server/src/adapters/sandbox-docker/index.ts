@@ -94,7 +94,8 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 	const snapshots = createSnapshotFiles(options.checkpointRoot, storage.snapshotSuffix);
 
 	async function status(sandboxId: string): Promise<"running" | "stopped" | "missing"> {
-		const result = await docker(["inspect", "--format", "{{.State.Status}}", sandboxId]);
+		// 查容器一律带 --type container：镜像模式的卷也叫 tether-<会话>，容器删掉后不带类型会找到卷
+		const result = await docker(["inspect", "--type", "container", "--format", "{{.State.Status}}", sandboxId]);
 		if (isNoSuchContainer(result)) return "missing";
 		if (result.code !== 0) {
 			throw new TetherError("sandbox_failed", `docker inspect failed: ${result.stderr.trim()}`);
@@ -213,7 +214,7 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 			}
 			// 容器记着的挂载失效了（宿主重启后 loop 设备换了编号或接到了别的镜像上）：按原配置重建容器。
 			// 工作区在镜像里，不受影响；丢的只是容器层，和停止时进程丢失是同一类，模型照常收到重连说明。
-			const label = await dockerOrThrow(["inspect", "--format", `{{index .Config.Labels "${SPEC_LABEL}"}}`, sandboxId]);
+			const label = await dockerOrThrow(["inspect", "--type", "container", "--format", `{{index .Config.Labels "${SPEC_LABEL}"}}`, sandboxId]);
 			const spec = JSON.parse(label) as SandboxSpec;
 			await dockerOrThrow(["rm", "--force", sandboxId]);
 			await run(sessionId, spec);
@@ -242,7 +243,7 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 
 		async fence(sandboxId, epoch) {
 			// kill -1 在共享宿主 PID 命名空间的容器里会杀掉宿主上的进程：先确认容器有自己的命名空间
-			const inspect = await docker(["inspect", "--format", "{{.HostConfig.PidMode}}", sandboxId]);
+			const inspect = await docker(["inspect", "--type", "container", "--format", "{{.HostConfig.PidMode}}", sandboxId]);
 			if (inspect.code !== 0) {
 				throw new TetherError("sandbox_failed", `cannot fence ${sandboxId}: ${inspect.stderr.trim()}`);
 			}

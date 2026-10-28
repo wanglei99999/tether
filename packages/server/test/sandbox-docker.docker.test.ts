@@ -7,7 +7,7 @@ import type { SandboxProvider } from "@tether/core";
 import { registerSandboxProviderConformance, sampleSandboxSpec } from "@tether/testkit";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { buildSandboxImage, createDockerSandboxProvider } from "../src/adapters/sandbox-docker/index.ts";
-import { runtimeOption } from "./fixtures/runtime.ts";
+import { runtimeOption, TEST_RUNTIME } from "./fixtures/runtime.ts";
 import { freshRoot, type StorageMode } from "./fixtures/storage.ts";
 
 const run = promisify(execFile);
@@ -56,6 +56,7 @@ async function makeProvider(mode: StorageMode, options: { runtime?: string } = {
 	return {
 		provider: tracked,
 		workspaceRoot,
+		checkpointRoot,
 		sessionId: nextSessionId,
 		cleanup: async () => {
 			for (const sandboxId of created) await provider.destroy(sandboxId);
@@ -267,6 +268,19 @@ for (const mode of ["image", "directory"] as const) {
 			expect(Number(await sh(sandboxId, "cat /workspace/a"))).toBeGreaterThan(before);
 		});
 
+		it("snapshots a file changed within the same second with the same size", async () => {
+			// 目录模式的 rsync --link-dest 默认按整秒比较修改时间：同一秒内改过、长度不变的文件会被当成没改，链接到上一张的旧内容
+			const { sandboxId } = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec() });
+			await sh(sandboxId, "echo 1 > /workspace/f && touch -d '2026-01-01 00:00:00.100' /workspace/f");
+			await made.provider.snapshot(sandboxId);
+			await sh(sandboxId, "echo 2 > /workspace/f && touch -d '2026-01-01 00:00:00.900' /workspace/f");
+			const { snapshotId } = await made.provider.snapshot(sandboxId);
+
+			const restored = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec(), from: snapshotId });
+
+			expect(await sh(restored.sandboxId, "cat /workspace/f")).toBe("2");
+		});
+
 		it("keeps the source and the restored sandbox independent", async () => {
 			const { sandboxId } = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec() });
 			await sh(sandboxId, "echo base > /workspace/f.txt");
@@ -281,6 +295,21 @@ for (const mode of ["image", "directory"] as const) {
 			// 存档本身不受两边改动影响
 			const again = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec(), from: snapshotId });
 			expect(await sh(again.sandboxId, "cat /workspace/f.txt")).toBe("base");
+		});
+
+		it("removes a session's snapshot directory together with its last snapshot", async () => {
+			// 归档清理和稀疏化删完一个会话的存档后，不留下空目录
+			const sessionId = made.sessionId();
+			const { sandboxId } = await made.provider.create({ sessionId, spec: sampleSandboxSpec() });
+			const first = await made.provider.snapshot(sandboxId);
+			const second = await made.provider.snapshot(sandboxId);
+			const dir = join(made.checkpointRoot, sessionId);
+
+			await made.provider.deleteSnapshot(first.snapshotId);
+			expect(existsSync(dir)).toBe(true);
+			await made.provider.deleteSnapshot(second.snapshotId);
+
+			expect(existsSync(dir)).toBe(false);
 		});
 
 		it("keeps the snapshot after the source sandbox is destroyed", async () => {
@@ -337,7 +366,9 @@ describe("docker sandbox specifics (image only)", () => {
 		const spec = sampleSandboxSpec({ resources: { cpu: 1, memoryMb: 512, diskMb: 512 } });
 		const { sandboxId } = await made.provider.create({ sessionId, spec });
 
-		expect(await docker("exec", sandboxId, "stat", "-f", "-c", "%T", "/workspace")).toBe("xfs");
+		// gVisor 里挂进来的目录都经它的文件代理，容器里看到的类型是 v9fs；容量照样是镜像的
+		const fsType = await docker("exec", sandboxId, "stat", "-f", "-c", "%T", "/workspace");
+		expect(fsType).toBe(TEST_RUNTIME === "runsc" ? "v9fs" : "xfs");
 		const sizeMb = Number(await docker("exec", sandboxId, "sh", "-c", "df -m --output=size /workspace | tail -1"));
 		// XFS 的日志和元数据占掉一部分：512 MB 的镜像约 448 MB 可用；要证明的是"这是镜像，不是宿主盘"
 		expect(sizeMb).toBeGreaterThan(400);
@@ -424,6 +455,19 @@ describe("docker sandbox specifics (image only)", () => {
 		// 设备已经摘掉：不再出现在已接设备的列表里
 		const attached = (await losetup("--list", "--noheadings", "--output", "NAME")).split("\n");
 		expect(attached).not.toContain(devices[0]);
+	});
+
+	it("reports a container removed outside Tether as missing although its volume has the same name", async () => {
+		// 卷名和容器名都是 tether-<会话>：不限定类型的 docker inspect 会找到卷，状态查询报错，巡检永远标不成 lost
+		const sessionId = made.sessionId();
+		const { sandboxId } = await made.provider.create({ sessionId, spec: sampleSandboxSpec() });
+		await docker("rm", "--force", sandboxId);
+
+		expect(await made.provider.status(sandboxId)).toBe("missing");
+		await expect(made.provider.fence(sandboxId, 1)).rejects.toMatchObject({
+			code: "sandbox_failed",
+			message: expect.stringMatching(/no such container/i),
+		});
 	});
 
 	it("lists and removes leftover volumes and loop devices of sessions without a container", async () => {
