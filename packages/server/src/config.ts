@@ -29,6 +29,8 @@ export interface Config {
 	stopAfterMs: number;
 	/** 停止后再闲置多久删除沙箱（先存最终存档；TETHER_DESTROY_AFTER_SECONDS，默认 7 天），必须长于 stopAfterMs。 */
 	destroyAfterMs: number;
+	/** 拉取模板镜像的上限（TETHER_IMAGE_PULL_TIMEOUT_SECONDS，默认 600 秒）。 */
+	imagePullTimeoutMs: number;
 	/** 存档所在的盘空闲低于这个百分比就稀疏化（TETHER_CHECKPOINT_MIN_FREE_PERCENT，默认 10）。 */
 	checkpointMinFreePercent: number;
 	/** 巡检间隔（TETHER_SWEEP_INTERVAL_SECONDS，默认 60 秒）。 */
@@ -118,6 +120,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
 		stopAfterMs,
 		destroyAfterMs,
 		checkpointMinFreePercent: percent(env, "TETHER_CHECKPOINT_MIN_FREE_PERCENT", 10),
+		imagePullTimeoutMs: duration(env, "TETHER_IMAGE_PULL_TIMEOUT_SECONDS", 600),
 		sweepIntervalMs: duration(env, "TETHER_SWEEP_INTERVAL_SECONDS", 60),
 	};
 }

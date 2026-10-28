@@ -12,6 +12,9 @@ Tether 还没有发布版本号，按里程碑记录。每个里程碑合进 `ma
 - 镜像模式需要的 `losetup` 由一次性的 `--privileged` 容器执行；Tether 进程本身仍以普通用户运行，不需要 sudo。
 - 丢失重建改为从存档恢复：沙箱被删掉后，下一次工具调用从会话最近的一张存档建新沙箱（自己还没有存档的分叉会话用分叉时选中的那张），不再执行 `setup`，并告诉模型工作区还原到了那张存档、之后执行过的哪些操作不在里面（最多 20 条）。没有存档或最近的存档是模板时，仍按 M2 的方式按模板重建。`tether.sandbox` 条目的 `data.checkpointId` 记下用的是哪一张。
 - 沙箱停止时，会话只有在没有一轮正在运行时才改为 `idle`（M2 里无条件改）。
+- 模板镜像在准入之前准备好：本地没有就先 `docker pull`（上限 `TETHER_IMAGE_PULL_TIMEOUT_SECONDS`，默认 600），拉取期间别的会话照常创建和启动沙箱。拉取失败报 `sandbox_failed`（"cannot pull image …"）。M2 里拉取发生在 `docker run` 里、占着全局准入锁。
+- docker 调用加了上限：默认 120 秒，超时杀掉 docker 命令行进程，报 `sandbox_failed`（"docker <子命令> timed out after … s"）。`--build-sandbox` 不限。
+- setup 失败、容器又没删掉（丢失原因 "cleanup failed"）的沙箱计入运行中的名额，它的容器可能还在跑。
 - 丢失原因写进数据库：M2 里原因只在内存中，服务重启后说明里一律写 "missing"；现在重启后仍是原来的原因。
 - `tether.sqlite` 升到第 2 版（新增 `checkpoints` 表，`sandbox_bindings` 增加 `reason` 列）。第 1 版的库在启动时自动迁移，数据保留。
 

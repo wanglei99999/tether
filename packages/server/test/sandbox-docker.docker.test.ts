@@ -87,6 +87,25 @@ for (const mode of ["image", "directory"] as const) {
 			return () => made.cleanup();
 		});
 
+		it("prepares an image that is already present without pulling", async () => {
+			const started = Date.now();
+
+			await made.provider.prepareImage(sampleSandboxSpec());
+
+			// 默认镜像是本地构建的，不在任何仓库里：去拉就会失败
+			expect(Date.now() - started).toBeLessThan(10_000);
+		});
+
+		it("reports a template image that cannot be pulled as sandbox_failed", async () => {
+			// 本机 1 号端口没有仓库：拉取立即失败，不依赖外网
+			const spec = sampleSandboxSpec({ template: "127.0.0.1:1/tether-missing:latest" });
+
+			await expect(made.provider.prepareImage(spec)).rejects.toMatchObject({
+				code: "sandbox_failed",
+				message: expect.stringContaining("cannot pull image 127.0.0.1:1/tether-missing:latest"),
+			});
+		});
+
 		it("runs the container as the given uid:gid with PID 1 sleep", async () => {
 			const { sandboxId } = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec() });
 

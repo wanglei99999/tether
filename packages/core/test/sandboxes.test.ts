@@ -1,4 +1,4 @@
-import { MemoryAppStore, sampleAgent, sampleCheckpoint, sampleSession, sampleSpec } from "@tether/testkit";
+import { MemoryAppStore, sampleAgent, sampleBinding, sampleCheckpoint, sampleSession, sampleSpec } from "@tether/testkit";
 import { describe, expect, it } from "vitest";
 import {
 	type BindingPatch,
@@ -89,7 +89,7 @@ describe("SandboxService.ensureSandbox", () => {
 		const binding = await sandboxes.ensureSandbox("ses_1");
 
 		expect(binding).toMatchObject({ sessionId: "ses_1", provider: "docker", epoch: 0, state: "running", template: "" });
-		expect(provider.calls).toEqual(["create"]);
+		expect(provider.calls).toEqual(["prepareImage", "create"]);
 		expect(exec.calls).toEqual([
 			{ sandboxId: binding.sandboxId, cwd: "/workspace", command: 'git clone "$REPO_URL" .', env: variables, timeoutMs: 600_000 },
 			{ sandboxId: binding.sandboxId, cwd: "/workspace", command: "npm ci", env: variables, timeoutMs: 600_000 },
@@ -113,7 +113,7 @@ describe("SandboxService.ensureSandbox", () => {
 		expect(error).toMatchObject({ code: "sandbox_failed" });
 		expect((error as Error).message).toContain("`git clone https://dead.example/r.git .`");
 		expect((error as Error).message).toContain("timed out");
-		expect(provider.calls).toEqual(["create", "destroy"]);
+		expect(provider.calls).toEqual(["prepareImage", "create", "destroy"]);
 		expect(await store.getBinding("ses_1")).toBeUndefined();
 	});
 
@@ -166,7 +166,7 @@ describe("SandboxService.ensureSandbox", () => {
 		expect(message).toContain("error: missing header");
 		expect(message).toContain("compiling");
 		expect(exec.calls.map((c) => c.command)).toEqual(["true", "make build"]);
-		expect(provider.calls).toEqual(["create", "destroy"]);
+		expect(provider.calls).toEqual(["prepareImage", "create", "destroy"]);
 		expect(provider.containers.size).toBe(0);
 		expect(exec.closed).toHaveLength(1);
 		expect(await store.getBinding("ses_1")).toBeUndefined();
@@ -253,6 +253,39 @@ describe("SandboxService.ensureSandbox", () => {
 });
 
 describe("SandboxService admission", () => {
+	it("pulls a missing template image before taking the admission lock", async () => {
+		// 拉镜像可能要几分钟：ses_1 卡在拉镜像时，ses_2 照样能建沙箱
+		const { store, provider, sandboxes } = await setUpSessions(2, { maxRunning: 1 });
+		let release = () => {};
+		provider.onPrepareImage = () => {
+			provider.onPrepareImage = async () => {};
+			return new Promise((resolve) => {
+				release = resolve;
+			});
+		};
+		const first = sandboxes.ensureSandbox("ses_1");
+		await new Promise((resolve) => setTimeout(resolve, 10));
+
+		await expect(sandboxes.ensureSandbox("ses_2")).resolves.toMatchObject({ state: "running" });
+
+		release();
+		// 名额被 ses_2 占了：ses_1 拉完镜像才进准入，被拒绝
+		await expect(first).rejects.toMatchObject({ code: "sandbox_limit" });
+		expect(await store.getBinding("ses_1")).toBeUndefined();
+		expect(provider.calls.filter((call) => call === "prepareImage")).toHaveLength(2);
+	});
+
+	it("counts a lost sandbox whose cleanup failed towards the limit", async () => {
+		// setup 失败后容器没删掉：它可能还在跑，占着资源
+		const { store, sandboxes } = await setUpSessions(2, { maxRunning: 1 });
+		await store.createBinding(sampleBinding("ses_1", { state: "lost", reason: "cleanup failed" }));
+
+		await expect(sandboxes.ensureSandbox("ses_2")).rejects.toMatchObject({ code: "sandbox_limit" });
+
+		await store.updateBinding("ses_1", { reason: "missing" }, { state: "lost" });
+		await expect(sandboxes.ensureSandbox("ses_2")).resolves.toMatchObject({ state: "running" });
+	});
+
 	it("refuses a new sandbox at the limit with sandbox_limit and records tether.admission", async () => {
 		const { store, provider, notes, sandboxes } = await setUpSessions(2, { maxRunning: 1 });
 		await sandboxes.ensureSandbox("ses_1");
@@ -349,7 +382,7 @@ describe("SandboxService rebuild", () => {
 
 		expect(rebuilt).toMatchObject({ state: "running", epoch: 0 });
 		expect(rebuilt.sandboxId).not.toBe(first.sandboxId);
-		expect(provider.calls).toEqual(["destroy", "create"]);
+		expect(provider.calls).toEqual(["destroy", "prepareImage", "create"]);
 		expect(exec.closed).toContain(first.sandboxId);
 		expect(exec.calls.map((c) => c.command)).toEqual(["prep"]);
 		expect(notes.at(-1)).toEqual({
@@ -383,7 +416,7 @@ describe("SandboxService rebuild", () => {
 		const rebuilt = await sandboxes.ensureSandbox("ses_1");
 
 		expect(rebuilt).toMatchObject({ state: "running", epoch: 0 });
-		expect(provider.calls).toEqual(["destroy", "create-from"]);
+		expect(provider.calls).toEqual(["destroy", "prepareImage", "create-from"]);
 		expect(provider.containers.get(rebuilt.sandboxId)?.from).toBe("snap_1");
 		// 存档里已经有 setup 的结果
 		expect(exec.calls).toEqual([]);
@@ -406,7 +439,7 @@ describe("SandboxService rebuild", () => {
 
 		await sandboxes.ensureSandbox("ses_1");
 
-		expect(provider.calls).toEqual(["destroy", "create"]);
+		expect(provider.calls).toEqual(["destroy", "prepareImage", "create"]);
 		expect(exec.calls.map((c) => c.command)).toEqual(["prep"]);
 		expect(notes.at(-1)).toMatchObject({ modelText: NOTES.reset("missing") });
 	});
@@ -426,7 +459,7 @@ describe("SandboxService rebuild", () => {
 
 		const rebuilt = await sandboxes.ensureSandbox("ses_2");
 
-		expect(provider.calls).toEqual(["destroy", "create-from"]);
+		expect(provider.calls).toEqual(["destroy", "prepareImage", "create-from"]);
 		expect(provider.containers.get(rebuilt.sandboxId)?.from).toBe("snap_src");
 		expect(notes.at(-1)).toMatchObject({ data: { checkpointId: "cp_src" }, modelText: NOTES.restored("missing", []) });
 	});
@@ -507,8 +540,8 @@ describe("SandboxService rebuild", () => {
 
 		await expect(sandboxes.ensureSandbox("ses_1")).rejects.toMatchObject({ code: "sandbox_limit" });
 
-		// 残留在准入之前就删了（删除可以重复），没有新建；绑定还是 lost，下次照样按重建处理
-		expect(provider.calls).toEqual(["destroy"]);
+		// 残留在准入之前就删了（删除可以重复），镜像也在准入之前准备好；没有新建，绑定还是 lost，下次照样按重建处理
+		expect(provider.calls).toEqual(["destroy", "prepareImage"]);
 		expect((await store.getBinding("ses_1"))?.state).toBe("lost");
 	});
 

@@ -40,7 +40,11 @@ export interface DockerSandboxOptions {
 	defaultDiskMb: number;
 	/** 快照放在这里，必须和 workspaceRoot 在同一个文件系统上（reflink 不跨文件系统）。 */
 	checkpointRoot: string;
+	/** docker pull 的上限，默认 DEFAULT_IMAGE_PULL_TIMEOUT_MS；其他 docker 调用用 DOCKER_TIMEOUT_MS。 */
+	imagePullTimeoutMs?: number;
 }
+
+export const DEFAULT_IMAGE_PULL_TIMEOUT_MS = 600_000;
 
 /**
  * 选工作区的存法：workspaceRoot 和 checkpointRoot 之间能 reflink 就用镜像，否则用目录。
@@ -71,7 +75,10 @@ export async function buildSandboxImage(tag: string): Promise<void> {
 		const arch = process.arch as Parameters<typeof packagedDaemon>[0]["arch"];
 		await copyFile(packagedDaemon({ platform: "linux", arch }), join(context, "pi-env"));
 		for (const script of ["launch.sh", "fence.sh"]) await copyFile(join(SANDBOX_DIR, script), join(context, script));
-		await dockerOrThrow(["build", "--quiet", "--tag", tag, "--file", join(SANDBOX_DIR, "Dockerfile"), context]);
+		// 一次性的命令行操作（--build-sandbox），可能要下载基础镜像，不设上限
+		await dockerOrThrow(["build", "--quiet", "--tag", tag, "--file", join(SANDBOX_DIR, "Dockerfile"), context], {
+			timeoutMs: 0,
+		});
 	} finally {
 		await rm(context, { recursive: true, force: true });
 	}
@@ -186,6 +193,17 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 		},
 
 		status,
+
+		async prepareImage(spec) {
+			const image = spec.template === "" ? options.defaultImage : spec.template;
+			if ((await docker(["image", "inspect", "--format", "{{.Id}}", image])).code === 0) return;
+			const pulled = await docker(["pull", "--quiet", image], {
+				timeoutMs: options.imagePullTimeoutMs ?? DEFAULT_IMAGE_PULL_TIMEOUT_MS,
+			});
+			if (pulled.code !== 0) {
+				throw new TetherError("sandbox_failed", `cannot pull image ${image}: ${pulled.stderr.trim()}`);
+			}
+		},
 
 		async start(sandboxId) {
 			const sessionId = sessionOf(sandboxId);

@@ -18,6 +18,7 @@ describe("loadConfig", () => {
 			stopAfterMs: 3_600_000,
 			destroyAfterMs: 604_800_000,
 			checkpointMinFreePercent: 10,
+			imagePullTimeoutMs: 600_000,
 			sweepIntervalMs: 60_000,
 		});
 	});
@@ -34,6 +35,7 @@ describe("loadConfig", () => {
 			TETHER_STOP_AFTER_SECONDS: "1800",
 			TETHER_DESTROY_AFTER_SECONDS: "86400",
 			TETHER_CHECKPOINT_MIN_FREE_PERCENT: "25",
+			TETHER_IMAGE_PULL_TIMEOUT_SECONDS: "120",
 			TETHER_SWEEP_INTERVAL_SECONDS: "0.5",
 		});
 
@@ -52,6 +54,7 @@ describe("loadConfig", () => {
 			stopAfterMs: 1_800_000,
 			destroyAfterMs: 86_400_000,
 			checkpointMinFreePercent: 25,
+			imagePullTimeoutMs: 120_000,
 			sweepIntervalMs: 500,
 		});
 	});
@@ -76,6 +79,7 @@ describe("loadConfig", () => {
 			"TETHER_SETUP_TIMEOUT_SECONDS",
 			"TETHER_STOP_AFTER_SECONDS",
 			"TETHER_DESTROY_AFTER_SECONDS",
+			"TETHER_IMAGE_PULL_TIMEOUT_SECONDS",
 			"TETHER_SWEEP_INTERVAL_SECONDS",
 		]) {
 			for (const value of ["0", "-5", "ten"]) {

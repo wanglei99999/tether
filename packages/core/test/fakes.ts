@@ -153,6 +153,12 @@ export class FakeProvider implements SandboxProvider {
 	readonly fenced: { sandboxId: string; epoch: number }[] = [];
 	#created = 0;
 
+	/** 在 prepareImage 里调用，测试用它让拉镜像卡住。 */
+	onPrepareImage: () => Promise<void> = async () => {};
+	async prepareImage() {
+		this.calls.push("prepareImage");
+		await this.onPrepareImage();
+	}
 	async create({ sessionId, from }: SandboxCreate) {
 		this.calls.push(from === undefined ? "create" : "create-from");
 		await new Promise((resolve) => setTimeout(resolve, this.createDelayMs));

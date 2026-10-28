@@ -61,6 +61,8 @@ export const MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024;
 const tooLarge = () => new TetherError("invalid_request", "file is larger than 10 MiB");
 /** 准入锁只有一把，所有会话共用这个键。 */
 const ADMISSION = "admission";
+/** setup 失败后删不掉容器时绑定的丢失原因；这种沙箱计入准入（容器可能还在跑）。 */
+const CLEANUP_FAILED = "cleanup failed";
 /** setup 失败时错误消息里保留的输出长度。 */
 const OUTPUT_TAIL_BYTES = 4096;
 
@@ -354,11 +356,12 @@ export class SandboxService {
 		const spec = version.spec.sandbox;
 		const source = lost ? await this.#restoreSource(session) : await this.#forkSource(session);
 
-		// 删旧容器和工作区可能很慢，放在准入锁外面；删除可以重复，被准入拒绝或新建失败时绑定还是 lost
+		// 删旧容器和工作区、拉模板镜像都可能很慢，放在准入锁外面；删除可以重复，被准入拒绝或新建失败时绑定还是 lost
 		if (lost) {
 			exec.close(lost.sandboxId);
 			await provider.destroy(lost.sandboxId);
 		}
+		await provider.prepareImage(spec);
 		// 写下 creating 就占住了名额，setup 可能跑几分钟，在准入锁外面跑
 		const creating = await this.#admit(sessionId, async () => {
 			const { sandboxId } = await provider.create({
@@ -458,12 +461,15 @@ export class SandboxService {
 	/**
 	 * 新占一个运行名额（创建、启动）之前的准入检查。数数和占位（occupy 里写 creating 或 running）在同一把全局锁里，
 	 * 几个会话同时第一次调用工具时不会都数到"还有空位"。本会话自己的绑定不算。
+	 * 清理失败的 lost 也算：setup 失败后容器没删掉，可能还在跑。
 	 */
 	#admit<T>(sessionId: string, occupy: () => Promise<T>): Promise<T> {
 		return this.#admission.run(ADMISSION, async () => {
 			const limit = this.#deps.maxRunning ?? DEFAULT_MAX_RUNNING_SANDBOXES;
 			const running = (await this.#deps.store.listBindings()).filter(
-				(b) => b.sessionId !== sessionId && (b.state === "running" || b.state === "creating"),
+				(b) =>
+					b.sessionId !== sessionId &&
+					(b.state === "running" || b.state === "creating" || (b.state === "lost" && b.reason === CLEANUP_FAILED)),
 			).length;
 			if (running >= limit) {
 				// 模型从工具的错误结果里已经看到原因，这条只给客户端看
@@ -512,7 +518,7 @@ export class SandboxService {
 		}
 		try {
 			if (!destroyed) {
-				await this.#markLost(binding, "abandon", "cleanup failed");
+				await this.#markLost(binding, "abandon", CLEANUP_FAILED);
 			} else if (lost) {
 				// 重建失败：绑定留在 lost，原来的丢失原因不变，下次仍按重建处理并告诉模型环境重置了
 				await this.#transition(binding, "abandon", lost.reason === undefined ? {} : { reason: lost.reason });

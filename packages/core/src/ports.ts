@@ -128,6 +128,8 @@ export interface SandboxCreate {
 export interface SandboxProvider {
 	readonly name: "docker";
 	readonly capabilities: { snapshot: boolean; fork: boolean; rollback: boolean; preservesMemoryOnStop: boolean };
+	/** 模板镜像本地没有就拉下来。在准入之外调用：拉取可能要几分钟，不能让别的会话等着。 */
+	prepareImage(spec: SandboxSpec): Promise<void>;
 	create(input: SandboxCreate): Promise<{ sandboxId: string }>;
 	status(sandboxId: string): Promise<"running" | "stopped" | "missing">;
 	start(sandboxId: string): Promise<void>;
