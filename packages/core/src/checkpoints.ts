@@ -1,5 +1,5 @@
 import type { TranscriptEntry } from "./events.ts";
-import type { CheckpointRecord, ForkOrigin } from "./model.ts";
+import type { CheckpointRecord, ForkOrigin, SessionRecord } from "./model.ts";
 import type { AgentEngine, AppStore } from "./ports.ts";
 
 /** 会改动工作区的工具；read 没有副作用。 */
@@ -119,6 +119,17 @@ export async function findCheckpoint(
 
 async function changedBetween(read: ReadEntries, sessionId: string, after: string, upto: string): Promise<boolean> {
 	return sideEffectCalls(await read(sessionId, after, upto), after, upto).length > 0;
+}
+
+/**
+ * 沙箱丢失后从哪张存档重建：会话自己最新的一张；自己还没有的分叉会话用分叉选中的那张。
+ * 每轮存档在"这一轮开始时沙箱已丢失"时用同一张，两边必须一致。
+ */
+export async function restorePoint(store: AppStore, session: SessionRecord): Promise<CheckpointRecord | undefined> {
+	const latest = (await store.listCheckpoints(session.id)).at(-1);
+	if (latest !== undefined) return latest;
+	const checkpointId = session.forkedFrom?.checkpointId;
+	return checkpointId === undefined || checkpointId === null ? undefined : store.getCheckpoint(checkpointId);
 }
 
 /**

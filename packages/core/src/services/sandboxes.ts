@@ -1,7 +1,8 @@
 import type { DirEntry, ExecResult, TetherEnv } from "../env.ts";
 import { TetherError } from "../errors.ts";
 import { KeyedLock } from "../lock.ts";
-import type { BindingPatch, SandboxBinding, SandboxState, SessionRecord } from "../model.ts";
+import { alignedEntry, missedCalls, readEntries, restorePoint } from "../checkpoints.ts";
+import type { BindingPatch, CheckpointRecord, SandboxBinding, SandboxState, SessionRecord } from "../model.ts";
 import { NOTES, type SandboxNote } from "../notes.ts";
 import type { AgentEngine, AppStore, Clock, ExecChannel, SandboxProvider } from "../ports.ts";
 import { nextState, type SandboxEvent } from "../sandbox-lifecycle.ts";
@@ -9,12 +10,18 @@ import type { Log } from "../startup.ts";
 
 export type SandboxRecord = (sessionId: string, note: SandboxNote) => Promise<void>;
 
+/** 创建沙箱时从哪里来：一张有快照的存档，或者模板（checkpointGone：分叉选中的存档已被清理）。 */
+interface CreateSource {
+	checkpoint?: CheckpointRecord & { snapshotId: string };
+	checkpointGone?: true;
+}
+
 export interface SandboxServiceDeps {
 	store: AppStore;
 	provider: SandboxProvider;
 	exec: ExecChannel;
-	/** 巡检用它判断会话是否正在运行：正在跑的会话不算闲置。 */
-	engine: Pick<AgentEngine, "isRunning">;
+	/** 巡检用 isRunning 判断会话是否正在运行（正在跑的不算闲置）；重建时读记录，列出存档之后执行过的操作。 */
+	engine: Pick<AgentEngine, "isRunning" | "transcript">;
 	clock: Clock;
 	/** 写一条条目进会话记录（设计文档 §4.4），由组装层接到引擎的 appendEntry。 */
 	record: SandboxRecord;
@@ -74,8 +81,6 @@ export class SandboxService {
 	 * 其余连接都是重连。只在内存里：服务重启后为空，重启后的第一次连接也写说明（崩溃时 daemon 退出会带走后台进程）。
 	 */
 	readonly #fresh = new Set<string>();
-	/** 绑定变成 lost 的原因，重建时写进模型可见的说明。只在内存里：服务重启后缺省为 "missing"。 */
-	readonly #lostReasons = new Map<string, string>();
 
 	constructor(deps: SandboxServiceDeps) {
 		this.#deps = deps;
@@ -98,7 +103,6 @@ export class SandboxService {
 			await provider.destroy(binding.sandboxId);
 			await this.#transition(binding, "destroy");
 			this.#fresh.delete(sessionId);
-			this.#lostReasons.delete(sessionId);
 			await this.#note(sessionId, { state: "destroyed", reason });
 		});
 	}
@@ -276,10 +280,9 @@ export class SandboxService {
 		return this.#create(sessionId, binding);
 	}
 
-	/** 标成 lost 并记下原因；客户端看得到，模型等重建时再告诉（NOTES.reset）。 */
+	/** 标成 lost，原因写进绑定（重启后仍在）；客户端看得到，模型等重建时再告诉（NOTES.restored、NOTES.reset）。 */
 	async #markLost(binding: SandboxBinding, event: SandboxEvent, reason: string): Promise<SandboxBinding> {
-		const lost = await this.#transition(binding, event);
-		this.#lostReasons.set(binding.sessionId, reason);
+		const lost = await this.#transition(binding, event, { reason });
 		await this.#note(binding.sessionId, { state: "lost", reason });
 		return lost;
 	}
@@ -294,7 +297,9 @@ export class SandboxService {
 	}
 
 	/**
-	 * 按模板创建沙箱并执行 setup；分叉会话第一次创建时从分叉选中的存档建，不执行 setup。给了 lost 的旧绑定就是重建：先删掉旧容器和工作区，再新建，成功后告诉模型环境重置了。
+	 * 按模板创建沙箱并执行 setup；有存档可用时从存档建，不执行 setup（存档里已经有 setup 的结果）：
+	 * 分叉会话第一次创建用分叉选中的存档，重建用 restorePoint 那张。
+	 * 给了 lost 的旧绑定就是重建：先删掉旧容器和工作区，再新建，成功后告诉模型环境还原或重置了。
 	 * 旧绑定一直留到新容器建好：被准入拒绝或 docker run 失败时绑定还是 lost，下次仍按重建处理。
 	 */
 	async #create(sessionId: string, lost?: SandboxBinding): Promise<SandboxBinding> {
@@ -306,7 +311,7 @@ export class SandboxService {
 			throw new TetherError("internal", `session ${sessionId} pins missing version ${session.agentVersion}`);
 		}
 		const spec = version.spec.sandbox;
-		const fork = lost ? {} : await this.#forkSource(session);
+		const source = lost ? await this.#restoreSource(session) : await this.#forkSource(session);
 
 		// 删旧容器和工作区可能很慢，放在准入锁外面；删除可以重复，被准入拒绝或新建失败时绑定还是 lost
 		if (lost) {
@@ -318,7 +323,7 @@ export class SandboxService {
 			const { sandboxId } = await provider.create({
 				sessionId,
 				spec,
-				...(fork.snapshotId !== undefined && { from: fork.snapshotId }),
+				...(source.checkpoint !== undefined && { from: source.checkpoint.snapshotId }),
 			});
 			// 新容器建好了才删旧绑定：docker run 失败时绑定留在 lost，下次仍按重建处理并告诉模型
 			if (lost) await store.deleteBinding(sessionId);
@@ -338,49 +343,75 @@ export class SandboxService {
 		});
 		this.#fresh.add(sessionId);
 
-		// 从存档建的工作区里已经有 setup 的结果，不再执行
-		if (fork.snapshotId === undefined) {
+		if (source.checkpoint === undefined) {
 			try {
 				await this.#runSetup(creating, spec.setup, session.variables);
 			} catch (error) {
-				await this.#cleanUpFailedSetup(creating, lost !== undefined);
+				await this.#cleanUpFailedSetup(creating, lost);
 				throw error;
 			}
 		}
 
 		const running = await this.#transition(creating, "setup_done");
-		if (fork.snapshotId !== undefined) {
-			await this.#note(sessionId, { state: "running", reason: "restored" });
-		} else if (fork.checkpointGone) {
-			await this.#deps.record(sessionId, {
-				kind: "tether.sandbox",
-				data: { state: "running", reason: "created" },
-				modelText: NOTES.forkFresh,
-			});
-		} else if (lost) {
-			const reason = this.#lostReasons.get(sessionId) ?? "missing";
-			this.#lostReasons.delete(sessionId);
-			await this.#deps.record(sessionId, {
-				kind: "tether.sandbox",
-				data: { state: "running", reason: "recovered" },
-				modelText: NOTES.reset(reason),
-			});
-		} else {
-			await this.#note(sessionId, { state: "running", reason: "created" });
-		}
+		await this.#createdNote(session, source, lost);
 		return running;
 	}
 
+	/** 建好之后写的条目：重建要告诉模型还原了什么、丢了什么；分叉会话的存档已被清理也要告诉模型。 */
+	async #createdNote(session: SessionRecord, source: CreateSource, lost: SandboxBinding | undefined): Promise<void> {
+		const { record } = this.#deps;
+		const { checkpoint } = source;
+		if (lost) {
+			const reason = lost.reason ?? "missing";
+			await record(session.id, {
+				kind: "tether.sandbox",
+				data: { state: "running", reason: "recovered", ...(checkpoint && { checkpointId: checkpoint.id }) },
+				modelText: checkpoint ? NOTES.restored(reason, await this.#callsSince(session, checkpoint)) : NOTES.reset(reason),
+			});
+		} else if (checkpoint) {
+			// 分叉时已经告诉过模型
+			await this.#note(session.id, { state: "running", reason: "restored" });
+		} else if (source.checkpointGone) {
+			await record(session.id, { kind: "tether.sandbox", data: { state: "running", reason: "created" }, modelText: NOTES.forkFresh });
+		} else {
+			await this.#note(session.id, { state: "running", reason: "created" });
+		}
+	}
+
 	/**
-	 * 分叉会话第一次建沙箱时用哪张快照：分叉选中的存档有快照就用它；存档是模板（null）就按模板建，这是精确的；
+	 * 分叉会话第一次建沙箱时用哪张存档：分叉选中的存档有快照就用它；存档是模板（null）就按模板建，这是精确的；
 	 * 存档已经被清理就按模板建，并告诉模型（分叉时说的是"已还原"）。分叉时就没有存档的，分叉时已经告诉过模型。
 	 */
-	async #forkSource(session: SessionRecord): Promise<{ snapshotId?: string; checkpointGone?: true }> {
+	async #forkSource(session: SessionRecord): Promise<CreateSource> {
 		const checkpointId = session.forkedFrom?.checkpointId;
 		if (checkpointId === undefined || checkpointId === null) return {};
 		const checkpoint = await this.#deps.store.getCheckpoint(checkpointId);
 		if (!checkpoint) return { checkpointGone: true };
-		return checkpoint.snapshotId === null ? {} : { snapshotId: checkpoint.snapshotId };
+		return checkpoint.snapshotId === null ? {} : { checkpoint: { ...checkpoint, snapshotId: checkpoint.snapshotId } };
+	}
+
+	/** 重建用哪张存档（restorePoint）；没有存档或存档是模板时按模板重建。 */
+	async #restoreSource(session: SessionRecord): Promise<CreateSource> {
+		const checkpoint = await restorePoint(this.#deps.store, session);
+		return checkpoint?.snapshotId ? { checkpoint: { ...checkpoint, snapshotId: checkpoint.snapshotId } } : {};
+	}
+
+	/**
+	 * 存档之后会话里执行过、重建出来的工作区里没有的操作。存档是分叉选中的那张时，从分叉点那一侧对齐的那一刻算起。
+	 * 正在执行的这次工具调用还没有结果，不算。
+	 */
+	async #callsSince(session: SessionRecord, checkpoint: CheckpointRecord): Promise<string[]> {
+		const { store, engine } = this.#deps;
+		if (session.engineSessionId === null) return [];
+		const [newest] = (await engine.transcript(session.engineSessionId, { limit: 1 })).items;
+		if (newest === undefined) return [];
+		const origin = session.forkedFrom;
+		const from =
+			checkpoint.sessionId === session.id || origin === null
+				? checkpoint.entryId
+				: await alignedEntry(store, origin.sessionId, origin.entryId, checkpoint);
+		const entries = await readEntries(engine, session.engineSessionId, from, newest.id);
+		return missedCalls(entries, from, newest.id);
 	}
 
 	/**
@@ -421,9 +452,9 @@ export class SandboxService {
 	/**
 	 * setup 失败后的清理。每一步失败只记日志，调用方随后抛出原始的 setup 错误。
 	 * 容器删掉了就删绑定（setup_failed），下次从头创建；没删掉，或这是一次重建，就把绑定标成 lost（abandon），
-	 * 下次按重建处理：再删一次残留，并告诉模型环境重置了。
+	 * 下次按重建处理：再删一次残留，并告诉模型环境重置了。重建失败时沿用原来的丢失原因。
 	 */
-	async #cleanUpFailedSetup(binding: SandboxBinding, rebuilding: boolean): Promise<void> {
+	async #cleanUpFailedSetup(binding: SandboxBinding, lost: SandboxBinding | undefined): Promise<void> {
 		const { exec, provider, store, log } = this.#deps;
 		const { sessionId, sandboxId } = binding;
 		try {
@@ -441,9 +472,9 @@ export class SandboxService {
 		try {
 			if (!destroyed) {
 				await this.#markLost(binding, "abandon", "cleanup failed");
-			} else if (rebuilding) {
+			} else if (lost) {
 				// 重建失败：绑定留在 lost，原来的丢失原因不变，下次仍按重建处理并告诉模型环境重置了
-				await this.#transition(binding, "abandon");
+				await this.#transition(binding, "abandon", lost.reason === undefined ? {} : { reason: lost.reason });
 				await this.#note(sessionId, { state: "lost", reason: "setup failed" });
 			} else {
 				nextState(binding.state, "setup_failed");

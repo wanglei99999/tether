@@ -156,7 +156,8 @@ describe("recover", () => {
 		const result = await run();
 
 		expect(result.lostBindings).toBe(1);
-		expect((await store.getBinding("ses_gone"))?.state).toBe("lost");
+		// 原因写进绑定：重启后重建时说明里仍有它
+		expect(await store.getBinding("ses_gone")).toMatchObject({ state: "lost", reason: "missing" });
 		// 状态也按 Docker 的实际情况修正
 		expect((await store.getBinding("ses_kept"))?.state).toBe("stopped");
 	});

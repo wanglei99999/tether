@@ -10,6 +10,8 @@ Tether 还没有发布版本号，按里程碑记录。每个里程碑合进 `ma
 
 - 工作区的存法（ADR-011，M3 结束时写）：数据目录在支持 reflink 的文件系统上时（例如 XFS `reflink=1`），每个会话的工作区是一个 XFS 镜像文件 `workspaces/<会话>/disk.img`，经 loop 设备和 Docker 卷挂成 `/workspace`；否则仍是 M2 的宿主目录挂载，并在启动时打印一条警告。启动时自动选择，也可以用 `TETHER_WORKSPACE_STORAGE` 指定。镜像模式下宿主上看不到工作区里的单个文件，要用 `tether files`、`tether cat` 或文件浏览 API。
 - 镜像模式需要的 `losetup` 由一次性的 `--privileged` 容器执行；Tether 进程本身仍以普通用户运行，不需要 sudo。
+- 丢失重建改为从存档恢复：沙箱被删掉后，下一次工具调用从会话最近的一张存档建新沙箱（自己还没有存档的分叉会话用分叉时选中的那张），不再执行 `setup`，并告诉模型工作区还原到了那张存档、之后执行过的哪些操作不在里面（最多 20 条）。没有存档或最近的存档是模板时，仍按 M2 的方式按模板重建。`tether.sandbox` 条目的 `data.checkpointId` 记下用的是哪一张。
+- 丢失原因写进数据库：M2 里原因只在内存中，服务重启后说明里一律写 "missing"；现在重启后仍是原来的原因。
 - `tether.sqlite` 升到第 2 版（新增 `checkpoints` 表，`sandbox_bindings` 增加 `reason` 列）。第 1 版的库在启动时自动迁移，数据保留。
 
 ### 新增

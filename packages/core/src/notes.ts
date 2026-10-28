@@ -18,6 +18,11 @@ export const NOTES = {
 		"The connection to the sandbox was re-established. Processes started earlier, including background servers, have ended. Files in /workspace are kept.",
 	reset: (reason: string) =>
 		`The previous sandbox was lost (${reason}). A new sandbox was created from the template and the setup commands ran again. Files that were in /workspace are gone, and so are processes started earlier.`,
+	restored: (reason: string, missed: string[]) =>
+		`The previous sandbox was lost (${reason}). /workspace was restored from the latest checkpoint; processes started earlier are not running, and only /workspace was restored.` +
+		(missed.length === 0
+			? ""
+			: ` These operations ran after that checkpoint and are not reflected in /workspace:\n${missed.map((m) => `- ${m}`).join("\n")}`),
 	forked: (missed: string[]) =>
 		`This session was forked from another session. /workspace was restored from a checkpoint; processes from the original session are not running, and only /workspace was restored.` +
 		(missed.length === 0

@@ -95,7 +95,7 @@ async function reconcileSandboxes({
 		}
 		const status = await provider.status(binding.sandboxId);
 		if (status === "missing") {
-			await store.updateBinding(binding.sessionId, { state: "lost" }, { state: binding.state });
+			await store.updateBinding(binding.sessionId, { state: "lost", reason: "missing" }, { state: binding.state });
 			lostBindings++;
 			log.warn(`sandbox ${binding.sandboxId} of session ${binding.sessionId} is gone; binding marked lost`);
 			continue;

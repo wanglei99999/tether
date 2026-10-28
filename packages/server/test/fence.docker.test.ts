@@ -56,7 +56,7 @@ async function runningSession() {
 		store,
 		provider,
 		exec: channel(),
-		engine: { isRunning: async () => false },
+		engine: { isRunning: async () => false, transcript: async () => ({ items: [] }) },
 		clock: { now: () => new Date().toISOString() },
 		record: async (_sessionId, note) => {
 			notes.push(note);

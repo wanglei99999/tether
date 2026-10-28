@@ -354,6 +354,117 @@ describe("SandboxService rebuild", () => {
 		});
 	});
 
+	/** ses_1 有沙箱，存档 cp_1 对齐到条目 1（快照 snap_1）；之后写了 a.txt、执行了 make、读了一个文件；然后容器丢了。 */
+	async function lostAfterCheckpoint(setup: string[] = ["prep"]) {
+		const made = await setUp(setup);
+		const { store, provider, engine, sandboxes } = made;
+		await sandboxes.ensureSandbox("ses_1");
+		const entryId = engine.push("eng_1", { kind: "pi.user", role: "user", text: "go" });
+		await store.addCheckpoint(sampleCheckpoint("cp_1", { entryId, snapshotId: "snap_1" }));
+		provider.snapshots.set("snap_1", { sandboxId: "sbx_1", partial: false });
+		engine.ran("eng_1", "write", { path: "a.txt" });
+		engine.ran("eng_1", "bash", { command: "make" });
+		engine.ran("eng_1", "read", { path: "a.txt" });
+		provider.containers.clear();
+		await sandboxes.sweep();
+		made.provider.calls.length = 0;
+		made.exec.calls.length = 0;
+		return made;
+	}
+
+	it("rebuilds a lost sandbox from the latest checkpoint and lists the calls after it", async () => {
+		const { store, provider, exec, notes, sandboxes } = await lostAfterCheckpoint();
+
+		const rebuilt = await sandboxes.ensureSandbox("ses_1");
+
+		expect(rebuilt).toMatchObject({ state: "running", epoch: 0 });
+		expect(provider.calls).toEqual(["destroy", "create-from"]);
+		expect(provider.containers.get(rebuilt.sandboxId)?.from).toBe("snap_1");
+		// 存档里已经有 setup 的结果
+		expect(exec.calls).toEqual([]);
+		expect(notes.at(-1)).toEqual({
+			kind: "tether.sandbox",
+			data: { state: "running", reason: "recovered", checkpointId: "cp_1" },
+			modelText: NOTES.restored("missing", ["write: a.txt", "bash: make"]),
+		});
+		expect((await store.getBinding("ses_1"))?.reason).toBeUndefined();
+	});
+
+	it("rebuilds from the template when the latest checkpoint is a template one", async () => {
+		const { store, provider, exec, notes, sandboxes } = await setUp(["prep"]);
+		await sandboxes.ensureSandbox("ses_1");
+		await store.addCheckpoint(sampleCheckpoint("cp_1", { snapshotId: null }));
+		provider.containers.clear();
+		await sandboxes.sweep();
+		provider.calls.length = 0;
+		exec.calls.length = 0;
+
+		await sandboxes.ensureSandbox("ses_1");
+
+		expect(provider.calls).toEqual(["destroy", "create"]);
+		expect(exec.calls.map((c) => c.command)).toEqual(["prep"]);
+		expect(notes.at(-1)).toMatchObject({ modelText: NOTES.reset("missing") });
+	});
+
+	it("rebuilds a lost forked session from its fork's checkpoint when it has none of its own", async () => {
+		const { store, provider, engine, notes, sandboxes } = await setUp();
+		await store.addCheckpoint(sampleCheckpoint("cp_src", { snapshotId: "snap_src" }));
+		provider.snapshots.set("snap_src", { sandboxId: "sbx_old", partial: false });
+		await engine.createSession({ model: sampleSpec().model, instructions: "", tools: [], cwd: "/workspace" });
+		await store.createSession(
+			sampleSession("ses_2", { engineSessionId: "eng_2", forkedFrom: { sessionId: "ses_1", entryId: "1", checkpointId: "cp_src" } }),
+		);
+		await sandboxes.ensureSandbox("ses_2");
+		provider.containers.clear();
+		await sandboxes.sweep();
+		provider.calls.length = 0;
+
+		const rebuilt = await sandboxes.ensureSandbox("ses_2");
+
+		expect(provider.calls).toEqual(["destroy", "create-from"]);
+		expect(provider.containers.get(rebuilt.sandboxId)?.from).toBe("snap_src");
+		expect(notes.at(-1)).toMatchObject({ data: { checkpointId: "cp_src" }, modelText: NOTES.restored("missing", []) });
+	});
+
+	it("leaves the binding lost when creating from the checkpoint fails", async () => {
+		const { store, provider, notes, sandboxes } = await lostAfterCheckpoint();
+		provider.snapshots.delete("snap_1");
+
+		await expect(sandboxes.ensureSandbox("ses_1")).rejects.toMatchObject({ code: "sandbox_failed" });
+
+		expect(await store.getBinding("ses_1")).toMatchObject({ state: "lost", reason: "missing" });
+		provider.snapshots.set("snap_1", { sandboxId: "sbx_1", partial: false });
+		await sandboxes.ensureSandbox("ses_1");
+		expect(notes.at(-1)).toMatchObject({ data: { reason: "recovered" }, modelText: NOTES.restored("missing", ["write: a.txt", "bash: make"]) });
+	});
+
+	it("keeps the lost reason across a restart of the service", async () => {
+		const { store, provider, exec, engine, clock, sandboxes } = await setUp(["make"]);
+		exec.results.set("make", { exitCode: 2, stdout: "", stderr: "" });
+		provider.failDestroy = true;
+		await sandboxes.ensureSandbox("ses_1").catch(() => {});
+		exec.results.delete("make");
+		provider.failDestroy = false;
+		expect(await store.getBinding("ses_1")).toMatchObject({ state: "lost", reason: "cleanup failed" });
+
+		// 新的服务实例：内存里什么都没有，原因只能从绑定里读
+		const notes: SandboxNote[] = [];
+		const restarted = new SandboxService({
+			store,
+			provider,
+			exec,
+			engine,
+			clock,
+			record: async (_sessionId, note) => {
+				notes.push(note);
+			},
+			log: { warn: () => {} },
+		});
+		await restarted.ensureSandbox("ses_1");
+
+		expect(notes.at(-1)).toMatchObject({ modelText: NOTES.reset("cleanup failed") });
+	});
+
 	it("rebuilds a stopped sandbox whose container is gone on the next tool call", async () => {
 		const { store, provider, notes, sandboxes } = await setUp();
 		const first = await sandboxes.ensureSandbox("ses_1");
@@ -756,7 +867,7 @@ describe("SandboxService.sweep", () => {
 		const result = await sandboxes.sweep();
 
 		expect(result).toEqual({ ...NOTHING, lost: 1 });
-		expect((await store.getBinding("ses_1"))?.state).toBe("lost");
+		expect(await store.getBinding("ses_1")).toMatchObject({ state: "lost", reason: "missing" });
 		expect(notes.at(-1)).toEqual({ kind: "tether.sandbox", data: { state: "lost", reason: "missing" } });
 	});
 

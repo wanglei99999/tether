@@ -131,6 +131,10 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 				if (!engine) throw new TetherError("internal", "the engine is not open yet");
 				return engine.isRunning(engineSessionId);
 			},
+			transcript: (engineSessionId, page) => {
+				if (!engine) throw new TetherError("internal", "the engine is not open yet");
+				return engine.transcript(engineSessionId, page);
+			},
 		},
 		clock: systemClock,
 		setupTimeoutMs: config.setupTimeoutMs,
