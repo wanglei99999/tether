@@ -1,8 +1,21 @@
+import { execFile } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import { promisify } from "node:util";
 import { TetherError } from "@tether/core";
 import { docker } from "./docker-cli.ts";
 import type { WorkspaceStorage } from "./workspace.ts";
+
+const execFileAsync = promisify(execFile);
+
+async function run(command: string, args: string[]): Promise<void> {
+	try {
+		await execFileAsync(command, args, { maxBuffer: 16 * 1024 * 1024 });
+	} catch (error) {
+		const stderr = (error as { stderr?: string }).stderr?.trim();
+		throw new TetherError("sandbox_failed", `${command} failed: ${stderr || String(error)}`);
+	}
+}
 
 export interface DirectoryStorageOptions {
 	workspaceRoot: string;
@@ -16,11 +29,25 @@ export function createDirectoryStorage(options: DirectoryStorageOptions): Worksp
 
 	return {
 		mode: "directory",
+		snapshotSuffix: "",
 
-		async prepare(sessionId) {
+		async prepare(sessionId, _diskMb, from) {
 			const workspace = workspaceOf(sessionId);
 			await mkdir(workspace, { recursive: true });
+			// 恢复要真正复制：快照里的文件和其他快照共享 inode（硬链接），直接链接的话改工作区就改了存档
+			if (from !== undefined) await run("cp", ["-a", `${from}/.`, `${workspace}/`]);
 			return ["--volume", `${workspace}:/workspace`];
+		},
+
+		/** 没变的文件和上一张快照硬链接共享（rsync --link-dest），变了的完整复制一份（ADR-006 的退路）。 */
+		async copyOut(sessionId, target, previous) {
+			await run("rsync", [
+				"-a",
+				"--delete",
+				...(previous === undefined ? [] : [`--link-dest=${previous}`]),
+				`${workspaceOf(sessionId)}/`,
+				`${target}/`,
+			]);
 		},
 
 		async beforeStart() {

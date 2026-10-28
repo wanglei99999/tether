@@ -1,10 +1,13 @@
-import { copyFile, mkdtemp, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { copyFile, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { packagedDaemon } from "@earendil-works/pi-env";
 import { TetherError, type SandboxCreate, type SandboxProvider, type SandboxSpec } from "@tether/core";
 import { docker, dockerOrThrow, isNoSuchContainer } from "./docker-cli.ts";
+import { createSnapshotFiles } from "./snapshots.ts";
 import type { WorkspaceStorage } from "./workspace.ts";
 import { createDirectoryStorage } from "./workspace-directory.ts";
 import { createImageStorage, MIN_DISK_MB, probeReflink } from "./workspace-image.ts";
@@ -35,6 +38,8 @@ export interface DockerSandboxOptions {
 	storage: "image" | "directory";
 	/** spec.resources.diskMb 没填时镜像的大小。目录模式不限制磁盘。 */
 	defaultDiskMb: number;
+	/** 快照放在这里，必须和 workspaceRoot 在同一个文件系统上（reflink 不跨文件系统）。 */
+	checkpointRoot: string;
 }
 
 /**
@@ -43,6 +48,20 @@ export interface DockerSandboxOptions {
  */
 export async function probeWorkspaceStorage(workspaceRoot: string, checkpointRoot: string): Promise<"image" | "directory"> {
 	return (await probeReflink(workspaceRoot, checkpointRoot)) ? "image" : "directory";
+}
+
+const execFileAsync = promisify(execFile);
+
+/** 把所有文件系统的脏页写下去（镜像模式下包括 loop 设备上那层 XFS）；sync(2) 不需要特权。 */
+async function syncFilesystems(): Promise<void> {
+	await execFileAsync("sync");
+}
+
+async function exists(path: string): Promise<boolean> {
+	return stat(path).then(
+		() => true,
+		() => false,
+	);
 }
 
 /** 构建默认沙箱镜像：Dockerfile、launch.sh 和 pi-env daemon 二进制放进临时构建上下文。 */
@@ -65,11 +84,24 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 		options.storage === "image"
 			? createImageStorage({ workspaceRoot, user: options.user, helperImage: options.defaultImage })
 			: createDirectoryStorage({ workspaceRoot, helperImage: options.defaultImage });
+	const snapshots = createSnapshotFiles(options.checkpointRoot, storage.snapshotSuffix);
 
-	/** 按配置建并启动容器；工作区由 storage 准备。spec 记在标签里，挂载失效时按它重建（start）。 */
-	async function run(sessionId: string, spec: SandboxSpec): Promise<void> {
+	async function status(sandboxId: string): Promise<"running" | "stopped" | "missing"> {
+		const result = await docker(["inspect", "--format", "{{.State.Status}}", sandboxId]);
+		if (isNoSuchContainer(result)) return "missing";
+		if (result.code !== 0) {
+			throw new TetherError("sandbox_failed", `docker inspect failed: ${result.stderr.trim()}`);
+		}
+		return result.stdout.trim() === "running" ? "running" : "stopped";
+	}
+
+	/**
+	 * 按配置建并启动容器；工作区由 storage 准备，from 是快照在宿主上的路径。
+	 * spec 记在标签里，挂载失效时按它重建（start）。
+	 */
+	async function run(sessionId: string, spec: SandboxSpec, from?: string): Promise<void> {
 		const sandboxId = `${NAME_PREFIX}${sessionId}`;
-		const mount = await storage.prepare(sessionId, spec.resources.diskMb ?? options.defaultDiskMb);
+		const mount = await storage.prepare(sessionId, spec.resources.diskMb ?? options.defaultDiskMb, from);
 		const args = [
 			"run",
 			"--detach",
@@ -110,15 +142,20 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 
 	return {
 		name: "docker",
-		capabilities: { snapshot: false, fork: false, rollback: false, preservesMemoryOnStop: false },
+		// fork 指"后端原生分叉"（Cube）；Docker 的分叉由 core 用快照加 create({ from }) 组合出来
+		capabilities: { snapshot: true, fork: false, rollback: false, preservesMemoryOnStop: false },
 
-		async create({ sessionId, spec }: SandboxCreate) {
+		async create({ sessionId, spec, from }: SandboxCreate) {
 			if (!SESSION_ID.test(sessionId)) {
 				throw new TetherError("invalid_request", `session id ${JSON.stringify(sessionId)} is not a plain name`);
 			}
+			const source = from === undefined ? undefined : snapshots.pathOf(from);
+			if (source !== undefined && !(await exists(source))) {
+				throw new TetherError("sandbox_failed", `snapshot ${from} does not exist`);
+			}
 			const sandboxId = `${NAME_PREFIX}${sessionId}`;
 			try {
-				await run(sessionId, spec);
+				await run(sessionId, spec, source);
 			} catch (error) {
 				// docker run 可能已经建好容器、只是启动失败：删掉它和刚建的工作区，否则下次创建撞上同名容器
 				await docker(["rm", "--force", sandboxId]).catch(() => {});
@@ -128,14 +165,7 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 			return { sandboxId };
 		},
 
-		async status(sandboxId) {
-			const result = await docker(["inspect", "--format", "{{.State.Status}}", sandboxId]);
-			if (isNoSuchContainer(result)) return "missing";
-			if (result.code !== 0) {
-				throw new TetherError("sandbox_failed", `docker inspect failed: ${result.stderr.trim()}`);
-			}
-			return result.stdout.trim() === "running" ? "running" : "stopped";
-		},
+		status,
 
 		async start(sandboxId) {
 			const sessionId = sessionOf(sandboxId);
@@ -204,6 +234,42 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 				);
 			}
 			return { killed: result.stdout.trim().split(/\s+/).filter(Boolean).length };
+		},
+
+		/**
+		 * 运行中的容器先 docker pause（冻结 cgroup 里的全部进程），sync 把还在页缓存里的写入落到工作区，
+		 * 复制完再 unpause：快照是暂停那一刻的一致状态。实测（ADR-011）后台进程每 10 ms 写一次时整个过程约 0.26 s。
+		 */
+		async snapshot(sandboxId) {
+			const current = await status(sandboxId);
+			if (current === "missing") throw new TetherError("sandbox_failed", `cannot snapshot ${sandboxId}: it does not exist`);
+			const sessionId = sessionOf(sandboxId);
+			const copy = (target: string, previous?: string) => storage.copyOut(sessionId, target, previous);
+			if (current === "stopped") return { snapshotId: await snapshots.take(sessionId, copy) };
+
+			await dockerOrThrow(["pause", sandboxId]);
+			try {
+				return {
+					snapshotId: await snapshots.take(sessionId, async (target, previous) => {
+						await syncFilesystems();
+						await copy(target, previous);
+					}),
+				};
+			} finally {
+				await dockerOrThrow(["unpause", sandboxId]);
+			}
+		},
+
+		async deleteSnapshot(snapshotId) {
+			await snapshots.remove(snapshotId);
+		},
+
+		listSnapshots() {
+			return snapshots.list();
+		},
+
+		storage() {
+			return snapshots.space();
 		},
 
 		/** 给 pi-env 的 Connection 用；Connection 会在末尾追加 serve --token <hex>。 */

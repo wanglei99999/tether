@@ -20,6 +20,7 @@ const provider = createDockerSandboxProvider({
 	// 这里读宿主上的工作区文件，用目录模式；镜像模式在 sandbox-docker.docker.test.ts
 	storage: "directory",
 	defaultDiskMb: 512,
+	checkpointRoot: join(workspaceRoot, ".checkpoints"),
 	...runtimeOption(),
 });
 /** 测试里每个会话一个 SandboxService，按会话 ID 找到对应的服务来连接。 */

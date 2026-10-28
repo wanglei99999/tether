@@ -105,8 +105,14 @@ type ContainerState = "running" | "stopped";
 
 export class FakeProvider implements SandboxProvider {
 	readonly name = "docker" as const;
-	readonly capabilities = { snapshot: false, fork: false, rollback: false, preservesMemoryOnStop: false };
-	readonly containers = new Map<string, { sessionId: string; state: ContainerState }>();
+	readonly capabilities = { snapshot: true, fork: false, rollback: false, preservesMemoryOnStop: false };
+	readonly containers = new Map<string, { sessionId: string; state: ContainerState; from?: string }>();
+	/** 快照 ID → 存档时的沙箱；partial 模拟存到一半崩溃留下的。 */
+	readonly snapshots = new Map<string, { sandboxId: string; partial: boolean }>();
+	/** 为 true 时 snapshot 抛错。 */
+	failSnapshot = false;
+	space = { freeBytes: 100, totalBytes: 100 };
+	#snapshots = 0;
 	readonly calls: string[] = [];
 	/** create 完成前等待的毫秒数，用来让并发调用真正交错。 */
 	createDelayMs = 0;
@@ -119,13 +125,32 @@ export class FakeProvider implements SandboxProvider {
 	readonly fenced: { sandboxId: string; epoch: number }[] = [];
 	#created = 0;
 
-	async create({ sessionId }: SandboxCreate) {
-		this.calls.push("create");
+	async create({ sessionId, from }: SandboxCreate) {
+		this.calls.push(from === undefined ? "create" : "create-from");
 		await new Promise((resolve) => setTimeout(resolve, this.createDelayMs));
 		if (this.failCreate) throw new TetherError("sandbox_failed", "docker run failed");
+		if (from !== undefined && !this.snapshots.has(from)) throw new TetherError("sandbox_failed", `snapshot ${from} does not exist`);
 		const sandboxId = `sbx_${++this.#created}`;
-		this.containers.set(sandboxId, { sessionId, state: "running" });
+		this.containers.set(sandboxId, { sessionId, state: "running", ...(from !== undefined && { from }) });
 		return { sandboxId };
+	}
+	async snapshot(sandboxId: string) {
+		this.calls.push("snapshot");
+		if (this.failSnapshot) throw new TetherError("sandbox_failed", `cannot snapshot ${sandboxId}`);
+		if (!this.containers.has(sandboxId)) throw new TetherError("sandbox_failed", `no container ${sandboxId}`);
+		const snapshotId = `snap_${++this.#snapshots}`;
+		this.snapshots.set(snapshotId, { sandboxId, partial: false });
+		return { snapshotId };
+	}
+	async deleteSnapshot(snapshotId: string) {
+		this.calls.push("deleteSnapshot");
+		this.snapshots.delete(snapshotId);
+	}
+	async listSnapshots() {
+		return [...this.snapshots].map(([snapshotId, { partial }]) => ({ snapshotId, partial }));
+	}
+	async storage() {
+		return { ...this.space };
 	}
 	async status(sandboxId: string) {
 		this.calls.push("status");

@@ -120,6 +120,8 @@ export interface AgentEngine {
 export interface SandboxCreate {
 	sessionId: string;
 	spec: SandboxSpec;
+	/** 从这张快照创建：工作区是快照里的内容，大小也跟着快照。不给就按模板新建。 */
+	from?: string;
 }
 
 /** 只管沙箱的生命周期；文件和命令走 ExecChannel。 */
@@ -141,6 +143,18 @@ export interface SandboxProvider {
 	fence(sandboxId: string, epoch: number): Promise<{ killed: number }>;
 	/** 在沙箱里启动 daemon 的命令，ExecChannel 用它建立连接。 */
 	daemonCommand(sandboxId: string, epoch: number): string[];
+
+	/**
+	 * 给工作区存一张快照（capabilities.snapshot）。运行中的沙箱在存的那一刻冻结，快照是同一时刻的状态，之后照常运行；
+	 * 停止的沙箱保持停止。只存工作区，不存进程和内存。沙箱不存在时抛 sandbox_failed。
+	 */
+	snapshot(sandboxId: string): Promise<{ snapshotId: string }>;
+	/** 不存在不报错；ID 不是 snapshot() 给出的形式时抛 invalid_request。 */
+	deleteSnapshot(snapshotId: string): Promise<void>;
+	/** 后端保存的全部快照；partial 是存到一半中断留下的，启动对账删掉它们。 */
+	listSnapshots(): Promise<{ snapshotId: string; partial: boolean }[]>;
+	/** 快照所在存储的空间，稀疏化按它判断。 */
+	storage(): Promise<{ freeBytes: number; totalBytes: number }>;
 }
 
 export interface ExecChannel {

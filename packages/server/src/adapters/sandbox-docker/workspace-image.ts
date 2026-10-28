@@ -102,16 +102,23 @@ export function createImageStorage(options: ImageStorageOptions): WorkspaceStora
 
 	return {
 		mode: "image",
+		snapshotSuffix: ".img",
 
-		async prepare(sessionId, diskMb) {
-			if (diskMb < MIN_DISK_MB) {
-				throw new TetherError("invalid_request", `a workspace image needs at least ${MIN_DISK_MB} MB, got ${diskMb}`);
-			}
+		async prepare(sessionId, diskMb, from) {
 			const exists = await stat(imageOf(sessionId)).then(
 				() => true,
 				() => false,
 			);
-			if (!exists) await create(sessionId, diskMb);
+			if (from !== undefined) {
+				if (exists) throw new TetherError("conflict", `the workspace of ${sessionId} already exists`);
+				await mkdir(dirOf(sessionId), { recursive: true });
+				await reflink(from, imageOf(sessionId));
+			} else if (!exists) {
+				if (diskMb < MIN_DISK_MB) {
+					throw new TetherError("invalid_request", `a workspace image needs at least ${MIN_DISK_MB} MB, got ${diskMb}`);
+				}
+				await create(sessionId, diskMb);
+			}
 			const device = await attach(sessionId);
 			// 卷的选项建好就不能改：记着的设备不对就删了重建（调用方保证此时没有容器在用它）
 			const current = await volumeDevice(sessionId);
@@ -140,6 +147,11 @@ export function createImageStorage(options: ImageStorageOptions): WorkspaceStora
 			return ["--volume", `${volumeName(sessionId)}:/workspace:nocopy`];
 		},
 
+		/** 克隆整个镜像文件：一次 FICLONE，耗时与里面的文件数无关，只为之后改动的块占空间。 */
+		async copyOut(sessionId, target) {
+			await reflink(imageOf(sessionId), target);
+		},
+
 		/** 卷记着的设备还接着本会话的镜像吗？宿主重启后设备没了或换成了别的镜像，就是不再接着。 */
 		async beforeStart(sessionId) {
 			const device = await volumeDevice(sessionId);
@@ -161,6 +173,15 @@ export function createImageStorage(options: ImageStorageOptions): WorkspaceStora
 			await rm(dirOf(sessionId), { recursive: true, force: true });
 		},
 	};
+}
+
+async function reflink(source: string, target: string): Promise<void> {
+	try {
+		await execFileAsync("cp", ["--reflink=always", source, target]);
+	} catch (error) {
+		const stderr = (error as { stderr?: string }).stderr?.trim();
+		throw new TetherError("sandbox_failed", `cannot clone ${source} to ${target}: ${stderr || String(error)}`);
+	}
 }
 
 /** 两个目录之间能不能 reflink（同一个文件系统且支持）；能就用镜像模式。 */

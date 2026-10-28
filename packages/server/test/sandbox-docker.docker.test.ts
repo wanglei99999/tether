@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { existsSync, realpathSync, rmSync, statfsSync } from "node:fs";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import type { SandboxProvider } from "@tether/core";
 import { registerSandboxProviderConformance, sampleSandboxSpec } from "@tether/testkit";
@@ -31,8 +32,11 @@ beforeAll(async () => {
 /** 每个用例一个独立的工作区根目录，结束时销毁这次建过的所有沙箱。 */
 async function makeProvider(mode: StorageMode, options: { runtime?: string } = {}) {
 	const workspaceRoot = freshRoot(mode);
+	// 存档要和工作区在同一个文件系统上（reflink 不跨文件系统）
+	const checkpointRoot = freshRoot(mode, "tether-cp-");
 	const provider = createDockerSandboxProvider({
 		workspaceRoot,
+		checkpointRoot,
 		user: USER,
 		defaultImage: IMAGE,
 		storage: mode,
@@ -56,9 +60,13 @@ async function makeProvider(mode: StorageMode, options: { runtime?: string } = {
 		cleanup: async () => {
 			for (const sandboxId of created) await provider.destroy(sandboxId);
 			rmSync(workspaceRoot, { recursive: true, force: true });
+			rmSync(checkpointRoot, { recursive: true, force: true });
 		},
 	};
 }
+
+/** 在沙箱里跑一段 sh，返回去掉首尾空白的标准输出。 */
+const sh = (sandboxId: string, script: string) => docker("exec", sandboxId, "sh", "-c", script);
 
 afterAll(async () => {
 	// 兜底：用例中途失败时也不留下本进程建的容器和卷
@@ -197,6 +205,75 @@ for (const mode of ["image", "directory"] as const) {
 				made.provider.create({ sessionId: "../escape", spec: sampleSandboxSpec() }),
 			).rejects.toMatchObject({ code: "invalid_request" });
 		});
+
+		it("restores the files as of the snapshot, not later changes", async () => {
+			const { sandboxId } = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec() });
+			await sh(sandboxId, "echo before > /workspace/a.txt && mkdir -p /workspace/d && echo kept > /workspace/d/k.txt");
+			const { snapshotId } = await made.provider.snapshot(sandboxId);
+			await sh(sandboxId, "echo after > /workspace/a.txt && rm -r /workspace/d && echo new > /workspace/b.txt");
+
+			const restored = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec(), from: snapshotId });
+
+			expect(await sh(restored.sandboxId, "cat /workspace/a.txt /workspace/d/k.txt")).toBe("before\nkept");
+			expect(await sh(restored.sandboxId, "test -e /workspace/b.txt && echo yes || echo no")).toBe("no");
+		});
+
+		it("takes a point-in-time snapshot while a background process keeps writing", async () => {
+			// Review Focus 1：进程先写 a 再写 b（各自原子改名），任何时刻都有 a - b 为 0 或 1。
+			// 逐个文件复制、又不暂停进程的存档会先拷 a、后拷到更新的 b，得到 b > a。
+			const { sandboxId } = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec() });
+			await docker(
+				"exec",
+				"-d",
+				sandboxId,
+				"sh",
+				"-c",
+				"cd /workspace && i=0; while :; do i=$((i+1)); echo $i > a.t && mv a.t a; echo $i > b.t && mv b.t b; done",
+			);
+			await sleep(500);
+
+			const snapshots = [];
+			for (let round = 0; round < 3; round++) snapshots.push((await made.provider.snapshot(sandboxId)).snapshotId);
+
+			for (const snapshotId of snapshots) {
+				const restored = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec(), from: snapshotId });
+				const [a, b] = (await sh(restored.sandboxId, "cat /workspace/a /workspace/b")).split("\n").map(Number);
+				expect(a! - b!, `a=${a} b=${b}`).toBeGreaterThanOrEqual(0);
+				expect(a! - b!, `a=${a} b=${b}`).toBeLessThanOrEqual(1);
+				await made.provider.destroy(restored.sandboxId);
+			}
+			// 存档完容器照常运行，写入在继续
+			const before = Number(await sh(sandboxId, "cat /workspace/a"));
+			await sleep(200);
+			expect(Number(await sh(sandboxId, "cat /workspace/a"))).toBeGreaterThan(before);
+		});
+
+		it("keeps the source and the restored sandbox independent", async () => {
+			const { sandboxId } = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec() });
+			await sh(sandboxId, "echo base > /workspace/f.txt");
+			const { snapshotId } = await made.provider.snapshot(sandboxId);
+			const restored = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec(), from: snapshotId });
+
+			await sh(sandboxId, "echo source > /workspace/f.txt");
+			await sh(restored.sandboxId, "echo restored > /workspace/f.txt && echo only > /workspace/g.txt");
+
+			expect(await sh(sandboxId, "cat /workspace/f.txt; test -e /workspace/g.txt && echo g || echo no-g")).toBe("source\nno-g");
+			expect(await sh(restored.sandboxId, "cat /workspace/f.txt")).toBe("restored");
+			// 存档本身不受两边改动影响
+			const again = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec(), from: snapshotId });
+			expect(await sh(again.sandboxId, "cat /workspace/f.txt")).toBe("base");
+		});
+
+		it("keeps the snapshot after the source sandbox is destroyed", async () => {
+			const { sandboxId } = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec() });
+			await sh(sandboxId, "echo survives > /workspace/s.txt");
+			const { snapshotId } = await made.provider.snapshot(sandboxId);
+
+			await made.provider.destroy(sandboxId);
+			const restored = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec(), from: snapshotId });
+
+			expect(await sh(restored.sandboxId, "cat /workspace/s.txt")).toBe("survives");
+		});
 	});
 }
 
@@ -295,6 +372,23 @@ describe("docker sandbox specifics (image only)", () => {
 		} finally {
 			for (const loop of await associated(other)) await losetup("--detach", loop);
 		}
+	});
+
+	it("snapshots and restores a workspace that is full", async () => {
+		// Review Focus 5：agent 把工作区写满后，存档和恢复照样能用
+		const spec = sampleSandboxSpec({ resources: { cpu: 1, memoryMb: 512, diskMb: 320 } });
+		const { sandboxId } = await made.provider.create({ sessionId: made.sessionId(), spec });
+		await sh(sandboxId, "echo marker > /workspace/m.txt; dd if=/dev/zero of=/workspace/big bs=1M count=900 2>/dev/null; true");
+		// 写满后 df 按 MB 取整还剩 0 或 1
+		const availMb = async (id: string) => Number(await sh(id, "df --output=avail -m /workspace | tail -1"));
+		expect(await availMb(sandboxId)).toBeLessThanOrEqual(1);
+
+		const { snapshotId } = await made.provider.snapshot(sandboxId);
+		const restored = await made.provider.create({ sessionId: made.sessionId(), spec, from: snapshotId });
+
+		expect(await sh(restored.sandboxId, "cat /workspace/m.txt")).toBe("marker");
+		// 恢复出来的也是满的：大小跟着存档走
+		expect(await availMb(restored.sandboxId)).toBeLessThanOrEqual(1);
 	});
 
 	it("removes the volume, the loop device and the image on destroy", async () => {

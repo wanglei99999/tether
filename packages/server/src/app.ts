@@ -104,6 +104,7 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 		defaultImage: config.sandboxImage,
 		storage,
 		defaultDiskMb: config.defaultDiskMb,
+		checkpointRoot: config.checkpointRoot,
 		...(config.sandboxRuntime !== undefined && { runtime: config.sandboxRuntime }),
 	});
 	// 每次启动 daemon 前先隔离旧的（ADR-007）。sandboxes 在下面才建好，回调只在运行时调用。
