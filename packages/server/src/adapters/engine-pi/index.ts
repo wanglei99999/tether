@@ -6,8 +6,12 @@ import {
 	ConversationBusy,
 	type ConversationId,
 	createRegistry,
+	defineExtension,
 	type EntryId,
+	GenerationTask,
 	Harness,
+	hook,
+	LiveDoc,
 	type SubmissionId,
 	watchEvents,
 } from "@earendil-works/pi-durable";
@@ -33,6 +37,11 @@ export interface PiEngineOptions {
 	models: Models;
 	/** 工具调用时按引擎会话 ID 取执行环境；返回 undefined 表示这个会话没有沙箱。 */
 	envFor: (engineSessionId: string) => Promise<ExecutionEnv | undefined>;
+	/**
+	 * 每次请求模型之前调用，带上触发这一轮的提交（m0-findings §7：LiveDoc.run.inputs[0]，不是 run.taskId）。
+	 * 一轮里每次请求都会调用，去重由调用方按提交 ID 做。抛错只交给 onError，这一轮照常继续。
+	 */
+	onRunStart?: (engineSessionId: string, submissionId: string) => Promise<void>;
 	onError?: (error: unknown) => void;
 }
 
@@ -46,6 +55,29 @@ function parseId(id: string): number | undefined {
 export async function openPiEngine(options: PiEngineOptions): Promise<AgentEngine> {
 	const registry = createRegistry();
 	registry.install(CodingTools);
+	const { onRunStart } = options;
+	if (onRunStart) {
+		registry.install(
+			defineExtension({
+				name: "tether-run-start",
+				hooks: [
+					hook(GenerationTask, {
+						beforeRequest: async (_request, api, hookContext) => {
+							const live = await api.snapshot(LiveDoc, api.conversationId, hookContext);
+							const startedBy = live?.run?.inputs[0];
+							if (startedBy === undefined) return undefined;
+							try {
+								await onRunStart(String(api.conversationId), String(startedBy));
+							} catch (error) {
+								options.onError?.(error);
+							}
+							return undefined;
+						},
+					}),
+				],
+			}),
+		);
+	}
 	const harness = await Harness.open(
 		await openNodeSqliteStorage(options.database),
 		{
@@ -127,6 +159,25 @@ export async function openPiEngine(options: PiEngineOptions): Promise<AgentEngin
 			const conversation = await require(String(settled.conversationId));
 			const answer = await entry(conversation, settled.answer);
 			return answer ? { status: "done", answer } : { status: "done" };
+		},
+
+		async submissionEntry(submissionId) {
+			const id = parseId(submissionId);
+			const submission = id === undefined ? undefined : await harness.submission(id as SubmissionId, context);
+			if (!submission) throw new TetherError("not_found", `submission ${submissionId} not found`);
+			const record = await submission.status(context);
+			// placed、done 的输入提交带着它放进对话的条目
+			return record.type === "input" && record.entry !== undefined ? String(record.entry) : undefined;
+		},
+
+		async fork(engineSessionId, entryId) {
+			const conversation = await require(engineSessionId);
+			const at = parseId(entryId);
+			if (at === undefined || !(await entry(conversation, at as EntryId))) {
+				throw new TetherError("invalid_request", `entry ${entryId} is not in engine session ${engineSessionId}`);
+			}
+			const forked = await conversation.fork(at as EntryId, { ownership: { kind: "ownerless" } }, context);
+			return String(forked.id);
 		},
 
 		async abort(engineSessionId) {

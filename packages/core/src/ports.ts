@@ -72,6 +72,10 @@ export interface AgentEngine {
 		input: { content: string; requestId: string; whenBusy?: "followUp" | "steer" | "reject" },
 	): Promise<{ submissionId: string }>;
 	waitSubmission(submissionId: string): Promise<{ status: "done" | "unanswered"; answer?: TranscriptEntry }>;
+	/** 提交放进对话的那条用户条目；还没放进去时 undefined。未知提交报 not_found。 */
+	submissionEntry(submissionId: string): Promise<string | undefined>;
+	/** 在条目处分叉出一个新会话：它看得到到这条为止的记录，之后各写各的。条目不在这个会话里报 invalid_request。 */
+	fork(engineSessionId: string, entryId: string): Promise<string>;
 	abort(engineSessionId: string): Promise<void>;
 	/** 是否有一轮正在运行，与 SessionView.running 同一来源。未知会话报 not_found。 */
 	isRunning(engineSessionId: string): Promise<boolean>;

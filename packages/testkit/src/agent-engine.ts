@@ -370,6 +370,73 @@ export function registerAgentEngineConformance(
 			});
 		});
 
+		it("forks at an entry: the fork sees entries up to it and none after", async () => {
+			await withEngine([{ text: "one" }, { text: "two" }], async ({ engine, model }) => {
+				const id = await engine.createSession(config(model));
+				const first = await engine.waitSubmission((await engine.submit(id, { content: "a", requestId: "r1" })).submissionId);
+				await engine.waitSubmission((await engine.submit(id, { content: "b", requestId: "r2" })).submissionId);
+
+				const fork = await engine.fork(id, first.answer!.id);
+
+				expect(fork).not.toBe(id);
+				expect(await engine.hasSession(fork)).toBe(true);
+				expect(texts((await engine.transcript(fork, { limit: 10 })).items)).toEqual(["one", "a"]);
+			});
+		});
+
+		it("gives entries written after a fork ids greater than the fork point", async () => {
+			await withEngine([{ text: "one" }, { text: "two" }, { text: "three" }], async ({ engine, model }) => {
+				const id = await engine.createSession(config(model));
+				const first = await engine.waitSubmission((await engine.submit(id, { content: "a", requestId: "r1" })).submissionId);
+				await engine.waitSubmission((await engine.submit(id, { content: "b", requestId: "r2" })).submissionId);
+				const parentIds = (await engine.transcript(id, { limit: 100 })).items.map((e) => Number(e.id));
+				const fork = await engine.fork(id, first.answer!.id);
+
+				await engine.waitSubmission((await engine.submit(fork, { content: "c", requestId: "r3" })).submissionId);
+
+				const forkEntries = (await engine.transcript(fork, { limit: 100 })).items;
+				const added = forkEntries.filter((e) => Number(e.id) > Number(first.answer!.id));
+				expect(texts(added)).toEqual(["three", "c"]);
+				// 不只大于分叉点，也大于父会话里已有的全部条目：ID 在整个存储里递增
+				for (const entry of added) expect(Number(entry.id)).toBeGreaterThan(Math.max(...parentIds));
+			});
+		});
+
+		it("keeps the parent unchanged when the fork gets new entries", async () => {
+			await withEngine([{ text: "one" }, { text: "two" }, { text: "three" }], async ({ engine, model }) => {
+				const id = await engine.createSession(config(model));
+				const first = await engine.waitSubmission((await engine.submit(id, { content: "a", requestId: "r1" })).submissionId);
+				await engine.waitSubmission((await engine.submit(id, { content: "b", requestId: "r2" })).submissionId);
+				const fork = await engine.fork(id, first.answer!.id);
+
+				await engine.waitSubmission((await engine.submit(fork, { content: "c", requestId: "r3" })).submissionId);
+
+				expect(texts((await engine.transcript(id, { limit: 10 })).items)).toEqual(["two", "b", "one", "a"]);
+			});
+		});
+
+		it("rejects a fork at an entry that does not exist with invalid_request", async () => {
+			await withEngine([{ text: "one" }], async ({ engine, model }) => {
+				const id = await engine.createSession(config(model));
+				await engine.waitSubmission((await engine.submit(id, { content: "a", requestId: "r1" })).submissionId);
+
+				await expect(engine.fork(id, "999999")).rejects.toMatchObject({ code: "invalid_request" });
+				await expect(engine.fork(id, "not-a-number")).rejects.toMatchObject({ code: "invalid_request" });
+			});
+		});
+
+		it("returns the user entry of a submission once it is placed", async () => {
+			await withEngine([{ text: "Hi there." }], async ({ engine, model }) => {
+				const id = await engine.createSession(config(model));
+				const { submissionId } = await engine.submit(id, { content: "hello", requestId: "r1" });
+				await engine.waitSubmission(submissionId);
+
+				const user = (await engine.transcript(id, { limit: 10 })).items.find((e) => e.role === "user");
+				expect(await engine.submissionEntry(submissionId)).toBe(user!.id);
+				await expect(engine.submissionEntry("999999")).rejects.toMatchObject({ code: "not_found" });
+			});
+		});
+
 		it("reports an unknown session", async () => {
 			await withEngine([], async ({ engine }) => {
 				expect(await engine.hasSession("999999")).toBe(false);

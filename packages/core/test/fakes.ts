@@ -64,9 +64,24 @@ export class FakeEngine implements AgentEngine {
 	async hasSession(engineSessionId: string): Promise<boolean> {
 		return Number(engineSessionId.slice(4)) <= this.#sessions;
 	}
+	/** 条目 ID 和 pi 一样在整个引擎里递增；每次提交占一个（它的用户条目）。 */
+	#entries = 0;
+	readonly #submissionEntries = new Map<string, string>();
 	async submit(engineSessionId: string, input: { content: string; requestId: string }) {
 		this.submitted.push({ engineSessionId, ...input });
-		return { submissionId: `sub_${this.submitted.length}` };
+		const submissionId = `sub_${this.submitted.length}`;
+		this.#submissionEntries.set(submissionId, String(++this.#entries));
+		return { submissionId };
+	}
+	async submissionEntry(submissionId: string): Promise<string | undefined> {
+		const entry = this.#submissionEntries.get(submissionId);
+		if (entry === undefined) throw new TetherError("not_found", `submission ${submissionId} not found`);
+		return entry;
+	}
+	readonly forks: { engineSessionId: string; entryId: string }[] = [];
+	async fork(engineSessionId: string, entryId: string): Promise<string> {
+		this.forks.push({ engineSessionId, entryId });
+		return `eng_${++this.#sessions}`;
 	}
 	async waitSubmission() {
 		return { status: "done" as const };
