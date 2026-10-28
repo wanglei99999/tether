@@ -103,6 +103,18 @@ export class SandboxService {
 		});
 	}
 
+	/**
+	 * 给会话的工作区存一张快照（每轮存档用）。在会话锁里，不和工具调用、巡检交错；不刷新 lastUsedAt。
+	 * 只有 running、stopped 的沙箱能存；其他情况返回当时的状态（没有绑定是 "absent"），由调用方决定怎么记。
+	 */
+	snapshot(sessionId: string): Promise<{ snapshotId: string } | { state: SandboxState | "absent" }> {
+		return this.#lock.run(sessionId, async () => {
+			const binding = await this.#deps.store.getBinding(sessionId);
+			if (binding?.state !== "running" && binding?.state !== "stopped") return { state: binding?.state ?? "absent" };
+			return this.#deps.provider.snapshot(binding.sandboxId);
+		});
+	}
+
 	status(sessionId: string): Promise<SandboxBinding | undefined> {
 		return this.#deps.store.getBinding(sessionId);
 	}

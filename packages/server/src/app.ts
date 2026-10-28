@@ -9,6 +9,7 @@ import {
 	AgentService,
 	type AppStore,
 	BUILTIN_TOOLS,
+	CheckpointService,
 	type Log,
 	recover,
 	type SandboxRecord,
@@ -138,6 +139,22 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 		log,
 		record,
 	});
+	const ids = createIds();
+	const checkpoints = new CheckpointService({
+		store,
+		sandboxes,
+		provider,
+		engine: {
+			submissionEntry: (submissionId) => {
+				if (!engine) throw new TetherError("internal", "the engine is not open yet");
+				return engine.submissionEntry(submissionId);
+			},
+		},
+		clock: systemClock,
+		ids,
+		record,
+		log,
+	});
 
 	const opened = await openPiEngine({
 		database: join(config.dataDir, "engine.sqlite"),
@@ -153,11 +170,15 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 				resolve: async () => exec.piEnv(await sandboxes.ensureSandbox(session.id), WORKSPACE),
 			});
 		},
+		// 每轮第一次请求模型之前存档（spec §8.3）；存档失败只记日志，这一轮照常
+		onRunStart: async (engineSessionId, submissionId) => {
+			const session = await store.getSessionByEngineId(engineSessionId);
+			if (session) await checkpoints.onRunStart(session.id, submissionId);
+		},
 		onError: (error) => log.warn("engine reported an error", error),
 	});
 	engine = opened;
 
-	const ids = createIds();
 	// 目录模式限制不了磁盘，填了 diskMb 就拒绝，不悄悄忽略
 	const unsupported = { ...UNSUPPORTED_IN_M3, diskMb: storage === "directory", minDiskMb: MIN_DISK_MB };
 	const agents = new AgentService({ store, clock: systemClock, ids, catalog: BUILTIN_TOOLS, unsupported });

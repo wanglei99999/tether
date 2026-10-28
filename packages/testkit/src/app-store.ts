@@ -296,6 +296,12 @@ export function registerAppStoreConformance(
 			expect(await store.checkpointForSubmission("sub_missing")).toBeUndefined();
 		});
 
+		it("stores a template checkpoint that has no snapshot", async () => {
+			await store.addCheckpoint(sampleCheckpoint("cp_1", { snapshotId: null }));
+
+			expect(await store.getCheckpoint("cp_1")).toEqual(sampleCheckpoint("cp_1", { snapshotId: null }));
+		});
+
 		it("rejects a second checkpoint for the same submission with conflict", async () => {
 			await store.addCheckpoint(sampleCheckpoint("cp_1", { submissionId: "sub_same" }));
 

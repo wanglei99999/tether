@@ -18,14 +18,14 @@ export interface Unsupported {
 	diskMb: boolean;
 	/** permissions.requireApproval：审批在 M3 之后单独一份计划。 */
 	approval: boolean;
-	/** checkpointPolicy "perRun"：每轮存档接好之前拒绝。 */
+	/** checkpointPolicy "perRun"：后端不支持快照时拒绝。 */
 	checkpoints: boolean;
 	/** diskMb 的下限：工作区镜像是 XFS，mkfs.xfs 不接受小于 300 MB 的文件系统。 */
 	minDiskMb?: number;
 }
 
-/** 默认最保守：diskMb 是否支持取决于存储模式，组装层知道后再放开。 */
-export const UNSUPPORTED_IN_M3: Unsupported = { diskMb: true, approval: true, checkpoints: true };
+/** 默认：diskMb 是否支持取决于存储模式，组装层知道后再放开；审批还没做。 */
+export const UNSUPPORTED_IN_M3: Unsupported = { diskMb: true, approval: true, checkpoints: false };
 
 export function validateVersionSpec(
 	spec: unknown,

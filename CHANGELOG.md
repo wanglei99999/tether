@@ -15,7 +15,8 @@ Tether 还没有发布版本号，按里程碑记录。每个里程碑合进 `ma
 ### 新增
 
 - `sandbox.resources.diskMb` 在镜像模式下生效：镜像的大小就是工作区的磁盘上限，写满时工具得到 "No space left on device"，宿主盘不受影响。最小 300（`mkfs.xfs` 的下限），小于它在创建 agent 版本时报 `invalid_request`。目录模式下仍然拒绝这个字段。
-- 工作区快照（还没有 API，Task 5 起由每轮存档使用）：运行中的沙箱先 `docker pause` 再复制，存下的是暂停那一刻的一致状态，之后照常运行；后台进程会被冻结约 0.3 秒。快照只含 `/workspace`，不含进程和内存。镜像模式克隆 `disk.img`，目录模式用 `rsync --link-dest`（主机上需要 `rsync`）。快照在 `<数据目录>/checkpoints/<会话>/`。
+- 每轮存档：`checkpointPolicy: "perRun"` 可以用了。用户每发一条消息、模型开始干活之前，给工作区存一张档，对齐到这条消息的条目；同一轮只存一次，重试和崩溃恢复不会重复存。会话还没有沙箱时只记一条"模板"存档，不复制任何东西。会话记录里每次存档有一条客户端可见的 `tether.checkpoint`（`data.checkpointId`、`entryId`、`durationMs`；模板存档带 `template: true`）。存档失败不打断这一轮，`tether.checkpoint` 里带 `error`。
+- 工作区快照：运行中的沙箱先 `docker pause` 再复制，存下的是暂停那一刻的一致状态，之后照常运行；后台进程会被冻结约 0.3 秒。快照只含 `/workspace`，不含进程和内存。镜像模式克隆 `disk.img`，目录模式用 `rsync --link-dest`（主机上需要 `rsync`）。快照在 `<数据目录>/checkpoints/<会话>/`。
 - 配置 `TETHER_WORKSPACE_STORAGE`（`auto`、`image`、`directory`，默认 `auto`）和 `TETHER_DEFAULT_DISK_MB`（没填 `diskMb` 时镜像的大小，默认 10240，镜像是稀疏文件，不预占）。存档目录固定为 `<数据目录>/checkpoints`，必须和 `workspaces/` 在同一个文件系统上。
 
 ### 升级注意

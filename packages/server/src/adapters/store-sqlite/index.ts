@@ -87,7 +87,7 @@ function toCheckpoint(row: Row): CheckpointRecord {
 		sessionId: text(row, "session_id"),
 		submissionId: text(row, "submission_id"),
 		entryId: String(row.entry_id),
-		snapshotId: text(row, "snapshot_id"),
+		snapshotId: optionalText(row, "snapshot_id") ?? null,
 		kind: text(row, "kind") as CheckpointRecord["kind"],
 		createdAt: text(row, "created_at"),
 	};

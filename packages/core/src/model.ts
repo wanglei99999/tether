@@ -130,8 +130,11 @@ export interface CheckpointRecord {
 	submissionId: string;
 	/** 这一轮的用户条目；引擎条目 ID 是全局递增的整数，比较要按数值。 */
 	entryId: string;
-	/** 后端给的快照 ID。 */
-	snapshotId: string;
+	/**
+	 * 后端给的快照 ID。null 表示这一轮开始时会话还没有沙箱，工作区就是模板（按模板新建、执行 setup 就能还原）。
+	 * 几条记录可以指向同一张快照：沙箱丢失时开始的一轮，指向重建要用的那张。
+	 */
+	snapshotId: string | null;
 	kind: "filesystem";
 	createdAt: string;
 }

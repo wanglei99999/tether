@@ -56,7 +56,7 @@ CREATE TABLE checkpoints (
 	session_id     TEXT NOT NULL,
 	submission_id  TEXT NOT NULL UNIQUE,
 	entry_id       INTEGER NOT NULL,
-	snapshot_id    TEXT NOT NULL,
+	snapshot_id    TEXT,
 	kind           TEXT NOT NULL,
 	created_at     TEXT NOT NULL
 );

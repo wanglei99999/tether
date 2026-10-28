@@ -42,10 +42,18 @@ describe("validateVersionSpec unsupported fields", () => {
 	];
 
 	it("rejects diskMb, requireApproval and perRun while they are unsupported", () => {
+		const unsupported = { diskMb: true, approval: true, checkpoints: true };
 		for (const [field, spec] of variants) {
-			const error = rejection(() => validateVersionSpec(spec, BUILTIN_TOOLS));
+			const error = rejection(() => validateVersionSpec(spec, BUILTIN_TOOLS, unsupported));
 			expect(error, field).toMatchObject({ code: "invalid_request", message: `${field} is not supported yet` });
 		}
+	});
+
+	it("accepts perRun and still rejects diskMb and requireApproval by default", () => {
+		const [disk, approval, perRun] = variants;
+		expect(validateVersionSpec(perRun![1], BUILTIN_TOOLS)).toEqual(perRun![1]);
+		expect(rejection(() => validateVersionSpec(disk![1], BUILTIN_TOOLS)).code).toBe("invalid_request");
+		expect(rejection(() => validateVersionSpec(approval![1], BUILTIN_TOOLS)).code).toBe("invalid_request");
 	});
 
 	it("rejects a diskMb below the minimum the storage can make", () => {

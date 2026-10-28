@@ -3,7 +3,7 @@
  * 带 modelText 时模型也看得到：环境变了却不告诉模型，它会照着旧环境继续做（spec §8.4）。
  */
 export interface SandboxNote {
-	kind: "tether.sandbox" | "tether.admission";
+	kind: "tether.sandbox" | "tether.admission" | "tether.checkpoint";
 	data: Record<string, unknown>;
 	modelText?: string;
 }

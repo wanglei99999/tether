@@ -109,6 +109,30 @@ describe("createTether on docker", () => {
 		await shutdown(tether);
 	});
 
+	it("checkpoints each round, aligned to the round's user entry", async () => {
+		const config = newConfig();
+		const write = (name: string): ScriptStep => ({ toolCall: { name: "bash", args: { command: `echo ${name} > ${name}.txt` } } });
+		const tether = await open(config, [write("f1"), { text: "one" }, write("f2"), { text: "two" }, { text: "three" }]);
+		const { agents, sessions, store, engine } = tether.services;
+		const { agent } = await agents.create({ name: "perrun", spec: { ...bashSpec(), checkpointPolicy: "perRun" } });
+		const session = await sessions.create({ agentId: agent.id });
+
+		for (const [i, content] of ["first", "second", "third"].entries()) {
+			const { submissionId } = await sessions.sendMessage(session.id, { content, requestId: `r${i}` });
+			await engine.waitSubmission(submissionId);
+		}
+
+		const userEntries = [...(await sessions.transcript(session.id, { limit: 50 })).items]
+			.reverse()
+			.filter((e) => e.role === "user" && ["first", "second", "third"].includes(e.text ?? ""))
+			.map((e) => e.id);
+		const checkpoints = await store.listCheckpoints(session.id);
+		expect(checkpoints.map((c) => c.entryId)).toEqual(userEntries);
+		// 第一轮开始时还没有沙箱：模板存档；第二、三轮存了真正的快照
+		expect(checkpoints.map((c) => c.snapshotId === null)).toEqual([true, false, false]);
+		await shutdown(tether);
+	});
+
 	it("gives two sessions two containers", async () => {
 		const config = newConfig();
 		const write = (text: string): ScriptStep => ({ toolCall: { name: "bash", args: { command: `echo ${text} > who.txt` } } });

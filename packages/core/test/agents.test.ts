@@ -24,12 +24,13 @@ describe("AgentService", () => {
 
 	it("rejects unsupported fields on create and on a new version, and accepts them when the service supports them", async () => {
 		const { agents } = service();
-		const perRun = { ...sampleSpec(), checkpointPolicy: "perRun" as const };
-		const unsupported = { code: "invalid_request", message: "checkpointPolicy perRun is not supported yet" };
+		// 审批默认还不支持（M3 之后单独一份计划）
+		const approval = { ...sampleSpec(), permissions: { denyTools: [], requireApproval: ["bash"] } };
+		const unsupported = { code: "invalid_request", message: "permissions.requireApproval is not supported yet" };
 
-		await expect(agents.create({ name: "a", spec: perRun })).rejects.toMatchObject(unsupported);
+		await expect(agents.create({ name: "a", spec: approval })).rejects.toMatchObject(unsupported);
 		const { agent } = await agents.create({ name: "a", spec: sampleSpec() });
-		await expect(agents.addVersion(agent.id, perRun)).rejects.toMatchObject(unsupported);
+		await expect(agents.addVersion(agent.id, approval)).rejects.toMatchObject(unsupported);
 
 		const store = new MemoryAppStore();
 		const later = new AgentService({
@@ -37,9 +38,9 @@ describe("AgentService", () => {
 			clock: new FakeClock(),
 			ids: new FakeIds(),
 			catalog: BUILTIN_TOOLS,
-			unsupported: { diskMb: true, approval: true, checkpoints: false },
+			unsupported: { diskMb: true, approval: false, checkpoints: false },
 		});
-		await expect(later.create({ name: "b", spec: perRun })).resolves.toMatchObject({ version: { version: 1 } });
+		await expect(later.create({ name: "b", spec: approval })).resolves.toMatchObject({ version: { version: 1 } });
 	});
 
 	it("accepts only an image reference as the sandbox template", async () => {
