@@ -63,6 +63,14 @@ export interface EngineAgentConfig {
 	cwd: string;
 }
 
+/**
+ * 运行开始钩子（spec §4.2），每个 AgentEngine 实现都要支持，在打开引擎时传入：
+ * - 一轮运行里每次请求模型之前都调用（不只是第一次），去重由调用方按提交 ID 做；
+ * - submissionId 是触发这一轮的提交，同一轮内不变，中途 steer 进来的输入也不改变它；
+ * - 回调抛错不能打断这一轮：实现方报告错误后照常请求模型。
+ */
+export type RunStartListener = (engineSessionId: string, submissionId: string) => Promise<void>;
+
 export interface AgentEngine {
 	/** 返回引擎会话 ID。 */
 	createSession(config: EngineAgentConfig): Promise<string>;

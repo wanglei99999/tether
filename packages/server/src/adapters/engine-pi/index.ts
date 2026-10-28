@@ -21,6 +21,7 @@ import { CodingTools } from "@earendil-works/pi-durable/tools";
 import {
 	type AgentEngine,
 	type EngineAgentConfig,
+	type RunStartListener,
 	TetherError,
 	type TetherEvent,
 	type TranscriptEntry,
@@ -37,11 +38,8 @@ export interface PiEngineOptions {
 	models: Models;
 	/** 工具调用时按引擎会话 ID 取执行环境；返回 undefined 表示这个会话没有沙箱。 */
 	envFor: (engineSessionId: string) => Promise<ExecutionEnv | undefined>;
-	/**
-	 * 每次请求模型之前调用，带上触发这一轮的提交（m0-findings §7：LiveDoc.run.inputs[0]，不是 run.taskId）。
-	 * 一轮里每次请求都会调用，去重由调用方按提交 ID 做。抛错只交给 onError，这一轮照常继续。
-	 */
-	onRunStart?: (engineSessionId: string, submissionId: string) => Promise<void>;
+	/** 约定见 core 的 RunStartListener。pi 上用 beforeRequest 钩子读 LiveDoc.run.inputs[0]（m0-findings §7）；抛错交给 onError。 */
+	onRunStart?: RunStartListener;
 	onError?: (error: unknown) => void;
 }
 
