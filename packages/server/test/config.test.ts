@@ -9,6 +9,9 @@ describe("loadConfig", () => {
 			host: "127.0.0.1",
 			port: 7420,
 			workspaceRoot: resolve("./data/workspaces"),
+			checkpointRoot: resolve("./data/checkpoints"),
+			workspaceStorage: "auto",
+			defaultDiskMb: 10_240,
 			sandboxImage: "tether-sandbox:dev",
 			setupTimeoutMs: 600_000,
 			maxRunningSandboxes: 4,
@@ -36,6 +39,9 @@ describe("loadConfig", () => {
 			port: 8080,
 			token: "secret",
 			workspaceRoot: "/srv/tether/workspaces",
+			checkpointRoot: "/srv/tether/checkpoints",
+			workspaceStorage: "auto",
+			defaultDiskMb: 10_240,
 			sandboxImage: "custom:1",
 			setupTimeoutMs: 90_000,
 			maxRunningSandboxes: 2,
@@ -64,6 +70,21 @@ describe("loadConfig", () => {
 			for (const value of ["0", "-5", "ten"]) {
 				expect(() => loadConfig({ [name]: value }), `${name}=${value}`).toThrow(new RegExp(name));
 			}
+		}
+	});
+
+	it("reads the workspace storage mode and accepts only auto, image and directory", () => {
+		expect(loadConfig({ TETHER_WORKSPACE_STORAGE: "image" }).workspaceStorage).toBe("image");
+		expect(loadConfig({ TETHER_WORKSPACE_STORAGE: "directory" }).workspaceStorage).toBe("directory");
+		expect(() => loadConfig({ TETHER_WORKSPACE_STORAGE: "xfs" })).toThrow(
+			expect.objectContaining({ code: "invalid_request", message: expect.stringMatching(/TETHER_WORKSPACE_STORAGE/) }),
+		);
+	});
+
+	it("reads the default disk size and rejects one that is not a positive integer", () => {
+		expect(loadConfig({ TETHER_DEFAULT_DISK_MB: "2048" }).defaultDiskMb).toBe(2048);
+		for (const value of ["0", "-1", "abc", "1.5"]) {
+			expect(() => loadConfig({ TETHER_DEFAULT_DISK_MB: value }), value).toThrow(/TETHER_DEFAULT_DISK_MB/);
 		}
 	});
 

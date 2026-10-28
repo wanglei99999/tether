@@ -10,7 +10,7 @@ export interface AgentServiceDeps {
 	ids: Ids;
 	/** 服务端已安装的工具目录，版本里的工具名按它校验。 */
 	catalog: readonly ToolDescriptor[];
-	/** 还没实现、填了就拒绝的配置，由组装层给出；默认 UNSUPPORTED_IN_M2。 */
+	/** 还没实现、填了就拒绝的配置，由组装层给出；默认 UNSUPPORTED_IN_M3。 */
 	unsupported?: Unsupported;
 }
 

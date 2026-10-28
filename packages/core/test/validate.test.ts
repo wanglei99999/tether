@@ -48,6 +48,18 @@ describe("validateVersionSpec unsupported fields", () => {
 		}
 	});
 
+	it("rejects a diskMb below the minimum the storage can make", () => {
+		const limits = { diskMb: false, approval: false, checkpoints: false, minDiskMb: 300 };
+		const small = { ...completeSpec(), sandbox: { ...completeSpec().sandbox, resources: { cpu: 1, memoryMb: 512, diskMb: 299 } } };
+		const enough = { ...completeSpec(), sandbox: { ...completeSpec().sandbox, resources: { cpu: 1, memoryMb: 512, diskMb: 300 } } };
+
+		expect(rejection(() => validateVersionSpec(small, BUILTIN_TOOLS, limits))).toMatchObject({
+			code: "invalid_request",
+			message: "sandbox.resources.diskMb must be at least 300",
+		});
+		expect(validateVersionSpec(enough, BUILTIN_TOOLS, limits)).toEqual(enough);
+	});
+
 	it("accepts them when supported", () => {
 		const supported = { diskMb: false, approval: false, checkpoints: false };
 		for (const [field, spec] of variants) {

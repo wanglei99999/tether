@@ -13,6 +13,7 @@ import { createTether, type Tether } from "../src/app.ts";
 import { type Config, loadConfig } from "../src/config.ts";
 import { FAUX_MODEL, fauxModels } from "./fixtures/faux.ts";
 import { runtimeEnv } from "./fixtures/runtime.ts";
+import { freshRoot } from "./fixtures/storage.ts";
 
 const run = promisify(execFile);
 const IMAGE = "tether-sandbox:dev";
@@ -74,6 +75,37 @@ describe("createTether on docker", () => {
 		expect(readFileSync(join(config.workspaceRoot, session.id, "a.txt"), "utf8")).toBe("hi\n");
 		const { items } = await sessions.transcript(session.id, { limit: 20 });
 		expect(items.find((e) => e.kind === "tether.sandbox")).toMatchObject({ data: { state: "running", reason: "created" } });
+		await shutdown(tether);
+	});
+
+	it("runs a session on a workspace image of diskMb and removes it on archive", async () => {
+		// 其他用例的数据目录在 ext4 的临时目录上，自动选了目录模式；这里放到 XFS 上，走镜像模式
+		const dataDir = freshRoot("image", "tether-app-");
+		dirs.push(dataDir);
+		const config = newConfig({ TETHER_DATA_DIR: dataDir, TETHER_WORKSPACE_STORAGE: "image" });
+		const tether = await open(config, [
+			{ toolCall: { name: "bash", args: { command: "echo hi > a.txt && df -m --output=size /workspace | tail -1" } } },
+			{ text: "done" },
+		]);
+		const { agents, sessions, sandboxes, engine } = tether.services;
+		const spec = bashSpec();
+		const { agent } = await agents.create({
+			name: "image",
+			spec: { ...spec, sandbox: { ...spec.sandbox, resources: { cpu: 1, memoryMb: 512, diskMb: 512 } } },
+		});
+		const session = await sessions.create({ agentId: agent.id });
+
+		await engine.waitSubmission((await sessions.sendMessage(session.id, { content: "go", requestId: "r" })).submissionId);
+
+		const file = await sandboxes.readFile(session.id, "a.txt");
+		expect(new TextDecoder().decode(file.content)).toBe("hi\n");
+		const { items } = await sessions.transcript(session.id, { limit: 20 });
+		const size = Number(items.find((e) => e.role === "tool")?.toolResult?.text.trim().split("\n").at(-1));
+		expect(size).toBeGreaterThan(400);
+		expect(size).toBeLessThanOrEqual(512);
+
+		await sessions.archive(session.id);
+		expect(existsSync(join(config.workspaceRoot, session.id))).toBe(false);
 		await shutdown(tether);
 	});
 

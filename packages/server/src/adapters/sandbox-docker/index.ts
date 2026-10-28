@@ -1,15 +1,22 @@
-import { copyFile, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { packagedDaemon } from "@earendil-works/pi-env";
-import { TetherError, type SandboxCreate, type SandboxProvider } from "@tether/core";
+import { TetherError, type SandboxCreate, type SandboxProvider, type SandboxSpec } from "@tether/core";
 import { docker, dockerOrThrow, isNoSuchContainer } from "./docker-cli.ts";
+import type { WorkspaceStorage } from "./workspace.ts";
+import { createDirectoryStorage } from "./workspace-directory.ts";
+import { createImageStorage, MIN_DISK_MB, probeReflink } from "./workspace-image.ts";
+
+export { MIN_DISK_MB };
 
 const SANDBOX_DIR = fileURLToPath(new URL("../../../sandbox/", import.meta.url));
 const NAME_PREFIX = "tether-";
 const MANAGED_LABEL = "tether.managed=1";
 const SESSION_LABEL = "tether.session";
+/** 建容器时的 SandboxSpec（JSON），挂载失效时按它重建。 */
+const SPEC_LABEL = "tether.spec";
 /** 会话 ID 会拼进容器名和宿主目录，只允许普通名字，挡住 "../" 之类。 */
 const SESSION_ID = /^[A-Za-z0-9_-]+$/;
 /** PID 1 是 sleep，不处理 SIGTERM，docker stop 总要等满超时再 SIGKILL，所以超时设短。 */
@@ -24,6 +31,18 @@ export interface DockerSandboxOptions {
 	defaultImage: string;
 	/** docker run --runtime，例如 gVisor 的 runsc；不设则用 Docker 默认的 runc。 */
 	runtime?: string;
+	/** 工作区的存法（ADR-011）：image 需要 workspaceRoot 支持 reflink，由组装层用 probeWorkspaceStorage 选。 */
+	storage: "image" | "directory";
+	/** spec.resources.diskMb 没填时镜像的大小。目录模式不限制磁盘。 */
+	defaultDiskMb: number;
+}
+
+/**
+ * 选工作区的存法：workspaceRoot 和 checkpointRoot 之间能 reflink 就用镜像，否则用目录。
+ * 存档要从工作区克隆到 checkpointRoot，所以两者必须在同一个支持 reflink 的文件系统上。
+ */
+export async function probeWorkspaceStorage(workspaceRoot: string, checkpointRoot: string): Promise<"image" | "directory"> {
+	return (await probeReflink(workspaceRoot, checkpointRoot)) ? "image" : "directory";
 }
 
 /** 构建默认沙箱镜像：Dockerfile、launch.sh 和 pi-env daemon 二进制放进临时构建上下文。 */
@@ -41,29 +60,52 @@ export async function buildSandboxImage(tag: string): Promise<void> {
 
 export function createDockerSandboxProvider(options: DockerSandboxOptions): SandboxProvider {
 	const workspaceRoot = resolve(options.workspaceRoot);
-	const workspaceOf = (sessionId: string) => join(workspaceRoot, sessionId);
 	const sessionOf = (sandboxId: string) => sandboxId.slice(NAME_PREFIX.length);
+	const storage: WorkspaceStorage =
+		options.storage === "image"
+			? createImageStorage({ workspaceRoot, user: options.user, helperImage: options.defaultImage })
+			: createDirectoryStorage({ workspaceRoot, helperImage: options.defaultImage });
 
-	/** 工作区里可能有容器以其他身份写下的文件，借一个一次性 root 容器来删（沿用 M0 的做法）。 */
-	async function removeWorkspace(sessionId: string): Promise<void> {
-		const target = workspaceOf(sessionId);
-		const result = await docker([
+	/** 按配置建并启动容器；工作区由 storage 准备。spec 记在标签里，挂载失效时按它重建（start）。 */
+	async function run(sessionId: string, spec: SandboxSpec): Promise<void> {
+		const sandboxId = `${NAME_PREFIX}${sessionId}`;
+		const mount = await storage.prepare(sessionId, spec.resources.diskMb ?? options.defaultDiskMb);
+		const args = [
 			"run",
-			"--rm",
+			"--detach",
+			"--name",
+			sandboxId,
+			// PID 1 必须是 sleep（fence.sh 和 ADR-007 的防护都依赖它）：不让 daemon.json 的 init 或模板镜像的 ENTRYPOINT 换掉它
+			"--init=false",
+			"--entrypoint",
+			"sleep",
+			"--label",
+			MANAGED_LABEL,
+			"--label",
+			`${SESSION_LABEL}=${sessionId}`,
+			"--label",
+			`${SPEC_LABEL}=${JSON.stringify(spec)}`,
+			"--cpus",
+			String(spec.resources.cpu),
+			"--memory",
+			`${spec.resources.memoryMb}m`,
+			"--pids-limit",
+			"512",
+			// 容器里的进程以普通用户运行，用不到任何 Linux 能力；也不许经 setuid 程序提权
+			"--cap-drop",
+			"ALL",
+			"--security-opt",
+			"no-new-privileges",
+			...(options.runtime ? ["--runtime", options.runtime] : []),
 			"--network",
-			"none",
+			spec.network === "egress" ? "bridge" : "none",
 			"--user",
-			"0:0",
-			"--volume",
-			`${dirname(target)}:/parent`,
-			options.defaultImage,
-			"rm",
-			"-rf",
-			`/parent/${basename(target)}`,
-		]);
-		if (result.code !== 0) {
-			throw new TetherError("sandbox_failed", `cannot remove workspace ${target}: ${result.stderr.trim()}`);
-		}
+			options.user,
+			...mount,
+			spec.template === "" ? options.defaultImage : spec.template,
+			"infinity",
+			];
+		await dockerOrThrow(args);
 	}
 
 	return {
@@ -75,49 +117,12 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 				throw new TetherError("invalid_request", `session id ${JSON.stringify(sessionId)} is not a plain name`);
 			}
 			const sandboxId = `${NAME_PREFIX}${sessionId}`;
-			const workspace = workspaceOf(sessionId);
-			await mkdir(workspace, { recursive: true });
-			// spec.resources.diskMb 不会到这里：校验时就拒绝（UNSUPPORTED_IN_M2）。Docker 限制磁盘依赖存储驱动（overlay2 + xfs pquota），测试机不满足。
-			const args = [
-				"run",
-				"--detach",
-				"--name",
-				sandboxId,
-				// PID 1 必须是 sleep（fence.sh 和 ADR-007 的防护都依赖它）：不让 daemon.json 的 init 或模板镜像的 ENTRYPOINT 换掉它
-				"--init=false",
-				"--entrypoint",
-				"sleep",
-				"--label",
-				MANAGED_LABEL,
-				"--label",
-				`${SESSION_LABEL}=${sessionId}`,
-				"--cpus",
-				String(spec.resources.cpu),
-				"--memory",
-				`${spec.resources.memoryMb}m`,
-				"--pids-limit",
-				"512",
-				// 容器里的进程以普通用户运行，用不到任何 Linux 能力；也不许经 setuid 程序提权
-				"--cap-drop",
-				"ALL",
-				"--security-opt",
-				"no-new-privileges",
-				...(options.runtime ? ["--runtime", options.runtime] : []),
-				"--network",
-				spec.network === "egress" ? "bridge" : "none",
-				"--user",
-				options.user,
-				"--volume",
-				`${workspace}:/workspace`,
-				spec.template === "" ? options.defaultImage : spec.template,
-				"infinity",
-			];
 			try {
-				await dockerOrThrow(args);
+				await run(sessionId, spec);
 			} catch (error) {
 				// docker run 可能已经建好容器、只是启动失败：删掉它和刚建的工作区，否则下次创建撞上同名容器
 				await docker(["rm", "--force", sandboxId]).catch(() => {});
-				await rm(workspace, { recursive: true, force: true }).catch(() => {});
+				await storage.remove(sessionId).catch(() => {});
 				throw error;
 			}
 			return { sandboxId };
@@ -133,7 +138,17 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 		},
 
 		async start(sandboxId) {
-			await dockerOrThrow(["start", sandboxId]);
+			const sessionId = sessionOf(sandboxId);
+			if (await storage.beforeStart(sessionId)) {
+				await dockerOrThrow(["start", sandboxId]);
+				return;
+			}
+			// 容器记着的挂载失效了（宿主重启后 loop 设备换了编号或接到了别的镜像上）：按原配置重建容器。
+			// 工作区在镜像里，不受影响；丢的只是容器层，和停止时进程丢失是同一类，模型照常收到重连说明。
+			const label = await dockerOrThrow(["inspect", "--format", `{{index .Config.Labels "${SPEC_LABEL}"}}`, sandboxId]);
+			const spec = JSON.parse(label) as SandboxSpec;
+			await dockerOrThrow(["rm", "--force", sandboxId]);
+			await run(sessionId, spec);
 		},
 
 		async stop(sandboxId) {
@@ -146,7 +161,7 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 				throw new TetherError("sandbox_failed", `docker rm failed: ${result.stderr.trim()}`);
 			}
 			const sessionId = sessionOf(sandboxId);
-			if (SESSION_ID.test(sessionId)) await removeWorkspace(sessionId);
+			if (SESSION_ID.test(sessionId)) await storage.remove(sessionId);
 		},
 
 		async listManaged() {
