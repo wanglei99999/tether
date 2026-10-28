@@ -85,6 +85,8 @@ export function sampleCheckpoint(id: string, overrides: Partial<CheckpointRecord
 		submissionId: `sub_${id}`,
 		entryId: "1",
 		snapshotId: `ses_1/${id}`,
+		basisCheckpointId: null,
+		failed: false,
 		kind: "filesystem",
 		createdAt: T0,
 		...overrides,
@@ -300,6 +302,16 @@ export function registerAppStoreConformance(
 			await store.addCheckpoint(sampleCheckpoint("cp_1", { snapshotId: null }));
 
 			expect(await store.getCheckpoint("cp_1")).toEqual(sampleCheckpoint("cp_1", { snapshotId: null }));
+		});
+
+		it("keeps the checkpoint a record reuses and whether the round's checkpoint failed", async () => {
+			const reused = sampleCheckpoint("cp_2", { snapshotId: "ses_1/cp_1", basisCheckpointId: "cp_1" });
+			const failed = sampleCheckpoint("cp_3", { snapshotId: null, failed: true });
+			await store.addCheckpoint(reused);
+			await store.addCheckpoint(failed);
+
+			expect(await store.getCheckpoint("cp_2")).toEqual(reused);
+			expect(await store.getCheckpoint("cp_3")).toEqual(failed);
 		});
 
 		it("rejects a second checkpoint for the same submission with conflict", async () => {

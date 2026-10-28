@@ -428,6 +428,25 @@ describe("SandboxService rebuild", () => {
 		expect((await store.getBinding("ses_1"))?.reason).toBeUndefined();
 	});
 
+	it("lists the calls since the reused checkpoint when the latest record reuses an earlier snapshot", async () => {
+		// 沙箱丢失后开始的那一轮记了一条对齐到它自己用户条目、内容却是 cp_1 的记录：
+		// 从它算起会告诉模型什么都没丢，其实 a.txt 和 make 的结果都没了
+		const { store, engine, provider, notes, sandboxes } = await lostAfterCheckpoint();
+		const later = engine.push("eng_1", { kind: "pi.user", role: "user", text: "again" });
+		await store.addCheckpoint(
+			sampleCheckpoint("cp_2", { entryId: later, snapshotId: "snap_1", basisCheckpointId: "cp_1", submissionId: "sub_again" }),
+		);
+
+		const rebuilt = await sandboxes.ensureSandbox("ses_1");
+
+		expect(provider.containers.get(rebuilt.sandboxId)?.from).toBe("snap_1");
+		expect(notes.at(-1)).toEqual({
+			kind: "tether.sandbox",
+			data: { state: "running", reason: "recovered", checkpointId: "cp_1" },
+			modelText: NOTES.restored("missing", ["write: a.txt", "bash: make"]),
+		});
+	});
+
 	it("rebuilds from the template when the latest checkpoint is a template one", async () => {
 		const { store, provider, exec, notes, sandboxes } = await setUp(["prep"]);
 		await sandboxes.ensureSandbox("ses_1");

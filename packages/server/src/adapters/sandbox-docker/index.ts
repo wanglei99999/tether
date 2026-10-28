@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { packagedDaemon } from "@earendil-works/pi-env";
 import { TetherError, type SandboxCreate, type SandboxProvider, type SandboxSpec } from "@tether/core";
-import { docker, dockerOrThrow, isNoSuchContainer } from "./docker-cli.ts";
+import { DOCKER_TIMEOUT_MS, docker, dockerOrThrow, isNoSuchContainer } from "./docker-cli.ts";
 import { createSnapshotFiles } from "./snapshots.ts";
 import type { WorkspaceStorage } from "./workspace.ts";
 import { createDirectoryStorage } from "./workspace-directory.ts";
@@ -57,8 +57,13 @@ export async function probeWorkspaceStorage(workspaceRoot: string, checkpointRoo
 const execFileAsync = promisify(execFile);
 
 /** 把所有文件系统的脏页写下去（镜像模式下包括 loop 设备上那层 XFS）；sync(2) 不需要特权。 */
+/** 容器暂停期间执行：卡住就一直冻结着容器，所以和 docker 调用一样有上限。 */
 async function syncFilesystems(): Promise<void> {
-	await execFileAsync("sync");
+	try {
+		await execFileAsync("sync", [], { timeout: DOCKER_TIMEOUT_MS, killSignal: "SIGKILL" });
+	} catch (error) {
+		throw new TetherError("sandbox_failed", `sync before the snapshot failed: ${String(error)}`);
+	}
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -207,6 +212,12 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 		},
 
 		async start(sandboxId) {
+			// 存档到一半进程死了（或 unpause 失败）会把容器留在 paused：docker start 拒绝它，恢复运行就行
+			const state = await docker(["inspect", "--type", "container", "--format", "{{.State.Status}}", sandboxId]);
+			if (state.code === 0 && state.stdout.trim() === "paused") {
+				await dockerOrThrow(["unpause", sandboxId]);
+				return;
+			}
 			const sessionId = sessionOf(sandboxId);
 			if (await storage.beforeStart(sessionId)) {
 				await dockerOrThrow(["start", sandboxId]);
@@ -273,7 +284,15 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 			if (current === "missing") throw new TetherError("sandbox_failed", `cannot snapshot ${sandboxId}: it does not exist`);
 			const sessionId = sessionOf(sandboxId);
 			const copy = (target: string, previous?: string) => storage.copyOut(sessionId, target, previous);
-			if (current === "stopped") return { snapshotId: await snapshots.take(sessionId, copy) };
+			// 停止的容器也先 sync：卷可能还挂着（例如崩溃留下的 paused 容器），页缓存里有没落盘的写入
+			if (current === "stopped") {
+				return {
+					snapshotId: await snapshots.take(sessionId, async (target, previous) => {
+						await syncFilesystems();
+						await copy(target, previous);
+					}),
+				};
+			}
 
 			await dockerOrThrow(["pause", sandboxId]);
 			try {

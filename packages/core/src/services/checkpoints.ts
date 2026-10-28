@@ -1,4 +1,4 @@
-import { restorePoint } from "../checkpoints.ts";
+import { holdsOwnContent, restorePoint } from "../checkpoints.ts";
 import { TetherError } from "../errors.ts";
 import type { CheckpointRecord, SandboxBinding, SessionRecord } from "../model.ts";
 import type { AgentEngine, AppStore, Clock, Ids, SandboxProvider } from "../ports.ts";
@@ -28,8 +28,11 @@ export const THIN_STRIDE = 10;
 
 const byEntry = (a: CheckpointRecord, b: CheckpointRecord) => Number(a.entryId) - Number(b.entryId);
 
-/** 这一轮开始时工作区是什么：一张新快照、沿用的快照、模板（null），或者不记（undefined）。 */
-type RoundStart = { snapshotId: string | null; taken: boolean } | undefined;
+/**
+ * 这一轮开始时工作区是什么：一张新快照、沿用的快照、模板（null），或者不记（undefined）。
+ * 沿用别的存档时 basis 是那条存档：内容是它那一刻的。
+ */
+type RoundStart = { snapshotId: string | null; taken: boolean; basis: string | null } | undefined;
 
 /**
  * 每轮存档（spec §8.3 perRun）：一轮运行第一次请求模型之前，给工作区存一张档，对齐到触发这一轮的用户条目。
@@ -42,17 +45,46 @@ export class CheckpointService {
 		this.#deps = deps;
 	}
 
-	/** 引擎的运行开始钩子（RunStartListener）。存档失败不打断这一轮：记日志，写一条客户端可见的条目。 */
+	/**
+	 * 引擎的运行开始钩子（RunStartListener）。存档失败不打断这一轮：记日志，写一条客户端可见的条目，
+	 * 再记一条失败的存档记录挡住同一轮后面的调用：那时这一轮的工具已经改过工作区，再存就是半轮的状态。
+	 */
 	async onRunStart(sessionId: string, submissionId: string): Promise<void> {
 		try {
 			await this.#checkpoint(sessionId, submissionId);
 		} catch (error) {
+			const { log, record } = this.#deps;
 			const message = error instanceof Error ? error.message : String(error);
-			this.#deps.log.warn(`checkpoint of session ${sessionId} for submission ${submissionId} failed`, error);
-			await this.#deps
-				.record(sessionId, { kind: "tether.checkpoint", data: { submissionId, error: message } })
-				.catch((recordError: unknown) => this.#deps.log.warn("recording a failed checkpoint failed", recordError));
+			log.warn(`checkpoint of session ${sessionId} for submission ${submissionId} failed`, error);
+			await this.#markFailed(sessionId, submissionId).catch((markError: unknown) =>
+				log.warn(`recording the failed checkpoint of submission ${submissionId} failed`, markError),
+			);
+			await record(sessionId, { kind: "tether.checkpoint", data: { submissionId, error: message } }).catch(
+				(recordError: unknown) => log.warn("recording a failed checkpoint failed", recordError),
+			);
 		}
+	}
+
+	async #markFailed(sessionId: string, submissionId: string): Promise<void> {
+		const { store, engine, clock, ids } = this.#deps;
+		const entryId = await engine.submissionEntry(submissionId);
+		if (entryId === undefined) return;
+		await store
+			.addCheckpoint({
+				id: ids.next("cp"),
+				sessionId,
+				submissionId,
+				entryId,
+				snapshotId: null,
+				basisCheckpointId: null,
+				failed: true,
+				kind: "filesystem",
+				createdAt: clock.now(),
+			})
+			.catch((error: unknown) => {
+				// 同一轮的另一次调用已经记上了
+				if (!(error instanceof TetherError && error.code === "conflict")) throw error;
+			});
 	}
 
 	async #checkpoint(sessionId: string, submissionId: string): Promise<void> {
@@ -82,6 +114,8 @@ export class CheckpointService {
 			submissionId,
 			entryId,
 			snapshotId: start.snapshotId,
+			basisCheckpointId: start.basis,
+			failed: false,
 			kind: "filesystem",
 			createdAt: clock.now(),
 		};
@@ -95,7 +129,13 @@ export class CheckpointService {
 		}
 		await record(sessionId, {
 			kind: "tether.checkpoint",
-			data: { checkpointId: checkpoint.id, entryId, durationMs, ...(start.snapshotId === null && { template: true }) },
+			data: {
+				checkpointId: checkpoint.id,
+				entryId,
+				durationMs,
+				...(start.snapshotId === null && { template: true }),
+				...(start.basis !== null && { basisCheckpointId: start.basis }),
+			},
 		});
 	}
 
@@ -123,6 +163,8 @@ export class CheckpointService {
 				submissionId,
 				entryId: latest.id,
 				snapshotId,
+				basisCheckpointId: null,
+				failed: false,
 				kind: "filesystem",
 				createdAt: clock.now(),
 			};
@@ -162,7 +204,8 @@ export class CheckpointService {
 	/**
 	 * 存档所在的盘空闲比例低于下限时稀疏化，一张一张删，每删一张重新看空间，够了就停。顺序：
 	 * 最久没活动的会话先删；每个会话最新 KEEP_NEWEST_CHECKPOINTS 张不动；同一会话里先删序号（按条目从旧到新，0 起）
-	 * 不是 THIN_STRIDE 倍数的，再删其余的，都从旧到新。被分叉引用的、模板存档（不占空间）不删。
+	 * 不是 THIN_STRIDE 倍数的，再删其余的，都从旧到新。被分叉引用的、模板存档（不占空间）、和别的记录共用快照的、
+	 * 沿用别的存档或失败的记录都不删。
 	 * 只记日志：之后在那里分叉或恢复，会找到更早的一张，说明里列出没有发生的操作。
 	 */
 	async thin(): Promise<number> {
@@ -203,9 +246,16 @@ export class CheckpointService {
 			const strided = older.filter(({ index }) => index % THIN_STRIDE === 0);
 			ordered.push(...[...sparse, ...strided].map(({ checkpoint }) => checkpoint));
 		}
+		// 快照被几条记录共用（沙箱丢失的那一轮沿用上一张）时，删哪一条都省不出空间
+		const uses = new Map<string, number>();
+		for (const records of bySession.values()) {
+			for (const { snapshotId } of records) if (snapshotId !== null) uses.set(snapshotId, (uses.get(snapshotId) ?? 0) + 1);
+		}
 		const candidates: CheckpointRecord[] = [];
 		for (const checkpoint of ordered) {
-			if (checkpoint.snapshotId !== null && !(await store.checkpointReferenced(checkpoint.id))) candidates.push(checkpoint);
+			const { snapshotId } = checkpoint;
+			if (snapshotId === null || !holdsOwnContent(checkpoint) || (uses.get(snapshotId) ?? 0) > 1) continue;
+			if (!(await store.checkpointReferenced(checkpoint.id))) candidates.push(checkpoint);
 		}
 		return candidates;
 	}
@@ -232,25 +282,29 @@ export class CheckpointService {
 	 * - 还没有沙箱：工作区就是第一次工具调用时会建出来的那个，普通会话是模板（null），分叉会话是分叉选中的存档。
 	 *   这条记录也挡住了同一轮后面的调用：这一轮的工具调用建出沙箱之后，不能再在半轮的状态上存档。
 	 * - 沙箱丢了：下一次工具调用从 restorePoint 那张存档重建，这一轮开始时的工作区就是它，沿用它的快照（没有就是模板）。
+	 * 沿用时记下那条存档（basisCheckpointId）：这条记录的内容是那一刻的，查找和重建都跳过它、用那条。
 	 * - 创建中、已销毁：不记。
 	 */
 	async #roundStart(sessionId: string): Promise<RoundStart> {
 		const { store } = this.#deps;
 		const result = await this.#deps.sandboxes.snapshot(sessionId);
-		if ("snapshotId" in result) return { snapshotId: result.snapshotId, taken: true };
-		if (result.state === "absent") return { snapshotId: await this.#forkSnapshot(sessionId), taken: false };
-		if (result.state === "lost") {
-			const session = await store.getSession(sessionId);
-			const point = session ? await restorePoint(store, session) : undefined;
-			return { snapshotId: point?.snapshotId ?? null, taken: false };
-		}
+		if ("snapshotId" in result) return { snapshotId: result.snapshotId, taken: true, basis: null };
+		const session = await store.getSession(sessionId);
+		if (!session) return undefined;
+		const reuse = (checkpoint: CheckpointRecord | undefined): RoundStart => ({
+			snapshotId: checkpoint?.snapshotId ?? null,
+			taken: false,
+			basis: checkpoint?.id ?? null,
+		});
+		if (result.state === "absent") return reuse(await this.#forkCheckpoint(session));
+		if (result.state === "lost") return reuse(await restorePoint(store, session));
 		return undefined;
 	}
 
-	/** 分叉会话选中的存档的快照；不是分叉会话、存档是模板或已被清理时为 null。 */
-	async #forkSnapshot(sessionId: string): Promise<string | null> {
-		const checkpointId = (await this.#deps.store.getSession(sessionId))?.forkedFrom?.checkpointId;
-		if (checkpointId === undefined || checkpointId === null) return null;
-		return (await this.#deps.store.getCheckpoint(checkpointId))?.snapshotId ?? null;
+	/** 分叉会话选中的存档（还在的话）；不是分叉会话时 undefined。 */
+	async #forkCheckpoint(session: SessionRecord): Promise<CheckpointRecord | undefined> {
+		const checkpointId = session.forkedFrom?.checkpointId;
+		if (checkpointId === undefined || checkpointId === null) return undefined;
+		return this.#deps.store.getCheckpoint(checkpointId);
 	}
 }

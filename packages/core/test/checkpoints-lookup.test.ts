@@ -1,6 +1,6 @@
 import { MemoryAppStore, sampleCheckpoint, sampleSession } from "@tether/testkit";
 import { describe, expect, it } from "vitest";
-import { alignedEntry, findCheckpoint, missedCalls, type ReadEntries, type TranscriptEntry } from "../src/index.ts";
+import { alignedEntry, findCheckpoint, missedCalls, type ReadEntries, restorePoint, type TranscriptEntry } from "../src/index.ts";
 
 /** 一次执行完的工具调用：带调用的助手条目 + 结果条目，ID 分别是 at 和 at + 1。 */
 function ran(at: number, name: string, args: unknown): TranscriptEntry[] {
@@ -112,6 +112,33 @@ describe("findCheckpoint", () => {
 		expect(await alignedEntry(store, "ses_3", "5", found!)).toBe("4");
 	});
 
+	it("skips a record that reuses an earlier checkpoint's snapshot", async () => {
+		// ses_2 从 ses_1 的 25 分叉、选中 cp_a（21）；ses_2 的第一轮记录 cp_u 对齐到 30，内容却是 cp_a 那一刻
+		const store = await storeWith(
+			[{ id: "ses_1" }, { id: "ses_2", forkedFrom: { sessionId: "ses_1", entryId: "25" } }],
+			[["cp_a", "ses_1", "21"]],
+		);
+		await store.addCheckpoint(
+			sampleCheckpoint("cp_u", { sessionId: "ses_2", entryId: "30", snapshotId: "ses_1/cp_a", basisCheckpointId: "cp_a" }),
+		);
+		const read = reader({ ses_1: ran(22, "write", { path: "f2" }) });
+
+		// 在 ses_2 自己的分叉点 25 再分叉：cp_u 不能当成"25 之后、中间没改过的下一张"
+		const found = await findCheckpoint(store, "ses_2", "25", read);
+
+		expect(found?.id).toBe("cp_a");
+		expect(await alignedEntry(store, "ses_2", "25", found!)).toBe("21");
+		expect((await findCheckpoint(store, "ses_2", "40", read))?.id).toBe("cp_a");
+	});
+
+	it("skips a failed round's record", async () => {
+		const store = await storeWith([{ id: "ses_1" }], [["cp_a", "ses_1", "4"]]);
+		await store.addCheckpoint(sampleCheckpoint("cp_f", { entryId: "8", snapshotId: null, failed: true }));
+
+		expect((await findCheckpoint(store, "ses_1", "6", reader({})))?.id).toBe("cp_a");
+		expect((await findCheckpoint(store, "ses_1", "9", reader({})))?.id).toBe("cp_a");
+	});
+
 	it("returns undefined when no session on the chain has a checkpoint", async () => {
 		const store = await storeWith([{ id: "ses_1" }, { id: "ses_2", forkedFrom: { sessionId: "ses_1", entryId: "6" } }], []);
 
@@ -148,5 +175,15 @@ describe("missedCalls", () => {
 		expect(missedCalls(entries, "3", "4")).toEqual(["write: a"]);
 		expect(missedCalls(entries, "4", "9")).toEqual([]);
 		expect(missedCalls(entries, "1", "3")).toEqual([]);
+	});
+});
+
+describe("restorePoint", () => {
+	it("returns the latest checkpoint whose content is its own, skipping reused and failed records", async () => {
+		const store = await storeWith([{ id: "ses_1" }], [["cp_a", "ses_1", "4"]]);
+		await store.addCheckpoint(sampleCheckpoint("cp_r", { entryId: "8", snapshotId: "ses_1/cp_a", basisCheckpointId: "cp_a" }));
+		await store.addCheckpoint(sampleCheckpoint("cp_f", { entryId: "12", snapshotId: null, failed: true }));
+
+		expect((await restorePoint(store, (await store.getSession("ses_1"))!))?.id).toBe("cp_a");
 	});
 });

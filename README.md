@@ -196,6 +196,7 @@ TETHER_SANDBOX_RUNTIME=runsc npm run test:docker   # 可选：在 gVisor 下再�
 - `network: "egress"` 的沙箱能访问云厂商的元数据地址（例如阿里云的 `100.100.100.200`），拦截它需要宿主的防火墙规则，Tether 不改防火墙。部署在云主机上时请在宿主上自行拦截。
 - 文件浏览先把路径解析成真实路径、检查在 `/workspace` 下，再读取；沙箱里的进程在这两步之间把路径换成符号链接，理论上能让读取落到 `/workspace` 之外。读到的仍只是容器里的文件，不涉及宿主。
 - 丢失重建、重连的说明如果是在一轮运行中写下的，模型要到下一轮才看到；这一轮的工具结果已经反映了新环境。
+- 宿主重启后 loop 设备编号变了，启动停止的容器时要按原配置重建容器：`/workspace` 不受影响，容器层里的文件（`/tmp`、家目录、`apt install` 装的包）会丢，模型只收到"后台进程已结束"的说明。重建时 `docker run` 又失败的话，下一次工具调用会把它当成丢失，从最近的存档恢复，完好的镜像文件被删掉。
 - 运行中的容器被删掉后，要等下一次巡检（`TETHER_SWEEP_INTERVAL_SECONDS`）把它标成 `lost` 才会恢复；在这之前的工具调用失败，报 `sandbox_failed`。
 - 镜像模式下宿主上看不到工作区里的单个文件，要用 `tether files`、`tether cat` 或文件浏览 API。
 - 从 M2 升级、数据目录又在 XFS 上时，M2 建的会话工作区是目录，新代码按镜像模式找 `disk.img`。M3 不做迁移：升级前归档全部会话，或者设 `TETHER_WORKSPACE_STORAGE=directory`。

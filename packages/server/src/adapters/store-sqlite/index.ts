@@ -88,6 +88,8 @@ function toCheckpoint(row: Row): CheckpointRecord {
 		submissionId: text(row, "submission_id"),
 		entryId: String(row.entry_id),
 		snapshotId: optionalText(row, "snapshot_id") ?? null,
+		basisCheckpointId: optionalText(row, "basis_checkpoint_id") ?? null,
+		failed: row.failed === 1,
 		kind: text(row, "kind") as CheckpointRecord["kind"],
 		createdAt: text(row, "created_at"),
 	};
@@ -380,13 +382,15 @@ class SqliteAppStore implements AppStore {
 	async addCheckpoint(checkpoint: CheckpointRecord): Promise<void> {
 		try {
 			this.#run(
-				`INSERT INTO checkpoints (id, session_id, submission_id, entry_id, snapshot_id, kind, created_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				`INSERT INTO checkpoints (id, session_id, submission_id, entry_id, snapshot_id, basis_checkpoint_id, failed, kind, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				checkpoint.id,
 				checkpoint.sessionId,
 				checkpoint.submissionId,
 				Number(checkpoint.entryId),
 				checkpoint.snapshotId,
+				checkpoint.basisCheckpointId,
+				checkpoint.failed ? 1 : 0,
 				checkpoint.kind,
 				checkpoint.createdAt,
 			);

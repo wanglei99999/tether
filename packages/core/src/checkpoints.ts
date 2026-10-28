@@ -14,6 +14,14 @@ export type ReadEntries = (sessionId: string, afterEntryId: string, uptoEntryId:
 const num = (entryId: string): number => Number(entryId);
 
 /**
+ * 记录的内容就是它对齐的那一刻：不是沿用别的存档的快照（basisCheckpointId），也不是失败的那一轮。
+ * 查找存档、挑重建用的存档只看这种记录。
+ */
+export function holdsOwnContent(checkpoint: CheckpointRecord): boolean {
+	return checkpoint.basisCheckpointId === null && !checkpoint.failed;
+}
+
+/**
  * (after, upto] 区间内执行过的工具调用，按执行顺序。一次调用以它的结果条目为准：
  * 调用条目在区间前、结果在区间里，说明它是在区间里执行的。
  */
@@ -99,7 +107,7 @@ export async function findCheckpoint(
 	let level: string | undefined = sessionId;
 	let bound = atEntryId;
 	while (level !== undefined) {
-		const own = await store.listCheckpoints(level);
+		const own = (await store.listCheckpoints(level)).filter(holdsOwnContent);
 		if (bound === undefined) {
 			if (own.length > 0) return own.at(-1);
 		} else {
@@ -122,11 +130,11 @@ async function changedBetween(read: ReadEntries, sessionId: string, after: strin
 }
 
 /**
- * 沙箱丢失后从哪张存档重建：会话自己最新的一张；自己还没有的分叉会话用分叉选中的那张。
+ * 沙箱丢失后从哪张存档重建：会话自己最新的、内容是它自己的一张（holdsOwnContent）；自己还没有的分叉会话用分叉选中的那张。
  * 每轮存档在"这一轮开始时沙箱已丢失"时用同一张，两边必须一致。
  */
 export async function restorePoint(store: AppStore, session: SessionRecord): Promise<CheckpointRecord | undefined> {
-	const latest = (await store.listCheckpoints(session.id)).at(-1);
+	const latest = (await store.listCheckpoints(session.id)).filter(holdsOwnContent).at(-1);
 	if (latest !== undefined) return latest;
 	const checkpointId = session.forkedFrom?.checkpointId;
 	return checkpointId === undefined || checkpointId === null ? undefined : store.getCheckpoint(checkpointId);

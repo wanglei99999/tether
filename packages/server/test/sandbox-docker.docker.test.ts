@@ -238,6 +238,19 @@ for (const mode of ["image", "directory"] as const) {
 			expect(await sh(restored.sandboxId, "test -e /workspace/b.txt && echo yes || echo no")).toBe("no");
 		});
 
+		it("starts a container that a crash left paused in the middle of a snapshot", async () => {
+			// 存档到一半进程死了（或 unpause 失败）：容器停在 paused，docker start 会拒绝它
+			const { sandboxId } = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec() });
+			await sh(sandboxId, "echo kept > /workspace/k.txt");
+			await docker("pause", sandboxId);
+			expect(await made.provider.status(sandboxId)).toBe("stopped");
+
+			await made.provider.start(sandboxId);
+
+			expect(await made.provider.status(sandboxId)).toBe("running");
+			expect(await sh(sandboxId, "cat /workspace/k.txt")).toBe("kept");
+		});
+
 		it("takes a point-in-time snapshot while a background process keeps writing", async () => {
 			// Review Focus 1：进程先写 a 再写 b（各自原子改名），任何时刻都有 a - b 为 0 或 1。
 			// 逐个文件复制、又不暂停进程的存档会先拷 a、后拷到更新的 b，得到 b > a。

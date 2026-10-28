@@ -57,6 +57,10 @@ CREATE TABLE checkpoints (
 	submission_id  TEXT NOT NULL UNIQUE,
 	entry_id       INTEGER NOT NULL,
 	snapshot_id    TEXT,
+	-- 沿用了哪条存档的快照；内容是那一刻的，查找时跳过这条
+	basis_checkpoint_id  TEXT,
+	-- 这一轮的存档失败了，只挡住同一轮后面的调用
+	failed         INTEGER NOT NULL DEFAULT 0,
 	kind           TEXT NOT NULL,
 	created_at     TEXT NOT NULL
 );

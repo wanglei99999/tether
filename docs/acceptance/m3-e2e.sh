@@ -47,6 +47,8 @@ T files "$A"
 
 step "tether checkpoints：3 张，第一张是模板"
 T checkpoints "$A"
+# 第三轮开始前的存档（内容 f1、f2）：丢失恢复必须从它算起，说明里才会列出 f3
+CP3=$(T checkpoints "$A" | tail -n 1 | cut -d' ' -f1)
 
 step "在第三条消息处分叉：fork 里只有 f1、f2"
 OUT=$(T session fork "$A" "$(entry "$A" third)")
@@ -71,6 +73,8 @@ T sandbox "$A"
 T send "$A" "fourth" --follow
 T files "$A"
 notes "$A" | tail -n 4
+# 第四轮开始时沙箱已丢失，这一轮的记录沿用第三轮的快照；恢复要用第三轮那条，不能用这条（否则说明里什么都不缺）
+notes "$A" | grep '"reason":"recovered"' | tail -n 1 | grep -q "\"checkpointId\":\"$CP3\"" && echo "restored from $CP3" || { echo "FAIL: not restored from $CP3"; exit 1; }
 
 step "重启：停止 60 秒、删除 120 秒、巡检 5 秒"
 stop

@@ -85,8 +85,11 @@ describe("CheckpointService.onRunStart", () => {
 		await checkpoints.onRunStart("ses_2", submissionId);
 
 		const [checkpoint] = await store.listCheckpoints("ses_2");
-		expect(checkpoint).toMatchObject({ submissionId, snapshotId: "ses_1/src" });
-		expect(checkpointNotes()).toEqual([{ checkpointId: checkpoint!.id, entryId: checkpoint!.entryId, durationMs: 0 }]);
+		// 内容是分叉选中的那张存档的，不是这一轮用户条目那一刻的：记下它，查找时用它，不用这条
+		expect(checkpoint).toMatchObject({ submissionId, snapshotId: "ses_1/src", basisCheckpointId: "cp_src" });
+		expect(checkpointNotes()).toEqual([
+			{ checkpointId: checkpoint!.id, entryId: checkpoint!.entryId, durationMs: 0, basisCheckpointId: "cp_src" },
+		]);
 	});
 
 	it("points the round at the latest snapshot when the round starts with the sandbox lost", async () => {
@@ -103,7 +106,12 @@ describe("CheckpointService.onRunStart", () => {
 		await checkpoints.onRunStart("ses_1", second.submissionId);
 
 		const [a, b] = await store.listCheckpoints("ses_1");
-		expect(b).toMatchObject({ submissionId: second.submissionId, entryId: second.entryId, snapshotId: a!.snapshotId });
+		expect(b).toMatchObject({
+			submissionId: second.submissionId,
+			entryId: second.entryId,
+			snapshotId: a!.snapshotId,
+			basisCheckpointId: a!.id,
+		});
 		expect(provider.calls.filter((call) => call === "snapshot")).toHaveLength(1);
 	});
 
@@ -131,17 +139,33 @@ describe("CheckpointService.onRunStart", () => {
 		expect([...provider.snapshots.keys()]).toEqual([recorded[0]!.snapshotId]);
 	});
 
-	it("records a client-only entry and does not throw when the snapshot fails", async () => {
+	it("records a failed round and does not throw when the snapshot fails", async () => {
 		const { store, provider, sandboxes, checkpoints, submit, checkpointNotes, warnings } = await setUp();
 		await sandboxes.ensureSandbox("ses_1");
-		const { submissionId } = await submit("go");
+		const { submissionId, entryId } = await submit("go");
 		provider.failSnapshot = true;
 
 		await expect(checkpoints.onRunStart("ses_1", submissionId)).resolves.toBeUndefined();
 
-		expect(await store.listCheckpoints("ses_1")).toEqual([]);
+		const [record] = await store.listCheckpoints("ses_1");
+		expect(record).toMatchObject({ submissionId, entryId, snapshotId: null, failed: true });
 		expect(checkpointNotes()).toEqual([{ submissionId, error: expect.stringContaining("cannot snapshot") }]);
 		expect(warnings.some((w) => w.includes(submissionId))).toBe(true);
+	});
+
+	it("does not snapshot later in a round whose checkpoint failed", async () => {
+		// 钩子在这一轮每次请求模型前都会调用；第一次失败后再存，存下的是这一轮工具改过的半轮状态
+		const { store, provider, sandboxes, checkpoints, submit } = await setUp();
+		await sandboxes.ensureSandbox("ses_1");
+		const { submissionId } = await submit("go");
+		provider.failSnapshot = true;
+		await checkpoints.onRunStart("ses_1", submissionId);
+		provider.failSnapshot = false;
+
+		await checkpoints.onRunStart("ses_1", submissionId);
+
+		expect(provider.calls.filter((call) => call === "snapshot")).toHaveLength(1);
+		expect(await store.listCheckpoints("ses_1")).toEqual([expect.objectContaining({ failed: true })]);
 	});
 });
 
@@ -349,5 +373,19 @@ describe("CheckpointService cleanup", () => {
 
 		// 可删的是最新 5 张之外的 0、1、2：1 被分叉引用，2 是模板（删了不省空间，还丢了对齐信息）
 		expect(deleted).toEqual(["s/0"]);
+	});
+
+	it("never thins a checkpoint whose snapshot another record shares", async () => {
+		// cp_1 是沙箱丢失的那一轮，沿用 cp_0 的快照：删哪一条都省不出空间
+		const checkpoints = Array.from(
+			{ length: 8 },
+			(_, i) => [`cp_${i}`, "ses_1", String(i + 1), i === 1 ? "s/0" : `s/${i}`] as [string, string, string, string | null],
+		);
+		const { service, deleted, remaining } = await cleanup([{ id: "ses_1" }], checkpoints);
+
+		await service.thin();
+
+		expect(deleted).toEqual(["s/2"]);
+		expect(await remaining()).toEqual(expect.arrayContaining(["cp_0", "cp_1"]));
 	});
 });

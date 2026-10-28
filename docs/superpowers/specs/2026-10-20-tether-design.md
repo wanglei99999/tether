@@ -238,6 +238,8 @@ checkpoints
   submissionId                触发这一轮的提交（唯一，同一轮只存一张）；闲置删除前的最终存档是 final:<会话>:<沙箱创建时间>
   entryId                     引擎 transcript 里的条目 ID，检查点对齐的位置（全局递增的整数，按数值比较）
   snapshotId                  后端的快照；null 表示模板（这一轮开始时还没有沙箱）
+  basisCheckpointId           沿用了哪条检查点的快照（沙箱丢失时开始的一轮、分叉会话的第一轮）：内容是那一刻的，查找时跳过这条
+  failed                      这一轮的快照失败了：只挡住同一轮后面的调用，查找时跳过
   kind                        filesystem | full（含内存）
   createdAt
 

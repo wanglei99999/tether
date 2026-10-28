@@ -135,6 +135,13 @@ export interface CheckpointRecord {
 	 * 几条记录可以指向同一张快照：沙箱丢失时开始的一轮，指向重建要用的那张。
 	 */
 	snapshotId: string | null;
+	/**
+	 * 这条记录沿用了哪条存档的快照（沙箱丢失时开始的一轮、分叉会话的第一轮）：内容是那条存档那一刻的，
+	 * 不是这一轮用户条目那一刻的。这种记录只用来挡住同一轮的重复存档，查找存档时跳过，用它指向的那条。
+	 */
+	basisCheckpointId: string | null;
+	/** 这一轮的存档失败了：只用来挡住同一轮后面的调用（免得在半轮的状态上再存），查找存档时跳过。 */
+	failed: boolean;
 	kind: "filesystem";
 	createdAt: string;
 }
