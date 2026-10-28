@@ -90,19 +90,27 @@ export class CheckpointService {
 
 	/**
 	 * - 沙箱在（运行或停止）：存一张新快照。
-	 * - 还没有沙箱：工作区就是模板，记 null。这条记录也挡住了同一轮后面的调用：这一轮的工具调用建出沙箱之后，
-	 *   不能再在半轮的状态上存档。
-	 * - 沙箱丢了：下一次工具调用从最近的存档重建，这一轮开始时的工作区就是它，沿用它的快照（没有就是模板）。
+	 * - 还没有沙箱：工作区就是第一次工具调用时会建出来的那个，普通会话是模板（null），分叉会话是分叉选中的存档。
+	 *   这条记录也挡住了同一轮后面的调用：这一轮的工具调用建出沙箱之后，不能再在半轮的状态上存档。
+	 * - 沙箱丢了：下一次工具调用从最近的存档重建，这一轮开始时的工作区就是它，沿用它的快照
+	 *   （自己没有存档的分叉会话用分叉选中的那张，都没有就是模板）。
 	 * - 创建中、已销毁：不记。
 	 */
 	async #roundStart(sessionId: string): Promise<RoundStart> {
 		const result = await this.#deps.sandboxes.snapshot(sessionId);
 		if ("snapshotId" in result) return { snapshotId: result.snapshotId, taken: true };
-		if (result.state === "absent") return { snapshotId: null, taken: false };
+		if (result.state === "absent") return { snapshotId: await this.#forkSnapshot(sessionId), taken: false };
 		if (result.state === "lost") {
 			const latest = (await this.#deps.store.listCheckpoints(sessionId)).at(-1);
-			return { snapshotId: latest?.snapshotId ?? null, taken: false };
+			return { snapshotId: latest ? latest.snapshotId : await this.#forkSnapshot(sessionId), taken: false };
 		}
 		return undefined;
+	}
+
+	/** 分叉会话选中的存档的快照；不是分叉会话、存档是模板或已被清理时为 null。 */
+	async #forkSnapshot(sessionId: string): Promise<string | null> {
+		const checkpointId = (await this.#deps.store.getSession(sessionId))?.forkedFrom?.checkpointId;
+		if (checkpointId === undefined || checkpointId === null) return null;
+		return (await this.#deps.store.getCheckpoint(checkpointId))?.snapshotId ?? null;
 	}
 }

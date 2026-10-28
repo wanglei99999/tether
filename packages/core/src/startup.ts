@@ -32,31 +32,45 @@ const SETTLED: readonly SandboxBinding["state"][] = ["lost", "destroyed"];
 
 /**
  * 启动恢复，顺序照设计文档 §4.5：
- * 1. 给"应用表有记录、引擎里没有会话"的半成品补建引擎会话，补不了的标记 failed；
+ * 1. 给"应用表有记录、引擎里没有会话"的半成品补建引擎会话（分叉会话补的是引擎分叉），补不了的标记 failed；
  * 2. 与 Docker 对账：按实际状态修正绑定，容器不在的标记 lost，没有绑定的容器删除；
  * 3. 引擎 resume()，继续崩溃前没跑完的提交。
  * 第 2 步必须在第 3 步之前，否则续跑的工具调用会拿到过期的沙箱状态。
  */
 export async function recover(deps: RecoverDeps): Promise<RecoverResult> {
-	const repairedSessions = await repairSessions(deps);
+	const repaired = await repairSessions(deps);
 	const { lostBindings, removedOrphans, notes } = await reconcileSandboxes(deps);
 	deps.engine.resume();
-	return { repairedSessions, lostBindings, removedOrphans, notes };
+	return { repairedSessions: repaired.count, lostBindings, removedOrphans, notes: [...repaired.notes, ...notes] };
 }
 
-async function repairSessions({ store, sessions, log }: RecoverDeps): Promise<number> {
-	let repaired = 0;
+/** 分叉会话补上引擎分叉后，分叉时没来得及写的说明一并交出去。 */
+async function repairSessions({
+	store,
+	sessions,
+	log,
+}: RecoverDeps): Promise<{ count: number; notes: RecoverResult["notes"] }> {
+	let count = 0;
+	const notes: RecoverResult["notes"] = [];
 	for (const session of await store.sessionsWithoutEngine()) {
 		if (session.status === "failed") continue;
+		let engineSessionId: string;
 		try {
-			await sessions.attachEngine(session);
-			repaired++;
+			engineSessionId = await sessions.attachEngine(session);
+			count++;
 		} catch (error) {
 			await store.updateSession(session.id, { status: "failed" });
 			log.warn(`session ${session.id} marked failed: its engine session cannot be created`, error);
+			continue;
+		}
+		if (session.forkedFrom === null) continue;
+		try {
+			notes.push({ sessionId: session.id, note: await sessions.forkNote({ ...session, engineSessionId }) });
+		} catch (error) {
+			log.warn(`the fork note of session ${session.id} cannot be prepared`, error);
 		}
 	}
-	return repaired;
+	return { count, notes };
 }
 
 async function reconcileSandboxes({

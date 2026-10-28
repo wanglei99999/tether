@@ -1,4 +1,4 @@
-import { MemoryAppStore, sampleBinding, sampleSpec } from "@tether/testkit";
+import { MemoryAppStore, sampleBinding, sampleSession, sampleSpec } from "@tether/testkit";
 import { describe, expect, it } from "vitest";
 import { AgentService, BUILTIN_TOOLS, NOTES, recover, SessionService } from "../src/index.ts";
 import { FakeClock, FakeEngine, FakeIds, FakeProvider, FakeSandboxes } from "./fakes.ts";
@@ -55,9 +55,22 @@ async function setUp() {
 		return session.id;
 	}
 
+	/** 分叉做到一半：新会话的记录写了，引擎还没分叉。源会话有两条记录（用户、回答），在回答处分叉。 */
+	async function halfCreatedFork(): Promise<{ source: string; fork: string }> {
+		const source = await sessions.create({ agentId: agent.id });
+		await sessions.sendMessage(source.id, { content: "hi", requestId: "r" });
+		const entryId = engine.push(source.engineSessionId!, { kind: "pi.assistant", role: "assistant", text: "hello" });
+		const fork = sampleSession("ses_fork", {
+			agentId: agent.id,
+			forkedFrom: { sessionId: source.id, entryId, checkpointId: null },
+		});
+		await store.createSession(fork);
+		return { source: source.id, fork: fork.id };
+	}
+
 	order.length = 0;
 	const run = () => recover({ store, engine, provider, sessions, log });
-	return { order, store, engine, provider, warnings, halfCreatedSession, stoppedWhileDown, run };
+	return { order, store, engine, provider, warnings, halfCreatedSession, halfCreatedFork, stoppedWhileDown, run };
 }
 
 describe("recover", () => {
@@ -77,6 +90,33 @@ describe("recover", () => {
 			"engine.createSession",
 			"engine.createSession",
 			"engine.resume",
+		]);
+	});
+
+	it("repairs a half-created fork by forking the engine session, not creating a new one", async () => {
+		const { store, engine, halfCreatedFork, run } = await setUp();
+		const { source, fork } = await halfCreatedFork();
+		const sourceEngine = (await store.getSession(source))!.engineSessionId!;
+		engine.created.length = 0;
+
+		const result = await run();
+
+		expect(result.repairedSessions).toBe(1);
+		expect(engine.created).toEqual([]);
+		expect(engine.forks).toEqual([{ engineSessionId: sourceEngine, entryId: "2" }]);
+		const repaired = await store.getSession(fork);
+		expect(repaired?.engineSessionId).toBe(`eng_${engine.forks.length + 1}`);
+		// 说明不在 recover 里写（resume 之前写引擎会提前续跑），交给组装层
+		expect(engine.appended).toEqual([]);
+		expect(result.notes).toEqual([
+			{
+				sessionId: fork,
+				note: {
+					kind: "tether.fork",
+					data: { sessionId: source, entryId: "2", checkpointId: null, missed: 0 },
+					modelText: NOTES.forkFresh,
+				},
+			},
 		]);
 	});
 

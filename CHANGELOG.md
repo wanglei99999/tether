@@ -16,6 +16,8 @@ Tether 还没有发布版本号，按里程碑记录。每个里程碑合进 `ma
 
 - `sandbox.resources.diskMb` 在镜像模式下生效：镜像的大小就是工作区的磁盘上限，写满时工具得到 "No space left on device"，宿主盘不受影响。最小 300（`mkfs.xfs` 的下限），小于它在创建 agent 版本时报 `invalid_request`。目录模式下仍然拒绝这个字段。
 - 每轮存档：`checkpointPolicy: "perRun"` 可以用了。用户每发一条消息、模型开始干活之前，给工作区存一张档，对齐到这条消息的条目；同一轮只存一次，重试和崩溃恢复不会重复存。会话还没有沙箱时只记一条"模板"存档，不复制任何东西。会话记录里每次存档有一条客户端可见的 `tether.checkpoint`（`data.checkpointId`、`entryId`、`durationMs`；模板存档带 `template: true`）。存档失败不打断这一轮，`tether.checkpoint` 里带 `error`。
+- 会话分叉：`POST /v1/sessions/:id/fork`（body `{ entryId }`）、SDK `sessions.fork`、CLI `tether session fork <会话> <条目>`。新会话用同一个 agent 版本和变量，对话到这一条为止，原会话不变。工作区取自这一刻最近的存档：分叉点之后的下一张存档之前没有执行过 `write`、`edit`、`bash` 就用它，否则用分叉点之前最近的一张；自己没有就沿分叉来源往上找。新会话里有一条模型可见的 `tether.fork` 说明：工作区已还原（进程不在）；存档早于分叉点时列出中间没有发生的操作，最多 20 条；找不到存档时说明工作区是模板。沙箱仍在第一次工具调用时创建，从存档建的不再执行 `setup`。条目不在会话里报 `invalid_request`，已归档的会话报 `conflict`。
+- 列出存档：`GET /v1/sessions/:id/checkpoints`、SDK `sessions.checkpoints`、CLI `tether checkpoints <会话>`，从旧到新，模板存档的 `snapshotId` 为 `null`。
 - 工作区快照：运行中的沙箱先 `docker pause` 再复制，存下的是暂停那一刻的一致状态，之后照常运行；后台进程会被冻结约 0.3 秒。快照只含 `/workspace`，不含进程和内存。镜像模式克隆 `disk.img`，目录模式用 `rsync --link-dest`（主机上需要 `rsync`）。快照在 `<数据目录>/checkpoints/<会话>/`。
 - 配置 `TETHER_WORKSPACE_STORAGE`（`auto`、`image`、`directory`，默认 `auto`）和 `TETHER_DEFAULT_DISK_MB`（没填 `diskMb` 时镜像的大小，默认 10240，镜像是稀疏文件，不预占）。存档目录固定为 `<数据目录>/checkpoints`，必须和 `workspaces/` 在同一个文件系统上。
 

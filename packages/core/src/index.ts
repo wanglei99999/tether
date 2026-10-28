@@ -1,3 +1,4 @@
+export * from "./checkpoints.ts";
 export * from "./env.ts";
 export * from "./errors.ts";
 export * from "./events.ts";

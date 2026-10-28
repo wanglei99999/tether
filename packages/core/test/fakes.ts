@@ -11,6 +11,7 @@ import {
 	type SandboxProvider,
 	TetherError,
 	type TetherEnv,
+	type TranscriptEntry,
 } from "../src/index.ts";
 
 export class FakeClock implements Clock {
@@ -67,10 +68,24 @@ export class FakeEngine implements AgentEngine {
 	/** 条目 ID 和 pi 一样在整个引擎里递增；每次提交占一个（它的用户条目）。 */
 	#entries = 0;
 	readonly #submissionEntries = new Map<string, string>();
+	/** 每个引擎会话的记录，从旧到新；分叉出来的会话复制分叉点之前的部分。 */
+	readonly logs = new Map<string, TranscriptEntry[]>();
+	/** 往会话记录末尾加一条，返回它的 ID。 */
+	push(engineSessionId: string, entry: Omit<TranscriptEntry, "id">): string {
+		const id = String(++this.#entries);
+		this.logs.set(engineSessionId, [...(this.logs.get(engineSessionId) ?? []), { id, ...entry }]);
+		return id;
+	}
+	/** 一次执行完的工具调用：一条带调用的助手条目加一条结果，返回结果条目的 ID。 */
+	ran(engineSessionId: string, name: string, args: unknown): string {
+		const callId = `call_${this.#entries + 1}`;
+		this.push(engineSessionId, { kind: "pi.assistant", role: "assistant", toolCalls: [{ id: callId, name, args }] });
+		return this.push(engineSessionId, { kind: "pi.tool-result", role: "tool", toolResult: { callId, isError: false, text: "" } });
+	}
 	async submit(engineSessionId: string, input: { content: string; requestId: string }) {
 		this.submitted.push({ engineSessionId, ...input });
 		const submissionId = `sub_${this.submitted.length}`;
-		this.#submissionEntries.set(submissionId, String(++this.#entries));
+		this.#submissionEntries.set(submissionId, this.push(engineSessionId, { kind: "pi.user", role: "user", text: input.content }));
 		return { submissionId };
 	}
 	async submissionEntry(submissionId: string): Promise<string | undefined> {
@@ -80,8 +95,13 @@ export class FakeEngine implements AgentEngine {
 	}
 	readonly forks: { engineSessionId: string; entryId: string }[] = [];
 	async fork(engineSessionId: string, entryId: string): Promise<string> {
+		const log = this.logs.get(engineSessionId) ?? [];
+		const at = log.findIndex((entry) => entry.id === entryId);
+		if (at < 0) throw new TetherError("invalid_request", `entry ${entryId} is not in ${engineSessionId}`);
 		this.forks.push({ engineSessionId, entryId });
-		return `eng_${++this.#sessions}`;
+		const forked = `eng_${++this.#sessions}`;
+		this.logs.set(forked, log.slice(0, at + 1));
+		return forked;
 	}
 	async waitSubmission() {
 		return { status: "done" as const };
@@ -90,10 +110,18 @@ export class FakeEngine implements AgentEngine {
 	async abort(engineSessionId: string): Promise<void> {
 		this.aborted.push(engineSessionId);
 	}
-	async transcript() {
-		return { items: [] };
+	/** 和 pi 适配器一样：新的在前，游标是上一页最后一条的 ID。 */
+	async transcript(engineSessionId: string, page: { limit: number; before?: string }) {
+		const newest = [...(this.logs.get(engineSessionId) ?? [])].reverse();
+		const from = page.before === undefined ? newest : newest.filter((entry) => Number(entry.id) < Number(page.before));
+		const items = from.slice(0, page.limit);
+		return from.length > page.limit ? { items, next: items.at(-1)!.id } : { items };
 	}
-	async appendEntry(): Promise<void> {}
+	readonly appended: { engineSessionId: string; kind: string; data: unknown; modelText?: string }[] = [];
+	async appendEntry(engineSessionId: string, entry: { kind: `tether.${string}`; data: unknown; modelText?: string }) {
+		this.appended.push({ engineSessionId, ...entry });
+		this.push(engineSessionId, { kind: entry.kind, data: entry.data });
+	}
 	async subscribe() {
 		return { stop: async () => {} };
 	}

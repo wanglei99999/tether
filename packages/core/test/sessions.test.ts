@@ -1,6 +1,6 @@
-import { MemoryAppStore, sampleSpec } from "@tether/testkit";
+import { MemoryAppStore, sampleCheckpoint, sampleSpec } from "@tether/testkit";
 import { describe, expect, it } from "vitest";
-import { AgentService, BUILTIN_TOOLS, SessionService } from "../src/index.ts";
+import { AgentService, BUILTIN_TOOLS, NOTES, SessionService } from "../src/index.ts";
 import { FakeClock, FakeEngine, FakeIds, FakeSandboxes } from "./fakes.ts";
 
 async function setUp() {
@@ -178,5 +178,101 @@ describe("SessionService", () => {
 		});
 		await expect(sessions.get("ses_missing")).rejects.toMatchObject({ code: "not_found" });
 		await expect(sessions.transcript("ses_missing", { limit: 10 })).rejects.toMatchObject({ code: "not_found" });
+	});
+});
+
+describe("SessionService.fork", () => {
+	/**
+	 * 两轮：第一轮写 f1，第二轮写 f2。条目 1 用户，2-3 write f1，4 回答，5 用户，6-7 write f2，8 回答。
+	 * 第二轮的存档对齐到 5，内容是 {f1}。
+	 */
+	async function twoRounds() {
+		const made = await setUp();
+		const { engine, sessions, store, agentId } = made;
+		const source = await sessions.create({ agentId, variables: { REPO_URL: "r" } });
+		await sessions.sendMessage(source.id, { content: "make f1", requestId: "r1" });
+		engine.ran("eng_1", "write", { path: "f1" });
+		engine.push("eng_1", { kind: "pi.assistant", role: "assistant", text: "done" });
+		await sessions.sendMessage(source.id, { content: "make f2", requestId: "r2" });
+		engine.ran("eng_1", "write", { path: "f2" });
+		engine.push("eng_1", { kind: "pi.assistant", role: "assistant", text: "done" });
+		const addCheckpoint = (id: string, entryId: string) =>
+			store.addCheckpoint(sampleCheckpoint(id, { sessionId: source.id, entryId, snapshotId: `${source.id}/${id}` }));
+		return { ...made, source, addCheckpoint };
+	}
+
+	it("forks at an entry with an aligned checkpoint and tells the model nothing was missed", async () => {
+		const { engine, sessions, store, source, addCheckpoint } = await twoRounds();
+		await addCheckpoint("cp_r2", "5");
+
+		// 在第二条消息之前分叉：4 和 5 之间没有改过工作区，第二轮的存档就是 4 那一刻
+		const fork = await sessions.fork(source.id, "4");
+
+		expect(fork).toMatchObject({
+			agentId: source.agentId,
+			agentVersion: source.agentVersion,
+			variables: { REPO_URL: "r" },
+			status: "active",
+			forkedFrom: { sessionId: source.id, entryId: "4", checkpointId: "cp_r2" },
+			engineSessionId: "eng_2",
+		});
+		expect(fork.id).not.toBe(source.id);
+		expect(await store.getSession(fork.id)).toEqual(fork);
+		expect(engine.forks).toEqual([{ engineSessionId: "eng_1", entryId: "4" }]);
+		expect(engine.appended).toEqual([
+			{
+				engineSessionId: "eng_2",
+				kind: "tether.fork",
+				data: { sessionId: source.id, entryId: "4", checkpointId: "cp_r2", missed: 0 },
+				modelText: NOTES.forked([]),
+			},
+		]);
+		expect(engine.created).toHaveLength(1);
+	});
+
+	it("forks at an entry after the checkpoint and lists the calls that did not happen", async () => {
+		const { engine, sessions, source, addCheckpoint } = await twoRounds();
+		await addCheckpoint("cp_r1", "1");
+		await addCheckpoint("cp_r2", "5");
+
+		// 在 write f2 之后分叉：第二轮的存档里没有 f2，下一张又不存在
+		const fork = await sessions.fork(source.id, "8");
+
+		expect(fork.forkedFrom).toEqual({ sessionId: source.id, entryId: "8", checkpointId: "cp_r2" });
+		expect(engine.appended[0]).toMatchObject({ data: { missed: 1 }, modelText: NOTES.forked(["write: f2"]) });
+	});
+
+	it("forks without any checkpoint and tells the model the workspace is fresh", async () => {
+		const { engine, sessions, source } = await twoRounds();
+
+		const fork = await sessions.fork(source.id, "8");
+
+		expect(fork.forkedFrom).toEqual({ sessionId: source.id, entryId: "8", checkpointId: null });
+		expect(engine.appended[0]).toMatchObject({ kind: "tether.fork", modelText: NOTES.forkFresh });
+	});
+
+	it("rejects forking an archived session with conflict", async () => {
+		const { sessions, source } = await twoRounds();
+		await sessions.archive(source.id);
+
+		await expect(sessions.fork(source.id, "4")).rejects.toMatchObject({ code: "conflict" });
+	});
+
+	it("rejects an entry that is not in the session without writing a session", async () => {
+		const { sessions, source } = await twoRounds();
+
+		for (const entryId of ["99", "abc", ""]) {
+			await expect(sessions.fork(source.id, entryId), entryId).rejects.toMatchObject({ code: "invalid_request" });
+		}
+		expect((await sessions.list({ limit: 10 })).items).toHaveLength(1);
+	});
+
+	it("lists a session's checkpoints oldest first", async () => {
+		const { sessions, source, addCheckpoint } = await twoRounds();
+		await addCheckpoint("cp_r2", "5");
+		await addCheckpoint("cp_r1", "1");
+
+		expect((await sessions.checkpoints(source.id)).map((c) => c.id)).toEqual(["cp_r1", "cp_r2"]);
+		await expect(sessions.checkpoints("ses_missing")).rejects.toMatchObject({ code: "not_found" });
 	});
 });

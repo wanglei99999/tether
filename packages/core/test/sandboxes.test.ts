@@ -1,4 +1,4 @@
-import { MemoryAppStore, sampleAgent, sampleSession, sampleSpec } from "@tether/testkit";
+import { MemoryAppStore, sampleAgent, sampleCheckpoint, sampleSession, sampleSpec } from "@tether/testkit";
 import { describe, expect, it } from "vitest";
 import {
 	type BindingPatch,
@@ -876,5 +876,61 @@ describe("SandboxService.connect", () => {
 		await store.updateBinding("ses_1", { state: "lost" }, { state: "stopped" });
 		await expect(sandboxes.connect("ses_1")).rejects.toMatchObject({ code: "conflict" });
 		expect(provider.fenced).toEqual([]);
+	});
+});
+
+describe("SandboxService for a forked session", () => {
+	/** ses_2 从 ses_1 的条目 3 分叉，选中存档 checkpointId；snapshotId 给了就让后端里有这张快照。 */
+	async function forked(checkpointId: string | null, snapshotId?: string | null) {
+		const made = await setUp(["git clone \"$REPO_URL\" ."], { REPO_URL: "r" });
+		await made.engine.createSession({ model: sampleSpec().model, instructions: "", tools: [], cwd: "/workspace" });
+		await made.store.createSession(
+			sampleSession("ses_2", {
+				engineSessionId: "eng_2",
+				variables: { REPO_URL: "r" },
+				forkedFrom: { sessionId: "ses_1", entryId: "3", checkpointId },
+			}),
+		);
+		if (checkpointId !== null && snapshotId !== undefined) {
+			await made.store.addCheckpoint(sampleCheckpoint(checkpointId, { snapshotId }));
+			if (snapshotId !== null) made.provider.snapshots.set(snapshotId, { sandboxId: "sbx_old", partial: false });
+		}
+		return made;
+	}
+
+	it("creates a forked session's sandbox from its checkpoint without running setup", async () => {
+		const { provider, exec, store, sandboxes, recorded, notes } = await forked("cp_1", "ses_1/aaaa");
+
+		const binding = await sandboxes.ensureSandbox("ses_2");
+
+		expect(binding.state).toBe("running");
+		expect(provider.calls.filter((call) => call.startsWith("create"))).toEqual(["create-from"]);
+		expect(provider.containers.get(binding.sandboxId)?.from).toBe("ses_1/aaaa");
+		expect(exec.calls).toEqual([]);
+		expect(recorded).toEqual([{ sessionId: "ses_2", kind: "tether.sandbox", state: "running", reason: "restored" }]);
+		// 分叉时已经告诉过模型，这里不再写
+		expect(notes.filter((note) => note.modelText !== undefined)).toEqual([]);
+		expect((await store.getBinding("ses_2"))?.state).toBe("running");
+	});
+
+	it("falls back to the template and tells the model when the fork's checkpoint is gone", async () => {
+		const { provider, exec, sandboxes, notes } = await forked("cp_gone");
+
+		await sandboxes.ensureSandbox("ses_2");
+
+		expect(provider.calls.filter((call) => call.startsWith("create"))).toEqual(["create"]);
+		expect(exec.calls.map((call) => call.command)).toEqual(['git clone "$REPO_URL" .']);
+		expect(notes.filter((note) => note.modelText !== undefined).map((note) => note.modelText)).toEqual([NOTES.forkFresh]);
+	});
+
+	it("creates from the template and runs setup for a template checkpoint, without a note", async () => {
+		// 存档是模板（这一轮开始时还没有沙箱）：按模板新建就是精确的
+		const { provider, exec, sandboxes, notes } = await forked("cp_1", null);
+
+		await sandboxes.ensureSandbox("ses_2");
+
+		expect(provider.calls.filter((call) => call.startsWith("create"))).toEqual(["create"]);
+		expect(exec.calls).toHaveLength(1);
+		expect(notes.filter((note) => note.modelText !== undefined)).toEqual([]);
 	});
 });

@@ -133,6 +133,37 @@ describe("createTether on docker", () => {
 		await shutdown(tether);
 	});
 
+	it("forks a session and the fork sees the files as of the fork point", async () => {
+		const config = newConfig();
+		const write = (name: string): ScriptStep => ({ toolCall: { name: "bash", args: { command: `echo ${name} > ${name}.txt` } } });
+		const script: ScriptStep[] = [write("f1"), { text: "one" }, write("f2"), { text: "two" }, write("f3"), { text: "three" }];
+		const tether = await open(config, [...script, { toolCall: { name: "bash", args: { command: "ls" } } }, { text: "listed" }]);
+		const { agents, sessions, engine } = tether.services;
+		const { agent } = await agents.create({ name: "fork", spec: { ...bashSpec(), checkpointPolicy: "perRun" } });
+		const source = await sessions.create({ agentId: agent.id });
+		for (const [i, content] of ["first", "second", "third"].entries()) {
+			await engine.waitSubmission((await sessions.sendMessage(source.id, { content, requestId: `r${i}` })).submissionId);
+		}
+		const third = (await sessions.transcript(source.id, { limit: 50 })).items.find((e) => e.text === "third")!;
+
+		// 在第三条消息处分叉：第三轮的存档就对齐在这里，内容是 f1、f2
+		const fork = await sessions.fork(source.id, third.id);
+		await engine.waitSubmission((await sessions.sendMessage(fork.id, { content: "what is here", requestId: "f" })).submissionId);
+
+		const checkpoint = (await tether.services.store.listCheckpoints(source.id)).at(-1)!;
+		expect(fork.forkedFrom).toEqual({ sessionId: source.id, entryId: third.id, checkpointId: checkpoint.id });
+		const items = (await sessions.transcript(fork.id, { limit: 50 })).items;
+		expect(items.find((e) => e.kind === "tether.fork")).toMatchObject({ data: { missed: 0 } });
+		// 新的在前：第一条工具结果是分叉会话里的 ls
+		const listed = items.find((e) => e.role === "tool")?.toolResult?.text ?? "";
+		expect(listed).toContain("f2.txt");
+		expect(listed).not.toContain("f3.txt");
+		const files = (sid: string) => ["f1", "f2", "f3"].filter((f) => existsSync(join(config.workspaceRoot, sid, `${f}.txt`)));
+		expect(files(fork.id)).toEqual(["f1", "f2"]);
+		expect(files(source.id)).toEqual(["f1", "f2", "f3"]);
+		await shutdown(tether);
+	});
+
 	it("gives two sessions two containers", async () => {
 		const config = newConfig();
 		const write = (text: string): ScriptStep => ({ toolCall: { name: "bash", args: { command: `echo ${text} > who.txt` } } });

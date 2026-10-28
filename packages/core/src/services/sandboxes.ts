@@ -1,7 +1,7 @@
 import type { DirEntry, ExecResult, TetherEnv } from "../env.ts";
 import { TetherError } from "../errors.ts";
 import { KeyedLock } from "../lock.ts";
-import type { BindingPatch, SandboxBinding, SandboxState } from "../model.ts";
+import type { BindingPatch, SandboxBinding, SandboxState, SessionRecord } from "../model.ts";
 import { NOTES, type SandboxNote } from "../notes.ts";
 import type { AgentEngine, AppStore, Clock, ExecChannel, SandboxProvider } from "../ports.ts";
 import { nextState, type SandboxEvent } from "../sandbox-lifecycle.ts";
@@ -294,7 +294,7 @@ export class SandboxService {
 	}
 
 	/**
-	 * 按模板创建沙箱并执行 setup。给了 lost 的旧绑定就是重建：先删掉旧容器和工作区，再新建，成功后告诉模型环境重置了。
+	 * 按模板创建沙箱并执行 setup；分叉会话第一次创建时从分叉选中的存档建，不执行 setup。给了 lost 的旧绑定就是重建：先删掉旧容器和工作区，再新建，成功后告诉模型环境重置了。
 	 * 旧绑定一直留到新容器建好：被准入拒绝或 docker run 失败时绑定还是 lost，下次仍按重建处理。
 	 */
 	async #create(sessionId: string, lost?: SandboxBinding): Promise<SandboxBinding> {
@@ -306,6 +306,7 @@ export class SandboxService {
 			throw new TetherError("internal", `session ${sessionId} pins missing version ${session.agentVersion}`);
 		}
 		const spec = version.spec.sandbox;
+		const fork = lost ? {} : await this.#forkSource(session);
 
 		// 删旧容器和工作区可能很慢，放在准入锁外面；删除可以重复，被准入拒绝或新建失败时绑定还是 lost
 		if (lost) {
@@ -314,7 +315,11 @@ export class SandboxService {
 		}
 		// 写下 creating 就占住了名额，setup 可能跑几分钟，在准入锁外面跑
 		const creating = await this.#admit(sessionId, async () => {
-			const { sandboxId } = await provider.create({ sessionId, spec });
+			const { sandboxId } = await provider.create({
+				sessionId,
+				spec,
+				...(fork.snapshotId !== undefined && { from: fork.snapshotId }),
+			});
 			// 新容器建好了才删旧绑定：docker run 失败时绑定留在 lost，下次仍按重建处理并告诉模型
 			if (lost) await store.deleteBinding(sessionId);
 			const at = clock.now();
@@ -333,15 +338,26 @@ export class SandboxService {
 		});
 		this.#fresh.add(sessionId);
 
-		try {
-			await this.#runSetup(creating, spec.setup, session.variables);
-		} catch (error) {
-			await this.#cleanUpFailedSetup(creating, lost !== undefined);
-			throw error;
+		// 从存档建的工作区里已经有 setup 的结果，不再执行
+		if (fork.snapshotId === undefined) {
+			try {
+				await this.#runSetup(creating, spec.setup, session.variables);
+			} catch (error) {
+				await this.#cleanUpFailedSetup(creating, lost !== undefined);
+				throw error;
+			}
 		}
 
 		const running = await this.#transition(creating, "setup_done");
-		if (lost) {
+		if (fork.snapshotId !== undefined) {
+			await this.#note(sessionId, { state: "running", reason: "restored" });
+		} else if (fork.checkpointGone) {
+			await this.#deps.record(sessionId, {
+				kind: "tether.sandbox",
+				data: { state: "running", reason: "created" },
+				modelText: NOTES.forkFresh,
+			});
+		} else if (lost) {
 			const reason = this.#lostReasons.get(sessionId) ?? "missing";
 			this.#lostReasons.delete(sessionId);
 			await this.#deps.record(sessionId, {
@@ -353,6 +369,18 @@ export class SandboxService {
 			await this.#note(sessionId, { state: "running", reason: "created" });
 		}
 		return running;
+	}
+
+	/**
+	 * 分叉会话第一次建沙箱时用哪张快照：分叉选中的存档有快照就用它；存档是模板（null）就按模板建，这是精确的；
+	 * 存档已经被清理就按模板建，并告诉模型（分叉时说的是"已还原"）。分叉时就没有存档的，分叉时已经告诉过模型。
+	 */
+	async #forkSource(session: SessionRecord): Promise<{ snapshotId?: string; checkpointGone?: true }> {
+		const checkpointId = session.forkedFrom?.checkpointId;
+		if (checkpointId === undefined || checkpointId === null) return {};
+		const checkpoint = await this.#deps.store.getCheckpoint(checkpointId);
+		if (!checkpoint) return { checkpointGone: true };
+		return checkpoint.snapshotId === null ? {} : { snapshotId: checkpoint.snapshotId };
 	}
 
 	/**

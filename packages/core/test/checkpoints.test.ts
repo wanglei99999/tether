@@ -1,4 +1,4 @@
-import { MemoryAppStore, sampleAgent, sampleSession, sampleSpec } from "@tether/testkit";
+import { MemoryAppStore, sampleAgent, sampleCheckpoint, sampleSession, sampleSpec } from "@tether/testkit";
 import { describe, expect, it } from "vitest";
 import { type AgentVersionSpec, CheckpointService, type SandboxNote, SandboxService } from "../src/index.ts";
 import { FakeEngine, FakeExecChannel, FakeIds, FakeProvider, ManualClock } from "./fakes.ts";
@@ -70,6 +70,23 @@ describe("CheckpointService.onRunStart", () => {
 		expect(checkpoints1).toEqual([expect.objectContaining({ submissionId, entryId, snapshotId: null })]);
 		expect(provider.calls).not.toContain("snapshot");
 		expect(checkpointNotes()).toEqual([{ checkpointId: checkpoints1[0]!.id, entryId, durationMs: 0, template: true }]);
+	});
+
+	it("points a fork's first round at the fork's checkpoint, not the template", async () => {
+		// 分叉出来的会话还没有沙箱，但第一次工具调用会从分叉选中的存档建沙箱：这一轮开始时的工作区就是那张
+		const { store, engine, checkpoints, checkpointNotes } = await setUp();
+		await store.addCheckpoint(sampleCheckpoint("cp_src", { snapshotId: "ses_1/src" }));
+		const engineSessionId = await engine.fork("eng_1", engine.push("eng_1", { kind: "pi.user", role: "user", text: "x" }));
+		await store.createSession(
+			sampleSession("ses_2", { engineSessionId, forkedFrom: { sessionId: "ses_1", entryId: "1", checkpointId: "cp_src" } }),
+		);
+		const { submissionId } = await engine.submit(engineSessionId, { content: "go on", requestId: "f1" });
+
+		await checkpoints.onRunStart("ses_2", submissionId);
+
+		const [checkpoint] = await store.listCheckpoints("ses_2");
+		expect(checkpoint).toMatchObject({ submissionId, snapshotId: "ses_1/src" });
+		expect(checkpointNotes()).toEqual([{ checkpointId: checkpoint!.id, entryId: checkpoint!.entryId, durationMs: 0 }]);
 	});
 
 	it("points the round at the latest snapshot when the round starts with the sandbox lost", async () => {

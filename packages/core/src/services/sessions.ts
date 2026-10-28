@@ -1,6 +1,15 @@
+import {
+	alignedEntry,
+	findCheckpoint,
+	missedCalls,
+	type ReadEntries,
+	readEntries,
+	sideEffectCalls,
+} from "../checkpoints.ts";
 import { TetherError } from "../errors.ts";
 import type { TetherEvent, TranscriptEntry } from "../events.ts";
-import type { SessionRecord } from "../model.ts";
+import type { CheckpointRecord, SessionRecord } from "../model.ts";
+import { NOTES, type SandboxNote } from "../notes.ts";
 import type { AgentEngine, AppStore, Clock, Ids } from "../ports.ts";
 import { validateSessionVariables } from "../validate.ts";
 import { type AgentService, LOCAL_OWNER } from "./agents.ts";
@@ -28,38 +37,87 @@ export class SessionService {
 	 * 引擎失败时记录留着、engineSessionId 为 null，启动修复会找到它。
 	 */
 	async create(input: { agentId: string; agentVersion?: number; variables?: unknown }): Promise<SessionRecord> {
-		const { store, agents, clock, ids } = this.#deps;
+		const { store, agents } = this.#deps;
 		const agent = await agents.get(input.agentId);
 		if (agent.archivedAt !== undefined) throw new TetherError("conflict", `agent ${agent.id} is archived`);
 		const version = await agents.getVersion(agent.id, input.agentVersion);
 		const variables = validateSessionVariables(input.variables, version.spec.sandbox.variables);
 
-		const at = clock.now();
-		const session: SessionRecord = {
-			id: ids.next("ses"),
-			ownerId: LOCAL_OWNER,
-			agentId: agent.id,
-			agentVersion: version.version,
-			engineSessionId: null,
-			parentSessionId: null,
-			forkedFrom: null,
-			variables,
-			status: "active",
-			createdAt: at,
-			lastActiveAt: at,
-		};
+		const session = this.#newSession(agent.id, version.version, variables, null);
 		await store.createSession(session);
 		return { ...session, engineSessionId: await this.attachEngine(session) };
 	}
 
-	/** 按会话固定的版本建引擎会话并回填 ID。create 和启动修复共用。 */
+	/**
+	 * 在源会话的条目处分叉（spec §8.3）：同一个版本、同样的变量，对话到这一条为止；工作区取自选中的存档，
+	 * 沙箱等第一次工具调用时再从存档建。和 create 一样先写应用表再分叉引擎，半成品由启动修复补上。
+	 */
+	async fork(id: string, entryId: string): Promise<SessionRecord> {
+		const { store, engine } = this.#deps;
+		const source = await this.get(id);
+		if (source.status === "archived") throw new TetherError("conflict", `session ${id} is archived`);
+		await this.#requireEntry(source, entryId);
+
+		const checkpoint = await findCheckpoint(store, id, entryId, this.#reader());
+		const session = this.#newSession(source.agentId, source.agentVersion, source.variables, {
+			sessionId: id,
+			entryId,
+			checkpointId: checkpoint?.id ?? null,
+		});
+		await store.createSession(session);
+		const forked = { ...session, engineSessionId: await this.attachEngine(session) };
+		const { kind, data, modelText } = await this.forkNote(forked);
+		await engine.appendEntry(forked.engineSessionId, { kind, data, ...(modelText !== undefined && { modelText }) });
+		return forked;
+	}
+
+	/**
+	 * 分叉会话写给模型的说明：存档对得上就说工作区已还原；存档早于分叉点，再列出中间没有发生的操作；
+	 * 没有存档（或已经被清理）就说工作区是模板。fork 和启动修复共用，会话要已经有引擎会话。
+	 */
+	async forkNote(session: SessionRecord): Promise<SandboxNote> {
+		const { store, engine } = this.#deps;
+		const origin = session.forkedFrom;
+		if (origin === null || session.engineSessionId === null) {
+			throw new TetherError("internal", `session ${session.id} is not a fork with an engine session`);
+		}
+		const checkpoint = origin.checkpointId === null ? undefined : await store.getCheckpoint(origin.checkpointId);
+		const data = { sessionId: origin.sessionId, entryId: origin.entryId, checkpointId: origin.checkpointId };
+		if (checkpoint === undefined) return { kind: "tether.fork", data: { ...data, missed: 0 }, modelText: NOTES.forkFresh };
+
+		// 分叉会话的记录到分叉点为止和源会话一样，从它读
+		const from = await alignedEntry(store, origin.sessionId, origin.entryId, checkpoint);
+		const entries = await readEntries(engine, session.engineSessionId, from, origin.entryId);
+		return {
+			kind: "tether.fork",
+			data: { ...data, missed: sideEffectCalls(entries, from, origin.entryId).length },
+			modelText: NOTES.forked(missedCalls(entries, from, origin.entryId)),
+		};
+	}
+
+	/** 会话的存档，从旧到新。 */
+	async checkpoints(id: string): Promise<CheckpointRecord[]> {
+		await this.get(id);
+		return this.#deps.store.listCheckpoints(id);
+	}
+
+	/**
+	 * 给会话建引擎会话并回填 ID：普通会话按固定的版本新建，分叉会话在来源会话的条目处分叉。
+	 * create、fork 和启动修复共用。
+	 */
 	async attachEngine(session: SessionRecord): Promise<string> {
 		const { store, engine, agents } = this.#deps;
 		const version = await agents.getVersion(session.agentId, session.agentVersion);
 		let engineSessionId: string;
 		try {
-			const { model, instructions, tools } = version.spec;
-			engineSessionId = await engine.createSession({ model, instructions, tools, cwd: WORKSPACE });
+			if (session.forkedFrom === null) {
+				const { model, instructions, tools } = version.spec;
+				engineSessionId = await engine.createSession({ model, instructions, tools, cwd: WORKSPACE });
+			} else {
+				const source = await store.getSession(session.forkedFrom.sessionId);
+				if (!source?.engineSessionId) throw new Error(`source session ${session.forkedFrom.sessionId} has no engine session`);
+				engineSessionId = await engine.fork(source.engineSessionId, session.forkedFrom.entryId);
+			}
 		} catch (error) {
 			throw new TetherError("engine_failed", `cannot create the engine session for ${session.id}`, {
 				cause: error instanceof Error ? error.message : String(error),
@@ -124,6 +182,47 @@ export class SessionService {
 
 	async subscribe(id: string, listener: (events: TetherEvent[]) => void): Promise<{ stop(): Promise<void> }> {
 		return this.#deps.engine.subscribe(this.#engineId(await this.get(id)), listener);
+	}
+
+	#newSession(
+		agentId: string,
+		agentVersion: number,
+		variables: Record<string, string>,
+		forkedFrom: SessionRecord["forkedFrom"],
+	): SessionRecord {
+		const at = this.#deps.clock.now();
+		return {
+			id: this.#deps.ids.next("ses"),
+			ownerId: LOCAL_OWNER,
+			agentId,
+			agentVersion,
+			engineSessionId: null,
+			parentSessionId: null,
+			forkedFrom,
+			variables: { ...variables },
+			status: "active",
+			createdAt: at,
+			lastActiveAt: at,
+		};
+	}
+
+	/** 分叉点必须是源会话记录里的一条：先查，免得写下一条引擎分叉不了的会话记录。 */
+	async #requireEntry(source: SessionRecord, entryId: string): Promise<void> {
+		const invalid = new TetherError("invalid_request", `entry ${entryId} is not in session ${source.id}`);
+		if (!/^[1-9][0-9]*$/.test(entryId)) throw invalid;
+		const { items } = await this.#deps.engine.transcript(this.#engineId(source), {
+			limit: 1,
+			before: String(Number(entryId) + 1),
+		});
+		if (items[0]?.id !== entryId) throw invalid;
+	}
+
+	/** 按会话读引擎记录，findCheckpoint 沿分叉链判断两张存档之间有没有改过工作区。 */
+	#reader(): ReadEntries {
+		return async (sessionId, after, upto) => {
+			const session = await this.get(sessionId);
+			return readEntries(this.#deps.engine, this.#engineId(session), after, upto);
+		};
 	}
 
 	#engineId(session: SessionRecord): string {
