@@ -144,3 +144,51 @@ describe("CheckpointService.onRunStart", () => {
 		expect(warnings.some((w) => w.includes(submissionId))).toBe(true);
 	});
 });
+
+describe("CheckpointService.final", () => {
+	/** 沙箱已停止、会话记录里有几条；take 存一张快照。 */
+	async function stopped(policy: AgentVersionSpec["checkpointPolicy"] = "perRun") {
+		const made = await setUp(policy);
+		const binding = await made.sandboxes.ensureSandbox("ses_1");
+		await made.submit("go");
+		const latest = made.engine.ran("eng_1", "write", { path: "a.txt" });
+		let taken = 0;
+		const take = async () => {
+			taken++;
+			return (await made.provider.snapshot(binding.sandboxId)).snapshotId;
+		};
+		return { ...made, binding, latest, take, taken: () => taken };
+	}
+
+	it("records a final checkpoint aligned to the latest entry, once per sandbox", async () => {
+		const { store, checkpoints, binding, latest, take, taken, checkpointNotes } = await stopped();
+
+		expect(await checkpoints.final(binding, take)).toBe(true);
+		expect(await checkpoints.final(binding, take)).toBe(true);
+
+		const [checkpoint] = await store.listCheckpoints("ses_1");
+		expect(checkpoint).toMatchObject({ submissionId: `final:ses_1:${binding.createdAt}`, entryId: latest });
+		expect(checkpoint!.snapshotId).not.toBeNull();
+		expect(taken()).toBe(1);
+		expect(checkpointNotes()).toEqual([
+			{ checkpointId: checkpoint!.id, entryId: latest, durationMs: expect.any(Number), final: true },
+		]);
+	});
+
+	it("does not take a final checkpoint for checkpointPolicy none", async () => {
+		const { store, checkpoints, binding, take, taken } = await stopped("none");
+
+		expect(await checkpoints.final(binding, take)).toBe(false);
+		expect(taken()).toBe(0);
+		expect(await store.listCheckpoints("ses_1")).toEqual([]);
+	});
+
+	it("returns false and logs when the snapshot fails", async () => {
+		const { store, provider, checkpoints, binding, take, warnings } = await stopped();
+		provider.failSnapshot = true;
+
+		expect(await checkpoints.final(binding, take)).toBe(false);
+		expect(await store.listCheckpoints("ses_1")).toEqual([]);
+		expect(warnings.some((w) => w.includes("final checkpoint"))).toBe(true);
+	});
+});

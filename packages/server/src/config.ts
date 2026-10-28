@@ -27,6 +27,8 @@ export interface Config {
 	maxRunningSandboxes: number;
 	/** 沙箱闲置多久后停止（TETHER_STOP_AFTER_SECONDS，默认 3600 秒）。 */
 	stopAfterMs: number;
+	/** 停止后再闲置多久删除沙箱（先存最终存档；TETHER_DESTROY_AFTER_SECONDS，默认 7 天），必须长于 stopAfterMs。 */
+	destroyAfterMs: number;
 	/** 巡检间隔（TETHER_SWEEP_INTERVAL_SECONDS，默认 60 秒）。 */
 	sweepIntervalMs: number;
 }
@@ -78,6 +80,15 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
 	}
 	const token = setting(env, "TETHER_TOKEN");
 	const sandboxRuntime = setting(env, "TETHER_SANDBOX_RUNTIME");
+	const stopAfterMs = duration(env, "TETHER_STOP_AFTER_SECONDS", 3600);
+	const destroyAfterMs = duration(env, "TETHER_DESTROY_AFTER_SECONDS", 7 * 24 * 3600);
+	// 都从最后一次使用算起：删除不晚于停止的话，运行中的沙箱会先被停掉，停止这一档就没有意义了
+	if (destroyAfterMs <= stopAfterMs) {
+		throw new TetherError(
+			"invalid_request",
+			`TETHER_DESTROY_AFTER_SECONDS must be longer than TETHER_STOP_AFTER_SECONDS (${stopAfterMs / 1000})`,
+		);
+	}
 	return {
 		dataDir,
 		host: setting(env, "TETHER_HOST") ?? "127.0.0.1",
@@ -91,7 +102,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
 		...(sandboxRuntime !== undefined && { sandboxRuntime }),
 		setupTimeoutMs: duration(env, "TETHER_SETUP_TIMEOUT_SECONDS", 600),
 		maxRunningSandboxes: positiveInteger(env, "TETHER_MAX_RUNNING_SANDBOXES", DEFAULT_MAX_RUNNING_SANDBOXES),
-		stopAfterMs: duration(env, "TETHER_STOP_AFTER_SECONDS", 3600),
+		stopAfterMs,
+		destroyAfterMs,
 		sweepIntervalMs: duration(env, "TETHER_SWEEP_INTERVAL_SECONDS", 60),
 	};
 }

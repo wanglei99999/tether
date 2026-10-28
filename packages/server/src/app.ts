@@ -140,6 +140,9 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 		setupTimeoutMs: config.setupTimeoutMs,
 		maxRunning: config.maxRunningSandboxes,
 		stopAfterMs: config.stopAfterMs,
+		destroyAfterMs: config.destroyAfterMs,
+		// checkpoints 在下面才建，巡检开始时早已建好
+		finalCheckpoint: (binding, take) => checkpoints.final(binding, take),
 		log,
 		record,
 	});
@@ -152,6 +155,10 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 			submissionEntry: (submissionId) => {
 				if (!engine) throw new TetherError("internal", "the engine is not open yet");
 				return engine.submissionEntry(submissionId);
+			},
+			transcript: (engineSessionId, page) => {
+				if (!engine) throw new TetherError("internal", "the engine is not open yet");
+				return engine.transcript(engineSessionId, page);
 			},
 		},
 		clock: systemClock,

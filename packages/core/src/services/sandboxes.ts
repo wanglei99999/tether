@@ -32,6 +32,13 @@ export interface SandboxServiceDeps {
 	maxRunning?: number;
 	/** 会话不在运行、沙箱这么久没用就停止，默认 DEFAULT_STOP_AFTER_MS（spec §8.5）。 */
 	stopAfterMs?: number;
+	/** 停止的沙箱这么久没用就删除（先存最终存档），默认 DEFAULT_DESTROY_AFTER_MS；从最后使用时算起，长于 stopAfterMs。 */
+	destroyAfterMs?: number;
+	/**
+	 * 删除闲置沙箱之前存最终存档，由组装层接到 CheckpointService.final。take 在会话锁里存快照：巡检已经持有这把锁，
+	 * 不能再经 snapshot() 去拿。返回是否存下；失败也照样删除，恢复时用更早的存档。
+	 */
+	finalCheckpoint?: (binding: SandboxBinding, take: () => Promise<string>) => Promise<boolean>;
 }
 
 /** 一轮巡检停掉和标记丢失的沙箱数。 */
@@ -39,12 +46,15 @@ export interface SweepResult {
 	stoppedIdle: number;
 	stoppedOutside: number;
 	lost: number;
+	/** 停止后闲置超过 destroyAfter 被删除的。 */
+	destroyedIdle: number;
 }
 
 export const WORKSPACE = "/workspace";
 export const DEFAULT_SETUP_TIMEOUT_MS = 10 * 60 * 1000;
 export const DEFAULT_MAX_RUNNING_SANDBOXES = 4;
 export const DEFAULT_STOP_AFTER_MS = 60 * 60 * 1000;
+export const DEFAULT_DESTROY_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 /** 文件下载的上限。 */
 export const MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024;
 
@@ -53,6 +63,14 @@ const tooLarge = () => new TetherError("invalid_request", "file is larger than 1
 const ADMISSION = "admission";
 /** setup 失败时错误消息里保留的输出长度。 */
 const OUTPUT_TAIL_BYTES = 4096;
+
+/** 闲置时长写进说明：整天数按天，不足一天按分钟。 */
+function span(ms: number): string {
+	const days = ms / 86_400_000;
+	if (days >= 1 && Number.isInteger(days)) return `${days} day${days === 1 ? "" : "s"}`;
+	const minutes = Math.round(ms / 60_000);
+	return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
 
 function tail(text: string): string {
 	return text.length <= OUTPUT_TAIL_BYTES ? text : `…${text.slice(-OUTPUT_TAIL_BYTES)}`;
@@ -195,7 +213,7 @@ export class SandboxService {
 	 */
 	async sweep(): Promise<SweepResult> {
 		const { store, provider, log } = this.#deps;
-		const result: SweepResult = { stoppedIdle: 0, stoppedOutside: 0, lost: 0 };
+		const result: SweepResult = { stoppedIdle: 0, stoppedOutside: 0, lost: 0, destroyedIdle: 0 };
 		// 先取绑定再取容器：之后才建的沙箱不在这一轮里，不会因为列表里没有它而被误判丢失
 		const bindings = (await store.listBindings()).filter((b) => b.state === "running" || b.state === "stopped");
 		const listed = new Map((await provider.listManaged()).map((s) => [s.sandboxId, s.status]));
@@ -227,7 +245,7 @@ export class SandboxService {
 			await this.#markLost(binding, "vanish", "missing");
 			return "lost";
 		}
-		if (binding.state === "stopped") return undefined;
+		if (binding.state === "stopped") return this.#destroyIfIdle(binding);
 
 		if (status === "stopped") {
 			exec.close(binding.sandboxId);
@@ -252,11 +270,34 @@ export class SandboxService {
 		return "stoppedIdle";
 	}
 
-	/** 沙箱停了：写模型可见的说明，活动中的会话改为 idle。 */
+	/**
+	 * 停止的沙箱闲置超过 destroyAfter：先存最终存档（失败也继续），再删掉容器和工作区，绑定标成 lost。
+	 * 只写客户端条目；模型在下次工具调用恢复时从 NOTES.restored 得知。
+	 */
+	async #destroyIfIdle(binding: SandboxBinding): Promise<keyof SweepResult | undefined> {
+		const { provider, exec, clock, log } = this.#deps;
+		const destroyAfterMs = this.#deps.destroyAfterMs ?? DEFAULT_DESTROY_AFTER_MS;
+		if (Date.parse(clock.now()) - Date.parse(binding.lastUsedAt) < destroyAfterMs) return undefined;
+
+		const take = async () => (await provider.snapshot(binding.sandboxId)).snapshotId;
+		await this.#deps.finalCheckpoint?.(binding, take).catch((error: unknown) => {
+			log.warn(`final checkpoint of session ${binding.sessionId} failed`, error);
+			return false;
+		});
+		exec.close(binding.sandboxId);
+		await provider.destroy(binding.sandboxId);
+		await this.#markLost(binding, "vanish", `removed after ${span(destroyAfterMs)} without activity`);
+		return "destroyedIdle";
+	}
+
+	/** 沙箱停了：写模型可见的说明；会话不在运行才改为 idle（一轮正在跑时它仍是活动的）。 */
 	async #stoppedNote(sessionId: string, reason: string, modelText: string): Promise<void> {
-		await this.#deps.record(sessionId, { kind: "tether.sandbox", data: { state: "stopped", reason }, modelText });
-		const session = await this.#deps.store.getSession(sessionId);
-		if (session?.status === "active") await this.#deps.store.updateSession(sessionId, { status: "idle" });
+		const { store, engine, record } = this.#deps;
+		await record(sessionId, { kind: "tether.sandbox", data: { state: "stopped", reason }, modelText });
+		const session = await store.getSession(sessionId);
+		if (session?.status !== "active") return;
+		if (session.engineSessionId !== null && (await engine.isRunning(session.engineSessionId))) return;
+		await store.updateSession(sessionId, { status: "idle" });
 	}
 
 	async #ensure(sessionId: string): Promise<SandboxBinding> {

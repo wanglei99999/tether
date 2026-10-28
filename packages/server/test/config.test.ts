@@ -16,6 +16,7 @@ describe("loadConfig", () => {
 			setupTimeoutMs: 600_000,
 			maxRunningSandboxes: 4,
 			stopAfterMs: 3_600_000,
+			destroyAfterMs: 604_800_000,
 			sweepIntervalMs: 60_000,
 		});
 	});
@@ -30,6 +31,7 @@ describe("loadConfig", () => {
 			TETHER_SETUP_TIMEOUT_SECONDS: "90",
 			TETHER_MAX_RUNNING_SANDBOXES: "2",
 			TETHER_STOP_AFTER_SECONDS: "1800",
+			TETHER_DESTROY_AFTER_SECONDS: "86400",
 			TETHER_SWEEP_INTERVAL_SECONDS: "0.5",
 		});
 
@@ -46,6 +48,7 @@ describe("loadConfig", () => {
 			setupTimeoutMs: 90_000,
 			maxRunningSandboxes: 2,
 			stopAfterMs: 1_800_000,
+			destroyAfterMs: 86_400_000,
 			sweepIntervalMs: 500,
 		});
 	});
@@ -66,11 +69,25 @@ describe("loadConfig", () => {
 	});
 
 	it("rejects durations that are not a positive number of seconds", () => {
-		for (const name of ["TETHER_SETUP_TIMEOUT_SECONDS", "TETHER_STOP_AFTER_SECONDS", "TETHER_SWEEP_INTERVAL_SECONDS"]) {
+		for (const name of [
+			"TETHER_SETUP_TIMEOUT_SECONDS",
+			"TETHER_STOP_AFTER_SECONDS",
+			"TETHER_DESTROY_AFTER_SECONDS",
+			"TETHER_SWEEP_INTERVAL_SECONDS",
+		]) {
 			for (const value of ["0", "-5", "ten"]) {
 				expect(() => loadConfig({ [name]: value }), `${name}=${value}`).toThrow(new RegExp(name));
 			}
 		}
+	});
+
+	it("requires TETHER_DESTROY_AFTER_SECONDS to be longer than TETHER_STOP_AFTER_SECONDS", () => {
+		for (const destroy of ["3600", "60"]) {
+			expect(() => loadConfig({ TETHER_STOP_AFTER_SECONDS: "3600", TETHER_DESTROY_AFTER_SECONDS: destroy }), destroy).toThrow(
+				expect.objectContaining({ code: "invalid_request", message: expect.stringMatching(/TETHER_DESTROY_AFTER_SECONDS/) }),
+			);
+		}
+		expect(loadConfig({ TETHER_STOP_AFTER_SECONDS: "3600", TETHER_DESTROY_AFTER_SECONDS: "3601" }).destroyAfterMs).toBe(3_601_000);
 	});
 
 	it("reads the workspace storage mode and accepts only auto, image and directory", () => {

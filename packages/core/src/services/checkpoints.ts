@@ -1,6 +1,6 @@
 import { restorePoint } from "../checkpoints.ts";
 import { TetherError } from "../errors.ts";
-import type { CheckpointRecord } from "../model.ts";
+import type { CheckpointRecord, SandboxBinding, SessionRecord } from "../model.ts";
 import type { AgentEngine, AppStore, Clock, Ids, SandboxProvider } from "../ports.ts";
 import type { Log } from "../startup.ts";
 import type { SandboxRecord, SandboxService } from "./sandboxes.ts";
@@ -9,7 +9,8 @@ export interface CheckpointServiceDeps {
 	store: AppStore;
 	sandboxes: Pick<SandboxService, "snapshot">;
 	provider: Pick<SandboxProvider, "deleteSnapshot">;
-	engine: Pick<AgentEngine, "submissionEntry">;
+	/** submissionEntry 找一轮的用户条目；transcript 找最终存档对齐的最新条目。 */
+	engine: Pick<AgentEngine, "submissionEntry" | "transcript">;
 	clock: Clock;
 	ids: Ids;
 	record: SandboxRecord;
@@ -47,9 +48,7 @@ export class CheckpointService {
 		const { store, engine, provider, clock, ids, record } = this.#deps;
 		if (await store.checkpointForSubmission(submissionId)) return;
 		const session = await store.getSession(sessionId);
-		if (!session) return;
-		const version = await store.getVersion(session.agentId, session.agentVersion);
-		if (version?.spec.checkpointPolicy !== "perRun") return;
+		if (!session || !(await this.#perRun(session))) return;
 
 		const started = Date.now();
 		const start = await this.#roundStart(sessionId);
@@ -87,6 +86,53 @@ export class CheckpointService {
 			kind: "tether.checkpoint",
 			data: { checkpointId: checkpoint.id, entryId, durationMs, ...(start.snapshotId === null && { template: true }) },
 		});
+	}
+
+	/**
+	 * 闲置删除前的最终存档（设计决定 9）：对齐到会话记录的最新一条，沙箱已经停止，之后工作区不会再变。
+	 * 每个沙箱至多一张（提交 ID 带上沙箱的创建时间）；策略不是 perRun、会话还没有记录时不存。
+	 * 快照由 take 在调用方持有的会话锁里存。失败只记日志、返回 false，调用方照样删除沙箱。
+	 */
+	async final(binding: SandboxBinding, take: () => Promise<string>): Promise<boolean> {
+		const { store, engine, provider, clock, ids, record, log } = this.#deps;
+		const { sessionId } = binding;
+		const submissionId = `final:${sessionId}:${binding.createdAt}`;
+		try {
+			if (await store.checkpointForSubmission(submissionId)) return true;
+			const session = await store.getSession(sessionId);
+			if (!session?.engineSessionId || !(await this.#perRun(session))) return false;
+			const [latest] = (await engine.transcript(session.engineSessionId, { limit: 1 })).items;
+			if (latest === undefined) return false;
+
+			const started = Date.now();
+			const snapshotId = await take();
+			const checkpoint: CheckpointRecord = {
+				id: ids.next("cp"),
+				sessionId,
+				submissionId,
+				entryId: latest.id,
+				snapshotId,
+				kind: "filesystem",
+				createdAt: clock.now(),
+			};
+			await store.addCheckpoint(checkpoint).catch(async (error: unknown) => {
+				await provider.deleteSnapshot(snapshotId);
+				throw error;
+			});
+			await record(sessionId, {
+				kind: "tether.checkpoint",
+				data: { checkpointId: checkpoint.id, entryId: latest.id, durationMs: Date.now() - started, final: true },
+			});
+			return true;
+		} catch (error) {
+			log.warn(`final checkpoint of session ${sessionId} failed`, error);
+			return false;
+		}
+	}
+
+	async #perRun(session: SessionRecord): Promise<boolean> {
+		const version = await this.#deps.store.getVersion(session.agentId, session.agentVersion);
+		return version?.spec.checkpointPolicy === "perRun";
 	}
 
 	/**

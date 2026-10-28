@@ -7,6 +7,7 @@ import {
 	type SandboxBinding,
 	type SandboxNote,
 	SandboxService,
+	type SandboxServiceDeps,
 } from "../src/index.ts";
 import { FakeClock, FakeEngine, FakeExecChannel, FakeProvider, ManualClock } from "./fakes.ts";
 
@@ -30,10 +31,12 @@ interface SetUpOptions {
 	setupTimeoutMs?: number;
 	maxRunning?: number;
 	stopAfterMs?: number;
+	destroyAfterMs?: number;
+	finalCheckpoint?: SandboxServiceDeps["finalCheckpoint"];
 }
 
 async function setUp(setup: string[] = [], variables: Record<string, string> = {}, options: SetUpOptions = {}) {
-	const { setupTimeoutMs, maxRunning, stopAfterMs } = options;
+	const { setupTimeoutMs, maxRunning, stopAfterMs, destroyAfterMs, finalCheckpoint } = options;
 	const store = new SpyStore();
 	const spec = sampleSpec();
 	spec.sandbox.setup = setup;
@@ -62,6 +65,8 @@ async function setUp(setup: string[] = [], variables: Record<string, string> = {
 		...(setupTimeoutMs !== undefined && { setupTimeoutMs }),
 		...(maxRunning !== undefined && { maxRunning }),
 		...(stopAfterMs !== undefined && { stopAfterMs }),
+		...(destroyAfterMs !== undefined && { destroyAfterMs }),
+		...(finalCheckpoint !== undefined && { finalCheckpoint }),
 	});
 	return { store, provider, exec, engine, clock, recorded, notes, warnings, sandboxes };
 }
@@ -740,7 +745,7 @@ describe("SandboxService files", () => {
 });
 
 const HOUR = 3_600_000;
-const NOTHING = { stoppedIdle: 0, stoppedOutside: 0, lost: 0 };
+const NOTHING = { stoppedIdle: 0, stoppedOutside: 0, lost: 0, destroyedIdle: 0 };
 
 describe("SandboxService.sweep", () => {
 	it("stops a sandbox idle for stopAfter, writes the model-visible note and marks the session idle", async () => {
@@ -1043,5 +1048,92 @@ describe("SandboxService for a forked session", () => {
 		expect(provider.calls.filter((call) => call.startsWith("create"))).toEqual(["create"]);
 		expect(exec.calls).toHaveLength(1);
 		expect(notes.filter((note) => note.modelText !== undefined)).toEqual([]);
+	});
+});
+
+describe("SandboxService idle removal", () => {
+	const DAY = 24 * HOUR;
+	const REMOVED = "removed after 7 days without activity";
+
+	/** 最终存档由 finalCheckpoint 存：这里调用 take 拿到快照，记一条存档；fail 为 true 时不存、返回 false。 */
+	async function idle(fail = false) {
+		const finals: { sessionId: string; snapshotId: string }[] = [];
+		let store: MemoryAppStore | undefined;
+		const made = await setUp([], {}, {
+			finalCheckpoint: async (binding, take) => {
+				if (fail) return false;
+				const snapshotId = await take();
+				finals.push({ sessionId: binding.sessionId, snapshotId });
+				await store!.addCheckpoint(sampleCheckpoint("cp_final", { entryId: "9", snapshotId, submissionId: "final" }));
+				return true;
+			},
+		});
+		store = made.store;
+		const first = await made.sandboxes.ensureSandbox("ses_1");
+		made.clock.advance(HOUR);
+		await made.sandboxes.sweep();
+		expect((await made.store.getBinding("ses_1"))?.state).toBe("stopped");
+		made.provider.calls.length = 0;
+		return { ...made, finals, first };
+	}
+
+	it("takes a final checkpoint and removes a sandbox stopped longer than destroyAfter", async () => {
+		const { store, provider, clock, notes, sandboxes, finals, first } = await idle();
+		clock.advance(7 * DAY);
+
+		const result = await sandboxes.sweep();
+
+		expect(result).toEqual({ ...NOTHING, destroyedIdle: 1 });
+		expect(finals).toEqual([{ sessionId: "ses_1", snapshotId: expect.any(String) }]);
+		expect(provider.calls.filter((call) => call !== "status")).toEqual(["snapshot", "destroy"]);
+		expect(provider.containers.has(first.sandboxId)).toBe(false);
+		expect(await store.getBinding("ses_1")).toMatchObject({ state: "lost", reason: REMOVED });
+		// 只给客户端看；模型在下次恢复时从 NOTES.restored 得知
+		expect(notes.at(-1)).toEqual({ kind: "tether.sandbox", data: { state: "lost", reason: REMOVED } });
+	});
+
+	it("restores the removed sandbox from the final checkpoint on the next tool call", async () => {
+		const { provider, clock, notes, sandboxes, finals } = await idle();
+		clock.advance(7 * DAY);
+		await sandboxes.sweep();
+
+		const rebuilt = await sandboxes.ensureSandbox("ses_1");
+
+		expect(provider.containers.get(rebuilt.sandboxId)?.from).toBe(finals[0]!.snapshotId);
+		expect(notes.at(-1)).toMatchObject({ data: { checkpointId: "cp_final" }, modelText: NOTES.restored(REMOVED, []) });
+	});
+
+	it("removes the sandbox even when the final checkpoint fails, and the rebuild uses an earlier one", async () => {
+		const { store, provider, clock, sandboxes, first } = await idle(true);
+		await store.addCheckpoint(sampleCheckpoint("cp_old", { snapshotId: "snap_old" }));
+		provider.snapshots.set("snap_old", { sandboxId: first.sandboxId, partial: false });
+		clock.advance(7 * DAY);
+
+		expect(await sandboxes.sweep()).toEqual({ ...NOTHING, destroyedIdle: 1 });
+		expect(provider.containers.has(first.sandboxId)).toBe(false);
+
+		const rebuilt = await sandboxes.ensureSandbox("ses_1");
+		expect(provider.containers.get(rebuilt.sandboxId)?.from).toBe("snap_old");
+	});
+
+	it("does not remove a stopped sandbox younger than destroyAfter", async () => {
+		const { store, provider, clock, sandboxes, finals } = await idle();
+		clock.advance(7 * DAY - 2 * HOUR);
+
+		expect(await sandboxes.sweep()).toEqual(NOTHING);
+		expect(finals).toEqual([]);
+		expect(provider.calls).not.toContain("destroy");
+		expect((await store.getBinding("ses_1"))?.state).toBe("stopped");
+	});
+
+	it("does not mark a running session idle when its sandbox stops", async () => {
+		// 一轮正在跑（比如模型还在思考）时容器在 Tether 之外被停掉：会话仍在运行，不能改成 idle
+		const { store, provider, engine, sandboxes } = await setUp();
+		const { sandboxId } = await sandboxes.ensureSandbox("ses_1");
+		await provider.stop(sandboxId);
+		engine.running.add("eng_1");
+
+		expect(await sandboxes.sweep()).toEqual({ ...NOTHING, stoppedOutside: 1 });
+		expect((await store.getSession("ses_1"))?.status).toBe("active");
 	});
 });
