@@ -20,6 +20,10 @@ export interface RecoverResult {
 	repairedSessions: number;
 	lostBindings: number;
 	removedOrphans: number;
+	/** 存到一半的、没有记录的快照文件。 */
+	removedSnapshots: number;
+	/** 释放了卷和 loop 设备的、没有容器的会话。 */
+	releasedLeftovers: number;
 	/**
 	 * 对账发现的、要写进会话记录的说明。recover() 不写引擎：pi 的写入会开启调度，在 resume 之前写等于提前续跑。
 	 * 由组装层在 recover() 返回之后逐条写入。
@@ -33,15 +37,50 @@ const SETTLED: readonly SandboxBinding["state"][] = ["lost", "destroyed"];
 /**
  * 启动恢复，顺序照设计文档 §4.5：
  * 1. 给"应用表有记录、引擎里没有会话"的半成品补建引擎会话（分叉会话补的是引擎分叉），补不了的标记 failed；
- * 2. 与 Docker 对账：按实际状态修正绑定，容器不在的标记 lost，没有绑定的容器删除；
+ * 2. 与 Docker 对账：按实际状态修正绑定，容器不在的标记 lost，没有绑定的容器删除，没有容器的会话释放卷和 loop 设备；
+ *    快照文件和存档记录对账；
  * 3. 引擎 resume()，继续崩溃前没跑完的提交。
  * 第 2 步必须在第 3 步之前，否则续跑的工具调用会拿到过期的沙箱状态。
  */
 export async function recover(deps: RecoverDeps): Promise<RecoverResult> {
 	const repaired = await repairSessions(deps);
 	const { lostBindings, removedOrphans, notes } = await reconcileSandboxes(deps);
+	const releasedLeftovers = await deps.provider.releaseLeftovers();
+	const removedSnapshots = await reconcileSnapshots(deps);
 	deps.engine.resume();
-	return { repairedSessions: repaired.count, lostBindings, removedOrphans, notes: [...repaired.notes, ...notes] };
+	return {
+		repairedSessions: repaired.count,
+		lostBindings,
+		removedOrphans,
+		removedSnapshots,
+		releasedLeftovers,
+		notes: [...repaired.notes, ...notes],
+	};
+}
+
+/**
+ * 快照文件和存档记录对账（Review Focus 3）：存到一半中断的删掉；有文件没记录的（快照存好、记录没写上就崩溃）删掉；
+ * 有记录没文件的删掉记录，之后分叉或恢复会找到别的存档，不会一直从一张不存在的快照创建失败。
+ * 必须在 resume 之前：续跑的一轮会存新的快照，那时它还没有记录。
+ */
+async function reconcileSnapshots({ store, provider, log }: RecoverDeps): Promise<number> {
+	const snapshots = await provider.listSnapshots();
+	const records = await store.listAllCheckpoints();
+	const recorded = new Set(records.flatMap((checkpoint) => (checkpoint.snapshotId === null ? [] : [checkpoint.snapshotId])));
+	let removed = 0;
+	for (const { snapshotId, partial } of snapshots) {
+		if (!partial && recorded.has(snapshotId)) continue;
+		await provider.deleteSnapshot(snapshotId);
+		removed++;
+		log.warn(`removed snapshot ${snapshotId}: ${partial ? "it was left half-written" : "no checkpoint records it"}`);
+	}
+	const present = new Set(snapshots.filter(({ partial }) => !partial).map(({ snapshotId }) => snapshotId));
+	for (const checkpoint of records) {
+		if (checkpoint.snapshotId === null || present.has(checkpoint.snapshotId)) continue;
+		await store.deleteCheckpoint(checkpoint.id);
+		log.warn(`dropped checkpoint ${checkpoint.id} of session ${checkpoint.sessionId}: its snapshot ${checkpoint.snapshotId} is gone`);
+	}
+	return removed;
 }
 
 /** 分叉会话补上引擎分叉后，分叉时没来得及写的说明一并交出去。 */

@@ -165,6 +165,7 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 		ids,
 		record,
 		log,
+		minFreeRatio: config.checkpointMinFreePercent / 100,
 	});
 
 	const opened = await openPiEngine({
@@ -193,7 +194,7 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 	// 目录模式限制不了磁盘，填了 diskMb 就拒绝，不悄悄忽略
 	const unsupported = { ...UNSUPPORTED_IN_M3, diskMb: storage === "directory", minDiskMb: MIN_DISK_MB };
 	const agents = new AgentService({ store, clock: systemClock, ids, catalog: BUILTIN_TOOLS, unsupported });
-	const sessions = new SessionService({ store, engine: opened, agents, sandboxes, clock: systemClock, ids });
+	const sessions = new SessionService({ store, engine: opened, agents, sandboxes, checkpoints, clock: systemClock, ids });
 
 	let recovered: Awaited<ReturnType<typeof recover>>;
 	try {
@@ -210,7 +211,15 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 			log.warn(`recording the startup note for session ${sessionId} failed`, error),
 		);
 	}
-	const sweeper = startSweeper(() => sandboxes.sweep(), config.sweepIntervalMs, log);
+	// 先巡检（闲置删除会存最终存档），再看存档的盘够不够
+	const sweeper = startSweeper(
+		async () => {
+			await sandboxes.sweep();
+			await checkpoints.thin();
+		},
+		config.sweepIntervalMs,
+		log,
+	);
 
 	const http = createHttpApp({
 		agents,

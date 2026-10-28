@@ -192,3 +192,162 @@ describe("CheckpointService.final", () => {
 		expect(warnings.some((w) => w.includes("final checkpoint"))).toBe(true);
 	});
 });
+
+describe("CheckpointService cleanup", () => {
+	/**
+	 * 只有存储、后端和存档服务。checkpoints 是 [记录 ID, 会话, 条目, 快照]，快照不为 null 时后端里有它。
+	 * 后端删了 deletions 张以后空闲空间才回到下限以上（minFreeRatio 0.1：空闲 5% 不够，50% 够）。
+	 */
+	async function cleanup(
+		sessions: { id: string; lastActiveAt?: string; forkedFrom?: { sessionId: string; checkpointId: string } }[],
+		checkpoints: [string, string, string, string | null][],
+		deletions = Number.POSITIVE_INFINITY,
+	) {
+		const store = new MemoryAppStore();
+		const { agent, first } = sampleAgent();
+		await store.createAgent(agent, first);
+		for (const { id, lastActiveAt, forkedFrom } of sessions) {
+			await store.createSession(
+				sampleSession(id, {
+					...(lastActiveAt !== undefined && { lastActiveAt }),
+					forkedFrom: forkedFrom ? { ...forkedFrom, entryId: "1" } : null,
+				}),
+			);
+		}
+		const provider = new FakeProvider();
+		for (const [id, sessionId, entryId, snapshotId] of checkpoints) {
+			await store.addCheckpoint(sampleCheckpoint(id, { sessionId, entryId, snapshotId }));
+			if (snapshotId !== null) provider.snapshots.set(snapshotId, { sandboxId: `sbx_${sessionId}`, partial: false });
+		}
+		const deleted: string[] = [];
+		const deleteSnapshot = provider.deleteSnapshot.bind(provider);
+		provider.deleteSnapshot = async (snapshotId: string) => {
+			deleted.push(snapshotId);
+			await deleteSnapshot(snapshotId);
+		};
+		provider.storage = async () => ({ freeBytes: deleted.length >= deletions ? 50 : 5, totalBytes: 100 });
+		const warnings: string[] = [];
+		const service = new CheckpointService({
+			store,
+			sandboxes: { snapshot: async () => ({ state: "absent" as const }) },
+			provider,
+			engine: new FakeEngine(),
+			clock: new ManualClock(),
+			ids: new FakeIds(),
+			record: async () => {},
+			log: { warn: (message) => warnings.push(message) },
+			minFreeRatio: 0.1,
+		});
+		const archive = (id: string) => store.updateSession(id, { status: "archived" });
+		const remaining = async () => (await store.listAllCheckpoints()).map((c) => c.id).sort();
+		return { store, provider, service, deleted, warnings, archive, remaining };
+	}
+
+	it("deletes an archived session's checkpoints except the ones a live fork references", async () => {
+		const { service, provider, archive, remaining } = await cleanup(
+			[{ id: "ses_1" }, { id: "ses_2", forkedFrom: { sessionId: "ses_1", checkpointId: "cp_b" } }],
+			[["cp_a", "ses_1", "1", "s/a"], ["cp_b", "ses_1", "5", "s/b"], ["cp_t", "ses_1", "9", null]],
+		);
+		await archive("ses_1");
+
+		expect(await service.collect("ses_1")).toBe(2);
+
+		expect(await remaining()).toEqual(["cp_b"]);
+		expect([...provider.snapshots.keys()]).toEqual(["s/b"]);
+	});
+
+	it("deletes the referenced checkpoint once the last referencing fork is archived", async () => {
+		const { service, provider, archive, remaining } = await cleanup(
+			[
+				{ id: "ses_1" },
+				{ id: "ses_2", forkedFrom: { sessionId: "ses_1", checkpointId: "cp_b" } },
+				{ id: "ses_3", forkedFrom: { sessionId: "ses_1", checkpointId: "cp_b" } },
+			],
+			[["cp_a", "ses_1", "1", "s/a"], ["cp_b", "ses_1", "5", "s/b"]],
+		);
+		await archive("ses_1");
+		await service.collect("ses_1");
+		await archive("ses_2");
+		await service.collect("ses_2");
+		expect(await remaining()).toEqual(["cp_b"]);
+
+		await archive("ses_3");
+		await service.collect("ses_3");
+
+		expect(await remaining()).toEqual([]);
+		expect(provider.snapshots.size).toBe(0);
+	});
+
+	it("keeps a snapshot file while another record still points to it", async () => {
+		// 沙箱丢失时那一轮沿用上一张快照：两条记录共用 s/x
+		const { service, provider, deleted, archive, remaining } = await cleanup(
+			[{ id: "ses_1" }, { id: "ses_2", forkedFrom: { sessionId: "ses_1", checkpointId: "cp_b" } }],
+			[["cp_a", "ses_1", "1", "s/x"], ["cp_b", "ses_1", "5", "s/x"]],
+		);
+		await archive("ses_1");
+
+		await service.collect("ses_1");
+
+		expect(await remaining()).toEqual(["cp_b"]);
+		expect(deleted).toEqual([]);
+		expect(provider.snapshots.has("s/x")).toBe(true);
+	});
+
+	it("does not collect a session that is not archived", async () => {
+		const { service, remaining } = await cleanup([{ id: "ses_1" }], [["cp_a", "ses_1", "1", "s/a"]]);
+
+		expect(await service.collect("ses_1")).toBe(0);
+		expect(await remaining()).toEqual(["cp_a"]);
+	});
+
+	/** ses_old 13 张（序号 0..12），ses_new 6 张；ses_old 更久没用。 */
+	function many(): [string, string, string, string | null][] {
+		const old = Array.from({ length: 13 }, (_, i) => [`cp_o${i}`, "ses_old", String(i + 1), `old/${i}`] as [string, string, string, string]);
+		const recent = Array.from({ length: 6 }, (_, i) => [`cp_n${i}`, "ses_new", String(100 + i), `new/${i}`] as [string, string, string, string]);
+		return [...old, ...recent];
+	}
+	const twoSessions = [
+		{ id: "ses_new", lastActiveAt: "2026-10-27T00:00:00.000Z" },
+		{ id: "ses_old", lastActiveAt: "2026-10-01T00:00:00.000Z" },
+	];
+
+	it("thins oldest sessions first, keeping each session's newest five and every tenth", async () => {
+		const { service, deleted, warnings } = await cleanup(twoSessions, many());
+
+		expect(await service.thin()).toBe(9);
+
+		// 旧会话：最新 5 张（8..12）不动，先删不是 10 的倍数的 1..7，再删 0；新会话只有最旧的一张可删
+		expect(deleted).toEqual([1, 2, 3, 4, 5, 6, 7].map((i) => `old/${i}`).concat(["old/0", "new/0"]));
+		expect(warnings).toHaveLength(9);
+	});
+
+	it("stops thinning as soon as free space is above the floor", async () => {
+		const { service, deleted, remaining } = await cleanup(twoSessions, many(), 7);
+
+		expect(await service.thin()).toBe(7);
+
+		expect(deleted).toEqual([1, 2, 3, 4, 5, 6, 7].map((i) => `old/${i}`));
+		expect(await remaining()).toContain("cp_o0");
+		expect(await remaining()).toContain("cp_n0");
+	});
+
+	it("does nothing while free space is above the floor", async () => {
+		const { service, deleted } = await cleanup(twoSessions, many(), 0);
+
+		expect(await service.thin()).toBe(0);
+		expect(deleted).toEqual([]);
+	});
+
+	it("never thins a referenced checkpoint or a template one", async () => {
+		const checkpoints = Array.from({ length: 8 }, (_, i) => [`cp_${i}`, "ses_1", String(i + 1), i === 2 ? null : `s/${i}`] as [string, string, string, string | null]);
+		const { service, deleted } = await cleanup(
+			[{ id: "ses_1" }, { id: "ses_2", forkedFrom: { sessionId: "ses_1", checkpointId: "cp_1" } }],
+			checkpoints,
+		);
+
+		await service.thin();
+
+		// 可删的是最新 5 张之外的 0、1、2：1 被分叉引用，2 是模板（删了不省空间，还丢了对齐信息）
+		expect(deleted).toEqual(["s/0"]);
+	});
+});

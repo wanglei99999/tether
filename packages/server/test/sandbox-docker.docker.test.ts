@@ -406,4 +406,25 @@ describe("docker sandbox specifics (image only)", () => {
 		const attached = (await losetup("--list", "--noheadings", "--output", "NAME")).split("\n");
 		expect(attached).not.toContain(devices[0]);
 	});
+
+	it("lists and removes leftover volumes and loop devices of sessions without a container", async () => {
+		// 容器在 Tether 之外被删掉（或宿主上 Tether 崩溃）：卷和 loop 设备留着，镜像文件也留着（丢失重建时再删）
+		const gone = made.sessionId();
+		const kept = made.sessionId();
+		const { sandboxId: goneId } = await made.provider.create({ sessionId: gone, spec: sampleSandboxSpec() });
+		await made.provider.create({ sessionId: kept, spec: sampleSandboxSpec() });
+		await docker("rm", "--force", goneId);
+		expect(await associated(disk(gone))).toHaveLength(1);
+
+		expect(await made.provider.releaseLeftovers()).toBe(1);
+
+		await expect(docker("volume", "inspect", `tether-${gone}`)).rejects.toThrow();
+		expect(await associated(disk(gone))).toEqual([]);
+		expect(existsSync(disk(gone))).toBe(true);
+		// 还有容器的会话不动
+		expect(await docker("volume", "inspect", "--format", "{{.Name}}", `tether-${kept}`)).toBe(`tether-${kept}`);
+		expect(await associated(disk(kept))).toHaveLength(1);
+		// 再来一次没有可清的
+		expect(await made.provider.releaseLeftovers()).toBe(0);
+	});
 });

@@ -155,6 +155,11 @@ export interface SandboxProvider {
 	listSnapshots(): Promise<{ snapshotId: string; partial: boolean }[]>;
 	/** 快照所在存储的空间，稀疏化按它判断。 */
 	storage(): Promise<{ freeBytes: number; totalBytes: number }>;
+	/**
+	 * 启动对账用：没有容器的会话，释放它们工作区占着的后端资源（Docker 镜像模式下的卷和 loop 设备），
+	 * 工作区本身保留（丢失重建或归档时再删）。返回释放了几个会话的。
+	 */
+	releaseLeftovers(): Promise<number>;
 }
 
 export interface ExecChannel {

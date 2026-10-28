@@ -75,5 +75,10 @@ export function createDirectoryStorage(options: DirectoryStorageOptions): Worksp
 				throw new TetherError("sandbox_failed", `cannot remove workspace ${target}: ${result.stderr.trim()}`);
 			}
 		},
+
+		/** 目录直接绑定挂载，没有卷和 loop 设备要释放。 */
+		async release() {
+			return 0;
+		},
 	};
 }

@@ -206,6 +206,11 @@ export class FakeProvider implements SandboxProvider {
 		this.fenced.push({ sandboxId, epoch });
 		return { killed: 0 };
 	}
+	/** 没有容器的会话的卷和 loop 设备；假后端没有这些，只记调用。 */
+	async releaseLeftovers() {
+		this.calls.push("releaseLeftovers");
+		return 0;
+	}
 	async listManaged() {
 		return [...this.containers].map(([sandboxId, { sessionId, state }]) => ({ sandboxId, sessionId, status: state }));
 	}

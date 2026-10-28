@@ -29,8 +29,21 @@ export interface Config {
 	stopAfterMs: number;
 	/** 停止后再闲置多久删除沙箱（先存最终存档；TETHER_DESTROY_AFTER_SECONDS，默认 7 天），必须长于 stopAfterMs。 */
 	destroyAfterMs: number;
+	/** 存档所在的盘空闲低于这个百分比就稀疏化（TETHER_CHECKPOINT_MIN_FREE_PERCENT，默认 10）。 */
+	checkpointMinFreePercent: number;
 	/** 巡检间隔（TETHER_SWEEP_INTERVAL_SECONDS，默认 60 秒）。 */
 	sweepIntervalMs: number;
+}
+
+/** 0 到 100 之间（不含 100）的百分比；0 表示不稀疏化。 */
+function percent(env: NodeJS.ProcessEnv, name: string, defaultValue: number): number {
+	const raw = setting(env, name);
+	if (raw === undefined) return defaultValue;
+	const value = Number(raw);
+	if (!Number.isFinite(value) || value < 0 || value >= 100) {
+		throw new TetherError("invalid_request", `${name} must be a percentage from 0 to below 100, got ${raw}`);
+	}
+	return value;
 }
 
 /** 以秒配置的时长，转成毫秒；必须是正数。 */
@@ -104,6 +117,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
 		maxRunningSandboxes: positiveInteger(env, "TETHER_MAX_RUNNING_SANDBOXES", DEFAULT_MAX_RUNNING_SANDBOXES),
 		stopAfterMs,
 		destroyAfterMs,
+		checkpointMinFreePercent: percent(env, "TETHER_CHECKPOINT_MIN_FREE_PERCENT", 10),
 		sweepIntervalMs: duration(env, "TETHER_SWEEP_INTERVAL_SECONDS", 60),
 	};
 }

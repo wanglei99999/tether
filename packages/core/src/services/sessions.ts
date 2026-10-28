@@ -13,6 +13,7 @@ import { NOTES, type SandboxNote } from "../notes.ts";
 import type { AgentEngine, AppStore, Clock, Ids } from "../ports.ts";
 import { validateSessionVariables } from "../validate.ts";
 import { type AgentService, LOCAL_OWNER } from "./agents.ts";
+import type { CheckpointService } from "./checkpoints.ts";
 import { type SandboxService, WORKSPACE } from "./sandboxes.ts";
 
 export interface SessionServiceDeps {
@@ -21,6 +22,8 @@ export interface SessionServiceDeps {
 	agents: AgentService;
 	/** 归档时销毁会话的沙箱。 */
 	sandboxes: Pick<SandboxService, "destroy">;
+	/** 归档时清理会话的存档；不给就不清理（只有组装层需要）。 */
+	checkpoints?: Pick<CheckpointService, "collect">;
 	clock: Clock;
 	ids: Ids;
 }
@@ -157,8 +160,8 @@ export class SessionService {
 	}
 
 	/**
-	 * 归档：先改状态（之后的消息被拒绝），再中止正在跑的一轮，最后销毁沙箱。
-	 * 对已归档的会话再调用一次也会执行销毁，上次销毁失败可以这样重试。
+	 * 归档：先改状态（之后的消息被拒绝），再中止正在跑的一轮，然后销毁沙箱，最后清理没被分叉引用的存档。
+	 * 对已归档的会话再调用一次也会执行销毁和清理，上次失败可以这样重试。
 	 */
 	async archive(id: string): Promise<SessionRecord> {
 		const { store, engine, sandboxes } = this.#deps;
@@ -166,6 +169,7 @@ export class SessionService {
 		if (session.status !== "archived") await store.updateSession(id, { status: "archived" });
 		if (session.engineSessionId !== null) await engine.abort(session.engineSessionId);
 		await sandboxes.destroy(id, "archived");
+		await this.#deps.checkpoints?.collect(id);
 		return this.get(id);
 	}
 

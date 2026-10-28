@@ -20,4 +20,9 @@ export interface WorkspaceStorage {
 	beforeStart(sessionId: string): Promise<boolean>;
 	/** 删掉工作区和它占用的一切（卷、loop 设备、文件）；不存在不报错。 */
 	remove(sessionId: string): Promise<void>;
+	/**
+	 * workspaceRoot 下不在 live 里的会话（没有容器了）：释放它们的卷和 loop 设备，工作区文件留着。
+	 * 只看本实例 workspaceRoot 下的会话，不碰别的 Tether 实例和宿主上别的 loop 设备。返回释放了几个会话的。
+	 */
+	release(live: ReadonlySet<string>): Promise<number>;
 }

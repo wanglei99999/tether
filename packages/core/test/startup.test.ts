@@ -1,4 +1,4 @@
-import { MemoryAppStore, sampleBinding, sampleSession, sampleSpec } from "@tether/testkit";
+import { MemoryAppStore, sampleBinding, sampleCheckpoint, sampleSession, sampleSpec } from "@tether/testkit";
 import { describe, expect, it } from "vitest";
 import { AgentService, BUILTIN_TOOLS, NOTES, recover, SessionService } from "../src/index.ts";
 import { FakeClock, FakeEngine, FakeIds, FakeProvider, FakeSandboxes } from "./fakes.ts";
@@ -30,6 +30,16 @@ async function setUp() {
 	provider.listManaged = async () => {
 		order.push("provider.listManaged");
 		return listManaged();
+	};
+	const deleteSnapshot = provider.deleteSnapshot.bind(provider);
+	provider.deleteSnapshot = async (snapshotId: string) => {
+		order.push(`provider.deleteSnapshot ${snapshotId}`);
+		await deleteSnapshot(snapshotId);
+	};
+	const releaseLeftovers = provider.releaseLeftovers.bind(provider);
+	provider.releaseLeftovers = async () => {
+		order.push("provider.releaseLeftovers");
+		return releaseLeftovers();
 	};
 	const agents = new AgentService({ store, clock, ids, catalog: BUILTIN_TOOLS });
 	const sessions = new SessionService({ store, engine, agents, sandboxes: new FakeSandboxes(), clock, ids });
@@ -118,6 +128,42 @@ describe("recover", () => {
 				},
 			},
 		]);
+	});
+
+	it("removes partial snapshots and snapshots without a record before resume", async () => {
+		// Review Focus 3 的另一半：存档存到一半崩溃，留下 partial；快照存好了、记录没写上，留下没有记录的文件
+		const { order, store, provider, run } = await setUp();
+		provider.snapshots.set("ses_1/aaaa", { sandboxId: "sbx_1", partial: true });
+		provider.snapshots.set("ses_1/bbbb", { sandboxId: "sbx_1", partial: false });
+		provider.snapshots.set("ses_1/cccc", { sandboxId: "sbx_1", partial: false });
+		await store.addCheckpoint(sampleCheckpoint("cp_kept", { snapshotId: "ses_1/cccc" }));
+
+		const result = await run();
+
+		expect(result.removedSnapshots).toBe(2);
+		expect([...provider.snapshots.keys()]).toEqual(["ses_1/cccc"]);
+		expect(order.indexOf("provider.deleteSnapshot ses_1/aaaa")).toBeLessThan(order.indexOf("engine.resume"));
+		expect(order.indexOf("provider.deleteSnapshot ses_1/bbbb")).toBeLessThan(order.indexOf("engine.resume"));
+	});
+
+	it("drops checkpoint records whose snapshot file is gone", async () => {
+		const { store, warnings, run } = await setUp();
+		await store.addCheckpoint(sampleCheckpoint("cp_gone", { snapshotId: "ses_1/dddd" }));
+		await store.addCheckpoint(sampleCheckpoint("cp_template", { snapshotId: null }));
+
+		await run();
+
+		expect((await store.listAllCheckpoints()).map((c) => c.id)).toEqual(["cp_template"]);
+		expect(warnings.join("\n")).toContain("cp_gone");
+	});
+
+	it("releases leftover workspaces of sessions without a container after removing orphans, before resume", async () => {
+		const { order, run } = await setUp();
+
+		await run();
+
+		const backend = order.filter((call) => call.startsWith("provider.") || call === "engine.resume");
+		expect(backend).toEqual(["provider.listManaged", "provider.releaseLeftovers", "engine.resume"]);
 	});
 
 	it("marks a session failed when its engine session cannot be created", async () => {

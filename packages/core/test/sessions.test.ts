@@ -10,9 +10,16 @@ async function setUp() {
 	const engine = new FakeEngine();
 	const sandboxes = new FakeSandboxes();
 	const agents = new AgentService({ store, clock, ids, catalog: BUILTIN_TOOLS });
-	const sessions = new SessionService({ store, engine, agents, sandboxes, clock, ids });
+	const collected: string[] = [];
+	const checkpoints = {
+		collect: async (sessionId: string) => {
+			collected.push(sessionId);
+			return 0;
+		},
+	};
+	const sessions = new SessionService({ store, engine, agents, sandboxes, checkpoints, clock, ids });
 	const { agent } = await agents.create({ name: "fixer", spec: sampleSpec("v1") });
-	return { store, engine, sandboxes, agents, sessions, agentId: agent.id };
+	return { store, engine, sandboxes, agents, sessions, collected, agentId: agent.id };
 }
 
 describe("SessionService", () => {
@@ -102,8 +109,8 @@ describe("SessionService", () => {
 		expect((await store.getSession(session.id))?.status).toBe("active");
 	});
 
-	it("archives a session: status archived, run aborted, sandbox destroyed", async () => {
-		const { store, engine, sandboxes, sessions, agentId } = await setUp();
+	it("archives a session: status archived, run aborted, sandbox destroyed, checkpoints collected", async () => {
+		const { store, engine, sandboxes, sessions, collected, agentId } = await setUp();
 		const session = await sessions.create({ agentId });
 		let statusAtDestroy: string | undefined;
 		sandboxes.onDestroy = async (id) => {
@@ -118,6 +125,8 @@ describe("SessionService", () => {
 		expect(sandboxes.destroyed).toEqual([{ sessionId: session.id, reason: "archived" }]);
 		// 先改状态再销毁：销毁期间到达的消息已经会被拒绝
 		expect(statusAtDestroy).toBe("archived");
+		// 沙箱删掉之后清理它的存档
+		expect(collected).toEqual([session.id]);
 	});
 
 	it("rejects messages to an archived session with conflict", async () => {

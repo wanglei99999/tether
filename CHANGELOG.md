@@ -21,6 +21,9 @@ Tether 还没有发布版本号，按里程碑记录。每个里程碑合进 `ma
 - 每轮存档：`checkpointPolicy: "perRun"` 可以用了。用户每发一条消息、模型开始干活之前，给工作区存一张档，对齐到这条消息的条目；同一轮只存一次，重试和崩溃恢复不会重复存。会话还没有沙箱时只记一条"模板"存档，不复制任何东西。会话记录里每次存档有一条客户端可见的 `tether.checkpoint`（`data.checkpointId`、`entryId`、`durationMs`；模板存档带 `template: true`）。存档失败不打断这一轮，`tether.checkpoint` 里带 `error`。
 - 会话分叉：`POST /v1/sessions/:id/fork`（body `{ entryId }`）、SDK `sessions.fork`、CLI `tether session fork <会话> <条目>`。新会话用同一个 agent 版本和变量，对话到这一条为止，原会话不变。工作区取自这一刻最近的存档：分叉点之后的下一张存档之前没有执行过 `write`、`edit`、`bash` 就用它，否则用分叉点之前最近的一张；自己没有就沿分叉来源往上找。新会话里有一条模型可见的 `tether.fork` 说明：工作区已还原（进程不在）；存档早于分叉点时列出中间没有发生的操作，最多 20 条；找不到存档时说明工作区是模板。沙箱仍在第一次工具调用时创建，从存档建的不再执行 `setup`。条目不在会话里报 `invalid_request`，已归档的会话报 `conflict`。
 - 闲置删除：停止的沙箱从最后一次使用起超过 `TETHER_DESTROY_AFTER_SECONDS`（默认 604800，即 7 天，必须大于 `TETHER_STOP_AFTER_SECONDS`，否则启动报错）没被用过，巡检先存一张最终存档（对齐到会话最新的一条记录，`tether.checkpoint` 带 `final: true`；存档策略为 `none` 的会话不存），再删除容器和工作区，绑定变成 `lost`，原因是 "removed after 7 days without activity"。这一步只写客户端条目；下次工具调用从最终存档恢复时，模型才收到说明。最终存档失败也照样删除，恢复时用更早的存档。
+- 存档清理：会话归档后删除它的存档，被未归档的分叉会话引用的那张保留，到引用它的最后一个分叉也归档时再删。几条存档记录共用一张快照时（沙箱丢失的那一轮沿用上一张），最后一条记录删掉才删快照文件。
+- 稀疏化：存档所在的盘空闲低于 `TETHER_CHECKPOINT_MIN_FREE_PERCENT`（默认 10，设为 0 不稀疏化）时，每次巡检后一张一张删存档，空闲回到下限以上就停。最久没活动的会话先删；每个会话最新 5 张不动；更早的先删序号不是 10 的倍数的。被分叉引用的和模板存档不删。每删一张记一条日志，不写进会话。
+- 启动对账：存到一半的快照文件、没有存档记录的快照文件删除；快照文件已经不在的存档记录删除；镜像模式下没有容器的会话，释放它的 Docker 卷和 loop 设备（镜像文件保留，丢失重建时再删）。只看本实例 `workspaces/` 下的会话，宿主上别的 loop 设备不动。
 - 列出存档：`GET /v1/sessions/:id/checkpoints`、SDK `sessions.checkpoints`、CLI `tether checkpoints <会话>`，从旧到新，模板存档的 `snapshotId` 为 `null`。
 - 工作区快照：运行中的沙箱先 `docker pause` 再复制，存下的是暂停那一刻的一致状态，之后照常运行；后台进程会被冻结约 0.3 秒。快照只含 `/workspace`，不含进程和内存。镜像模式克隆 `disk.img`，目录模式用 `rsync --link-dest`（主机上需要 `rsync`）。快照在 `<数据目录>/checkpoints/<会话>/`。
 - 配置 `TETHER_WORKSPACE_STORAGE`（`auto`、`image`、`directory`，默认 `auto`）和 `TETHER_DEFAULT_DISK_MB`（没填 `diskMb` 时镜像的大小，默认 10240，镜像是稀疏文件，不预占）。存档目录固定为 `<数据目录>/checkpoints`，必须和 `workspaces/` 在同一个文件系统上。

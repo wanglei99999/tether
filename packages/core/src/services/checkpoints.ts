@@ -8,14 +8,25 @@ import type { SandboxRecord, SandboxService } from "./sandboxes.ts";
 export interface CheckpointServiceDeps {
 	store: AppStore;
 	sandboxes: Pick<SandboxService, "snapshot">;
-	provider: Pick<SandboxProvider, "deleteSnapshot">;
+	/** deleteSnapshot 删快照文件；storage 看存档所在的盘还剩多少，稀疏化按它判断。 */
+	provider: Pick<SandboxProvider, "deleteSnapshot" | "storage">;
 	/** submissionEntry 找一轮的用户条目；transcript 找最终存档对齐的最新条目。 */
 	engine: Pick<AgentEngine, "submissionEntry" | "transcript">;
 	clock: Clock;
 	ids: Ids;
 	record: SandboxRecord;
 	log: Log;
+	/** 存档所在的盘空闲比例低于它就稀疏化，默认 DEFAULT_MIN_FREE_RATIO。 */
+	minFreeRatio?: number;
 }
+
+export const DEFAULT_MIN_FREE_RATIO = 0.1;
+/** 稀疏化不动每个会话最新的这么多张（设计决定 9）。 */
+export const KEEP_NEWEST_CHECKPOINTS = 5;
+/** 稀疏化先删序号不是它的倍数的，留下稀疏的一串，分叉和恢复时离得不会太远。 */
+export const THIN_STRIDE = 10;
+
+const byEntry = (a: CheckpointRecord, b: CheckpointRecord) => Number(a.entryId) - Number(b.entryId);
 
 /** 这一轮开始时工作区是什么：一张新快照、沿用的快照、模板（null），或者不记（undefined）。 */
 type RoundStart = { snapshotId: string | null; taken: boolean } | undefined;
@@ -128,6 +139,87 @@ export class CheckpointService {
 			log.warn(`final checkpoint of session ${sessionId} failed`, error);
 			return false;
 		}
+	}
+
+	/**
+	 * 归档会话的存档清理（设计决定 9）：删掉没被未归档的分叉引用的那些。会话是从另一个已归档的会话分叉来的，
+	 * 对那个会话也清理一次：引用它的最后一个分叉归档之后，它被引用的存档才能删。会话没归档时什么都不做。
+	 */
+	async collect(sessionId: string): Promise<number> {
+		const { store } = this.#deps;
+		const session = await store.getSession(sessionId);
+		if (session?.status !== "archived") return 0;
+		let removed = 0;
+		for (const checkpoint of await store.listCheckpoints(sessionId)) {
+			if (await store.checkpointReferenced(checkpoint.id)) continue;
+			await this.#remove(checkpoint);
+			removed++;
+		}
+		const source = session.forkedFrom?.sessionId;
+		return source === undefined ? removed : removed + (await this.collect(source));
+	}
+
+	/**
+	 * 存档所在的盘空闲比例低于下限时稀疏化，一张一张删，每删一张重新看空间，够了就停。顺序：
+	 * 最久没活动的会话先删；每个会话最新 KEEP_NEWEST_CHECKPOINTS 张不动；同一会话里先删序号（按条目从旧到新，0 起）
+	 * 不是 THIN_STRIDE 倍数的，再删其余的，都从旧到新。被分叉引用的、模板存档（不占空间）不删。
+	 * 只记日志：之后在那里分叉或恢复，会找到更早的一张，说明里列出没有发生的操作。
+	 */
+	async thin(): Promise<number> {
+		if (await this.#enoughSpace()) return 0;
+		let removed = 0;
+		for (const checkpoint of await this.#thinCandidates()) {
+			await this.#remove(checkpoint);
+			removed++;
+			this.#deps.log.warn(
+				`free space for checkpoints is low; removed checkpoint ${checkpoint.id} of session ${checkpoint.sessionId} (entry ${checkpoint.entryId})`,
+			);
+			if (await this.#enoughSpace()) break;
+		}
+		return removed;
+	}
+
+	async #enoughSpace(): Promise<boolean> {
+		const { freeBytes, totalBytes } = await this.#deps.provider.storage();
+		return totalBytes > 0 && freeBytes / totalBytes >= (this.#deps.minFreeRatio ?? DEFAULT_MIN_FREE_RATIO);
+	}
+
+	async #thinCandidates(): Promise<CheckpointRecord[]> {
+		const { store } = this.#deps;
+		const bySession = new Map<string, CheckpointRecord[]>();
+		for (const checkpoint of await store.listAllCheckpoints()) {
+			bySession.set(checkpoint.sessionId, [...(bySession.get(checkpoint.sessionId) ?? []), checkpoint]);
+		}
+		const sessions = await Promise.all(
+			[...bySession.keys()].map(async (id) => ({ id, lastActiveAt: (await store.getSession(id))?.lastActiveAt ?? "" })),
+		);
+		sessions.sort((a, b) => a.lastActiveAt.localeCompare(b.lastActiveAt));
+
+		const ordered: CheckpointRecord[] = [];
+		for (const { id } of sessions) {
+			const all = [...(bySession.get(id) ?? [])].sort(byEntry);
+			const older = all.slice(0, Math.max(0, all.length - KEEP_NEWEST_CHECKPOINTS)).map((checkpoint, index) => ({ checkpoint, index }));
+			const sparse = older.filter(({ index }) => index % THIN_STRIDE !== 0);
+			const strided = older.filter(({ index }) => index % THIN_STRIDE === 0);
+			ordered.push(...[...sparse, ...strided].map(({ checkpoint }) => checkpoint));
+		}
+		const candidates: CheckpointRecord[] = [];
+		for (const checkpoint of ordered) {
+			if (checkpoint.snapshotId !== null && !(await store.checkpointReferenced(checkpoint.id))) candidates.push(checkpoint);
+		}
+		return candidates;
+	}
+
+	/**
+	 * 删一条存档记录；快照没有别的记录再用（沙箱丢失的那一轮沿用上一张快照，几条记录可以共用一张）才删快照文件。
+	 * 先删记录：删文件前崩溃留下的没有记录的文件，由启动对账删掉。
+	 */
+	async #remove(checkpoint: CheckpointRecord): Promise<void> {
+		const { store, provider } = this.#deps;
+		await store.deleteCheckpoint(checkpoint.id);
+		if (checkpoint.snapshotId === null) return;
+		const shared = (await store.listAllCheckpoints()).some((other) => other.snapshotId === checkpoint.snapshotId);
+		if (!shared) await provider.deleteSnapshot(checkpoint.snapshotId);
 	}
 
 	async #perRun(session: SessionRecord): Promise<boolean> {

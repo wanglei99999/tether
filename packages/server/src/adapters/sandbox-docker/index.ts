@@ -95,6 +95,26 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 		return result.stdout.trim() === "running" ? "running" : "stopped";
 	}
 
+	/** Tether 管理的全部容器（含别的 Tether 实例的），一次 docker ps。 */
+	async function managed(): Promise<{ sandboxId: string; sessionId: string; status: "running" | "stopped" }[]> {
+		const out = await dockerOrThrow([
+			"ps",
+			"--all",
+			"--filter",
+			`label=${MANAGED_LABEL}`,
+			"--format",
+			`{{.Names}}\t{{.Label "${SESSION_LABEL}"}}\t{{.State}}`,
+		]);
+		return out
+			.split("\n")
+			.filter((line) => line.trim() !== "")
+			.map((line) => {
+				const [sandboxId = "", sessionId = "", state = ""] = line.split("\t");
+				// 与 status() 一致：只有 running 算运行，created、exited、paused 等都算停止
+				return { sandboxId, sessionId, status: state === "running" ? "running" : "stopped" } as const;
+			});
+	}
+
 	/**
 	 * 按配置建并启动容器；工作区由 storage 准备，from 是快照在宿主上的路径。
 	 * spec 记在标签里，挂载失效时按它重建（start）。
@@ -194,23 +214,12 @@ export function createDockerSandboxProvider(options: DockerSandboxOptions): Sand
 			if (SESSION_ID.test(sessionId)) await storage.remove(sessionId);
 		},
 
-		async listManaged() {
-			const out = await dockerOrThrow([
-				"ps",
-				"--all",
-				"--filter",
-				`label=${MANAGED_LABEL}`,
-				"--format",
-				`{{.Names}}\t{{.Label "${SESSION_LABEL}"}}\t{{.State}}`,
-			]);
-			return out
-				.split("\n")
-				.filter((line) => line.trim() !== "")
-				.map((line) => {
-					const [sandboxId = "", sessionId = "", state = ""] = line.split("\t");
-					// 与 status() 一致：只有 running 算运行，created、exited、paused 等都算停止
-					return { sandboxId, sessionId, status: state === "running" ? "running" : "stopped" } as const;
-				});
+		listManaged: managed,
+
+		/** 没有容器的会话，工作区占着的卷和 loop 设备（只有镜像模式有）释放掉；工作区文件留给丢失重建或归档去删。 */
+		async releaseLeftovers() {
+			const live = new Set((await managed()).map(({ sessionId }) => sessionId));
+			return storage.release(live);
 		},
 
 		async fence(sandboxId, epoch) {

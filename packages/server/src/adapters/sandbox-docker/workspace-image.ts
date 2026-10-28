@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, open, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { TetherError } from "@tether/core";
@@ -171,6 +171,25 @@ export function createImageStorage(options: ImageStorageOptions): WorkspaceStora
 				await helper(`for d in $(${ASSOCIATED}); do losetup --detach "$d"; done`, image);
 			}
 			await rm(dirOf(sessionId), { recursive: true, force: true });
+		},
+
+		/**
+		 * 按 workspaceRoot 下的会话目录找：容器没了（在 Tether 之外被删、或停机期间丢了），卷和 loop 设备还在。
+		 * 不按 loop 设备的 backing_file 找：在容器里接上的设备，那里记的路径不是宿主上的绝对路径。
+		 */
+		async release(live) {
+			const entries = await readdir(options.workspaceRoot, { withFileTypes: true }).catch(() => []);
+			let released = 0;
+			for (const entry of entries) {
+				if (!entry.isDirectory() || live.has(entry.name)) continue;
+				const image = await realpath(imageOf(entry.name)).catch(() => undefined);
+				if (image === undefined) continue;
+				const hadVolume = (await volumeDevice(entry.name)) !== undefined;
+				if (hadVolume) await dockerOrThrow(["volume", "rm", "--force", volumeName(entry.name)]);
+				const detached = await helper(`for d in $(${ASSOCIATED}); do losetup --detach "$d" && echo "$d"; done`, image);
+				if (hadVolume || detached.trim() !== "") released++;
+			}
+			return released;
 		},
 	};
 }

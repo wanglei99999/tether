@@ -17,6 +17,7 @@ describe("loadConfig", () => {
 			maxRunningSandboxes: 4,
 			stopAfterMs: 3_600_000,
 			destroyAfterMs: 604_800_000,
+			checkpointMinFreePercent: 10,
 			sweepIntervalMs: 60_000,
 		});
 	});
@@ -32,6 +33,7 @@ describe("loadConfig", () => {
 			TETHER_MAX_RUNNING_SANDBOXES: "2",
 			TETHER_STOP_AFTER_SECONDS: "1800",
 			TETHER_DESTROY_AFTER_SECONDS: "86400",
+			TETHER_CHECKPOINT_MIN_FREE_PERCENT: "25",
 			TETHER_SWEEP_INTERVAL_SECONDS: "0.5",
 		});
 
@@ -49,6 +51,7 @@ describe("loadConfig", () => {
 			maxRunningSandboxes: 2,
 			stopAfterMs: 1_800_000,
 			destroyAfterMs: 86_400_000,
+			checkpointMinFreePercent: 25,
 			sweepIntervalMs: 500,
 		});
 	});
@@ -78,6 +81,14 @@ describe("loadConfig", () => {
 			for (const value of ["0", "-5", "ten"]) {
 				expect(() => loadConfig({ [name]: value }), `${name}=${value}`).toThrow(new RegExp(name));
 			}
+		}
+	});
+
+	it("accepts a free-space floor from 0 to below 100 percent", () => {
+		expect(loadConfig({ TETHER_CHECKPOINT_MIN_FREE_PERCENT: "0" }).checkpointMinFreePercent).toBe(0);
+		expect(loadConfig({ TETHER_CHECKPOINT_MIN_FREE_PERCENT: "2.5" }).checkpointMinFreePercent).toBe(2.5);
+		for (const value of ["100", "-1", "ten"]) {
+			expect(() => loadConfig({ TETHER_CHECKPOINT_MIN_FREE_PERCENT: value }), value).toThrow(/TETHER_CHECKPOINT_MIN_FREE_PERCENT/);
 		}
 	});
 
