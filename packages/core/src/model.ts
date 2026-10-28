@@ -80,6 +80,13 @@ export interface AgentVersionRecord {
 
 export type SessionStatus = "active" | "idle" | "archived" | "failed";
 
+/** 分叉出来的会话从哪里来。checkpointId 是分叉时选定的存档，没有可用存档时为 null（按模板新建）。 */
+export interface ForkOrigin {
+	sessionId: string;
+	entryId: string;
+	checkpointId: string | null;
+}
+
 export interface SessionRecord {
 	id: string;
 	ownerId: string;
@@ -88,7 +95,7 @@ export interface SessionRecord {
 	/** 应用表先写、引擎会话后建，所以在回填之前是 null。 */
 	engineSessionId: string | null;
 	parentSessionId: null;
-	forkedFrom: null;
+	forkedFrom: ForkOrigin | null;
 	variables: Record<string, string>;
 	status: SessionStatus;
 	title?: string;
@@ -108,10 +115,26 @@ export interface SandboxBinding {
 	template: string;
 	createdAt: string;
 	lastUsedAt: string;
+	/** 为什么变成 lost（例如闲置太久被删除），恢复时写进说明；重建成功后清除。 */
+	reason?: string;
 }
 
-/** 绑定建好后能改的字段。 */
-export type BindingPatch = Partial<Pick<SandboxBinding, "state" | "lastUsedAt">>;
+/** 绑定建好后能改的字段。reason 给 null 表示清除，不给表示不动。 */
+export type BindingPatch = Partial<Pick<SandboxBinding, "state" | "lastUsedAt">> & { reason?: string | null };
+
+/** 一张工作区存档（spec §5.3），对齐到触发这一轮的用户条目：内容是这一轮开始之前的工作区。 */
+export interface CheckpointRecord {
+	id: string;
+	sessionId: string;
+	/** 触发这一轮的提交；同一个提交至多一张存档。 */
+	submissionId: string;
+	/** 这一轮的用户条目；引擎条目 ID 是全局递增的整数，比较要按数值。 */
+	entryId: string;
+	/** 后端给的快照 ID。 */
+	snapshotId: string;
+	kind: "filesystem";
+	createdAt: string;
+}
 
 export interface ExpectedState {
 	state: SandboxState | readonly SandboxState[];

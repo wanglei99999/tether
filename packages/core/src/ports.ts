@@ -5,6 +5,7 @@ import type {
 	AgentVersionRecord,
 	AgentVersionSpec,
 	BindingPatch,
+	CheckpointRecord,
 	ExpectedState,
 	ModelRef,
 	SandboxBinding,
@@ -53,6 +54,18 @@ export interface AppStore {
 	nextEpoch(sessionId: string): Promise<number>;
 	deleteBinding(sessionId: string): Promise<void>;
 	listBindings(): Promise<SandboxBinding[]>;
+
+	/** 同一个 submissionId 已有存档时报 conflict。 */
+	addCheckpoint(checkpoint: CheckpointRecord): Promise<void>;
+	getCheckpoint(id: string): Promise<CheckpointRecord | undefined>;
+	checkpointForSubmission(submissionId: string): Promise<CheckpointRecord | undefined>;
+	/** 按 entryId 的数值从旧到新。 */
+	listCheckpoints(sessionId: string): Promise<CheckpointRecord[]>;
+	listAllCheckpoints(): Promise<CheckpointRecord[]>;
+	/** 不存在不报错。 */
+	deleteCheckpoint(id: string): Promise<void>;
+	/** 有没有未归档的会话以它为分叉存档（forkedFrom.checkpointId）：有就不能删。 */
+	checkpointReferenced(id: string): Promise<boolean>;
 }
 
 /** 创建引擎会话时交给引擎的配置，由 agent 版本翻译而来。 */
@@ -142,5 +155,5 @@ export interface Clock {
 
 export interface Ids {
 	/** 形如 agt_<ULID 或 UUIDv7>，按时间可排序。 */
-	next(prefix: "agt" | "ses"): string;
+	next(prefix: "agt" | "ses" | "cp"): string;
 }

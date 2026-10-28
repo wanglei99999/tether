@@ -3,6 +3,7 @@ import type {
 	AgentVersionRecord,
 	AgentVersionSpec,
 	AppStore,
+	CheckpointRecord,
 	SandboxBinding,
 	SessionRecord,
 } from "@tether/core";
@@ -73,6 +74,19 @@ export function sampleBinding(sessionId: string, overrides: Partial<SandboxBindi
 		template: "",
 		createdAt: T0,
 		lastUsedAt: T0,
+		...overrides,
+	};
+}
+
+export function sampleCheckpoint(id: string, overrides: Partial<CheckpointRecord> = {}): CheckpointRecord {
+	return {
+		id,
+		sessionId: "ses_1",
+		submissionId: `sub_${id}`,
+		entryId: "1",
+		snapshotId: `ses_1/${id}`,
+		kind: "filesystem",
+		createdAt: T0,
 		...overrides,
 	};
 }
@@ -271,6 +285,79 @@ export function registerAppStoreConformance(
 				code: "not_found",
 			});
 			await expect(store.nextEpoch("ses_missing")).rejects.toMatchObject({ code: "not_found" });
+		});
+
+		it("stores a checkpoint and finds it by id and by submission", async () => {
+			await store.addCheckpoint(sampleCheckpoint("cp_1"));
+
+			expect(await store.getCheckpoint("cp_1")).toEqual(sampleCheckpoint("cp_1"));
+			expect(await store.checkpointForSubmission("sub_cp_1")).toEqual(sampleCheckpoint("cp_1"));
+			expect(await store.getCheckpoint("cp_missing")).toBeUndefined();
+			expect(await store.checkpointForSubmission("sub_missing")).toBeUndefined();
+		});
+
+		it("rejects a second checkpoint for the same submission with conflict", async () => {
+			await store.addCheckpoint(sampleCheckpoint("cp_1", { submissionId: "sub_same" }));
+
+			await expect(store.addCheckpoint(sampleCheckpoint("cp_2", { submissionId: "sub_same" }))).rejects.toMatchObject({
+				code: "conflict",
+			});
+			expect(await store.getCheckpoint("cp_2")).toBeUndefined();
+		});
+
+		it("lists a session's checkpoints in numeric entry order and deletes one", async () => {
+			await store.addCheckpoint(sampleCheckpoint("cp_a", { entryId: "10" }));
+			await store.addCheckpoint(sampleCheckpoint("cp_b", { entryId: "9" }));
+			await store.addCheckpoint(sampleCheckpoint("cp_c", { entryId: "100" }));
+			await store.addCheckpoint(sampleCheckpoint("cp_other", { sessionId: "ses_2", entryId: "5" }));
+
+			// 按数值排：字符串排序会把 "10"、"100" 排在 "9" 前面
+			expect((await store.listCheckpoints("ses_1")).map((c) => c.id)).toEqual(["cp_b", "cp_a", "cp_c"]);
+			expect((await store.listAllCheckpoints()).map((c) => c.id).sort()).toEqual(["cp_a", "cp_b", "cp_c", "cp_other"]);
+
+			await store.deleteCheckpoint("cp_a");
+			await store.deleteCheckpoint("cp_missing");
+
+			expect((await store.listCheckpoints("ses_1")).map((c) => c.id)).toEqual(["cp_b", "cp_c"]);
+		});
+
+		it("round-trips forkedFrom on a session", async () => {
+			const forkedFrom = { sessionId: "ses_1", entryId: "42", checkpointId: "cp_1" };
+			await store.createSession(sampleSession("ses_2", { forkedFrom }));
+			await store.createSession(sampleSession("ses_3", { forkedFrom: { ...forkedFrom, checkpointId: null } }));
+
+			expect((await store.getSession("ses_2"))?.forkedFrom).toEqual(forkedFrom);
+			expect((await store.getSession("ses_3"))?.forkedFrom).toEqual({ ...forkedFrom, checkpointId: null });
+			expect((await store.getSession("ses_missing"))?.forkedFrom).toBeUndefined();
+		});
+
+		it("reports a checkpoint referenced only while the referencing session is not archived", async () => {
+			await store.addCheckpoint(sampleCheckpoint("cp_1"));
+			await store.addCheckpoint(sampleCheckpoint("cp_2"));
+			await store.createSession(
+				sampleSession("ses_2", { forkedFrom: { sessionId: "ses_1", entryId: "1", checkpointId: "cp_1" } }),
+			);
+
+			expect(await store.checkpointReferenced("cp_1")).toBe(true);
+			expect(await store.checkpointReferenced("cp_2")).toBe(false);
+
+			await store.updateSession("ses_2", { status: "archived" });
+
+			expect(await store.checkpointReferenced("cp_1")).toBe(false);
+		});
+
+		it("sets and clears the binding reason without touching the epoch", async () => {
+			await store.createBinding(sampleBinding("ses_1"));
+			await store.nextEpoch("ses_1");
+
+			const lost = await store.updateBinding("ses_1", { state: "lost", reason: "removed after 7 days without activity" });
+			expect(lost).toEqual(sampleBinding("ses_1", { epoch: 1, state: "lost", reason: "removed after 7 days without activity" }));
+			// 不带 reason 的更新不动它
+			expect((await store.updateBinding("ses_1", { lastUsedAt: T0 })).reason).toBe("removed after 7 days without activity");
+
+			const cleared = await store.updateBinding("ses_1", { state: "creating", reason: null });
+			expect(cleared).toEqual(sampleBinding("ses_1", { epoch: 1, state: "creating" }));
+			expect(await store.getBinding("ses_1")).toEqual(sampleBinding("ses_1", { epoch: 1, state: "creating" }));
 		});
 
 		it("round-trips variables with shell metacharacters", async () => {

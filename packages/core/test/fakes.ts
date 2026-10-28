@@ -33,7 +33,7 @@ export class ManualClock implements Clock {
 
 export class FakeIds implements Ids {
 	#next = 1;
-	next(prefix: "agt" | "ses"): string {
+	next(prefix: "agt" | "ses" | "cp"): string {
 		return `${prefix}_${String(this.#next++).padStart(4, "0")}`;
 	}
 }

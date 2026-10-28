@@ -1,5 +1,5 @@
-/** 表结构照设计文档 §5。checkpoints 表 M3 再建，届时把 SCHEMA_VERSION 加一并补迁移。 */
-export const SCHEMA_VERSION = 1;
+/** 表结构照设计文档 §5。改表结构就是在 MIGRATIONS 末尾加一步，SCHEMA_VERSION 随之加一。 */
+export const SCHEMA_VERSION = 2;
 
 export const SCHEMA_V1 = `
 CREATE TABLE agent_definitions (
@@ -47,3 +47,23 @@ CREATE TABLE sandbox_bindings (
 	last_used_at  TEXT NOT NULL
 );
 `;
+
+/** 第 2 版（M3）：存档表；绑定记下变成 lost 的原因。sessions.forked_from 第 1 版已有，存 JSON。 */
+export const SCHEMA_V2 = `
+-- entry_id 是引擎的全局递增整数，按数值比较和排序
+CREATE TABLE checkpoints (
+	id             TEXT PRIMARY KEY,
+	session_id     TEXT NOT NULL,
+	submission_id  TEXT NOT NULL UNIQUE,
+	entry_id       INTEGER NOT NULL,
+	snapshot_id    TEXT NOT NULL,
+	kind           TEXT NOT NULL,
+	created_at     TEXT NOT NULL
+);
+CREATE INDEX checkpoints_by_session ON checkpoints (session_id, entry_id);
+
+ALTER TABLE sandbox_bindings ADD COLUMN reason TEXT;
+`;
+
+/** MIGRATIONS[i] 把第 i 版升到第 i + 1 版。 */
+export const MIGRATIONS: readonly string[] = [SCHEMA_V1, SCHEMA_V2];
