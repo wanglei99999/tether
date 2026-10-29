@@ -2,13 +2,13 @@
 
 Tether 还没有发布版本号，按里程碑记录。每个里程碑合进 `main` 时定稿；`[未发布]` 是正在进行的里程碑，随任务完成追加。只记使用者能感知的变化：API、命令、配置、数据目录、行为和已知限制。设计上的取舍见 `docs/adr/`。
 
-## [未发布]：M3 检查点与分叉
+## M3 检查点与分叉：2026-10-29
 
-计划：`docs/superpowers/plans/2026-10-28-m3-checkpoints-and-forks.md`。
+PR #4，合并提交 `ece5aa7`。决定见 ADR-011，执行中的决定见 `docs/superpowers/plans/2026-10-28-m3-rulings.md`，端到端验收见 `docs/acceptance/m3.md`。
 
 ### 变更
 
-- 工作区的存法（ADR-011，M3 结束时写）：数据目录在支持 reflink 的文件系统上时（例如 XFS `reflink=1`），每个会话的工作区是一个 XFS 镜像文件 `workspaces/<会话>/disk.img`，经 loop 设备和 Docker 卷挂成 `/workspace`；否则仍是 M2 的宿主目录挂载，并在启动时打印一条警告。启动时自动选择，也可以用 `TETHER_WORKSPACE_STORAGE` 指定。镜像模式下宿主上看不到工作区里的单个文件，要用 `tether files`、`tether cat` 或文件浏览 API。
+- 工作区的存法（ADR-011）：数据目录在支持 reflink 的文件系统上时（例如 XFS `reflink=1`），每个会话的工作区是一个 XFS 镜像文件 `workspaces/<会话>/disk.img`，经 loop 设备和 Docker 卷挂成 `/workspace`；否则仍是 M2 的宿主目录挂载，并在启动时打印一条警告。启动时自动选择，也可以用 `TETHER_WORKSPACE_STORAGE` 指定。镜像模式下宿主上看不到工作区里的单个文件，要用 `tether files`、`tether cat` 或文件浏览 API。
 - 镜像模式需要的 `losetup` 由一次性的 `--privileged` 容器执行；Tether 进程本身仍以普通用户运行，不需要 sudo。
 - 丢失重建改为从存档恢复：沙箱被删掉后，下一次工具调用从会话最近的一张存档建新沙箱（自己还没有存档的分叉会话用分叉时选中的那张），不再执行 `setup`，并告诉模型工作区还原到了那张存档、之后执行过的哪些操作不在里面（最多 20 条）。没有存档或最近的存档是模板时，仍按 M2 的方式按模板重建。`tether.sandbox` 条目的 `data.checkpointId` 记下用的是哪一张。
 - 沙箱停止时，会话只有在没有一轮正在运行时才改为 `idle`（M2 里无条件改）。
@@ -36,7 +36,6 @@ Tether 还没有发布版本号，按里程碑记录。每个里程碑合进 `ma
 - 镜像模式下容器在 Tether 之外被删掉后，Docker 卷和容器同名（`tether-<会话>`），状态查询读到卷而报错，巡检永远标不成 `lost`。查容器的 `docker inspect` 一律限定 `--type container`（M3 端到端验收发现，`docs/acceptance/m3.md`）。
 - 删掉一个会话的最后一张快照时，连同 `checkpoints/<会话>/` 目录一起删除。
 - 目录模式的快照可能混进上一张的旧文件：`rsync --link-dest` 默认按整秒比较修改时间，同一秒内改过、长度没变的文件被当成没改，链接到上一张快照的旧内容。改为连纳秒一起比较（`--modify-window=-1`）。在 gVisor 下跑 Docker 测试时发现（目录模式的一致性用例 15 次失败 2 次），runc 下同样会发生。
-
 - 沙箱丢失后开始的那一轮、分叉会话的第一轮，存档记录沿用更早的快照，却对齐到这一轮的用户条目；丢失恢复和分叉按它算"没有发生的操作"，会告诉模型什么都没丢。存档记录增加 `basisCheckpointId`，这种记录查找时跳过，用它沿用的那条（最终审查发现）。
 - 存档失败后，同一轮后面的模型请求会再存一次，存下的是这一轮工具改过的状态。失败时记一条 `failed` 的存档记录挡住同一轮，查找时跳过它。
 - 存档到一半进程崩溃（或 `unpause` 失败）留下的 paused 容器，之后每次启动都被 Docker 拒绝。启动时遇到 paused 改为 `unpause`；存档前一律 `sync`，`sync` 有 120 秒上限。
