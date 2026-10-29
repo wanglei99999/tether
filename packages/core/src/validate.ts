@@ -14,26 +14,33 @@ export function checkSchema(schema: TSchema, value: unknown, what: string): void
 
 /** spec 里已经定义、但还没有实现的配置；为 true 时填了就拒绝，不悄悄忽略。 */
 export interface Unsupported {
-	/** sandbox.resources.diskMb：Docker 限制磁盘要 overlay2 + xfs pquota。 */
+	/** sandbox.resources.diskMb：只有工作区是镜像文件时才有上限（ADR-011），由组装层按存储模式决定。 */
 	diskMb: boolean;
-	/** permissions.requireApproval：审批在 M3。 */
+	/** permissions.requireApproval：审批在 M3 之后单独一份计划。 */
 	approval: boolean;
-	/** checkpointPolicy "perRun"：检查点在 M3。 */
+	/** checkpointPolicy "perRun"：后端不支持快照时拒绝。 */
 	checkpoints: boolean;
+	/** diskMb 的下限：工作区镜像是 XFS，mkfs.xfs 不接受小于 300 MB 的文件系统。 */
+	minDiskMb?: number;
 }
 
-export const UNSUPPORTED_IN_M2: Unsupported = { diskMb: true, approval: true, checkpoints: true };
+/** 默认：diskMb 是否支持取决于存储模式，组装层知道后再放开；审批还没做。 */
+export const UNSUPPORTED_IN_M3: Unsupported = { diskMb: true, approval: true, checkpoints: false };
 
 export function validateVersionSpec(
 	spec: unknown,
 	catalog: readonly ToolDescriptor[],
-	unsupported: Unsupported = UNSUPPORTED_IN_M2,
+	unsupported: Unsupported = UNSUPPORTED_IN_M3,
 ): AgentVersionSpec {
 	checkSchema(AgentVersionSpec, spec, "agent version spec");
 	const typed = spec as AgentVersionSpec;
 
 	const notYet = (field: string) => new TetherError("invalid_request", `${field} is not supported yet`);
-	if (unsupported.diskMb && typed.sandbox.resources.diskMb !== undefined) throw notYet("sandbox.resources.diskMb");
+	const { diskMb } = typed.sandbox.resources;
+	if (unsupported.diskMb && diskMb !== undefined) throw notYet("sandbox.resources.diskMb");
+	if (unsupported.minDiskMb !== undefined && diskMb !== undefined && diskMb < unsupported.minDiskMb) {
+		throw new TetherError("invalid_request", `sandbox.resources.diskMb must be at least ${unsupported.minDiskMb}`);
+	}
 	if (unsupported.approval && typed.permissions.requireApproval.length > 0) throw notYet("permissions.requireApproval");
 	if (unsupported.checkpoints && typed.checkpointPolicy === "perRun") throw notYet("checkpointPolicy perRun");
 

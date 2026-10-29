@@ -9,6 +9,7 @@ import {
 	AgentService,
 	type AppStore,
 	BUILTIN_TOOLS,
+	CheckpointService,
 	type Log,
 	recover,
 	type SandboxRecord,
@@ -16,12 +17,12 @@ import {
 	SessionService,
 	startSweeper,
 	TetherError,
-	UNSUPPORTED_IN_M2,
+	UNSUPPORTED_IN_M3,
 	WORKSPACE,
 } from "@tether/core";
 import { openPiEngine } from "./adapters/engine-pi/index.ts";
 import { createPiEnvExecChannel, lazyEnv } from "./adapters/exec-pienv/index.ts";
-import { createDockerSandboxProvider } from "./adapters/sandbox-docker/index.ts";
+import { createDockerSandboxProvider, MIN_DISK_MB, probeWorkspaceStorage } from "./adapters/sandbox-docker/index.ts";
 import { openSqliteAppStore } from "./adapters/store-sqlite/index.ts";
 import type { Config } from "./config.ts";
 import { createHttpApp, type HttpApp } from "./http/routes.ts";
@@ -60,6 +61,26 @@ const stderrLog: Log = {
 	},
 };
 
+/**
+ * 工作区的存法（ADR-011）：auto 时能 reflink 就用镜像，否则退回目录并告警；
+ * 显式要 image 却不支持 reflink 时不启动，免得悄悄用上没有磁盘上限、存档又慢的目录模式。
+ */
+async function chooseStorage(config: Config, log: Log): Promise<"image" | "directory"> {
+	if (config.workspaceStorage === "directory") return "directory";
+	const probed = await probeWorkspaceStorage(config.workspaceRoot, config.checkpointRoot);
+	if (probed === "image") return "image";
+	if (config.workspaceStorage === "image") {
+		throw new TetherError(
+			"invalid_request",
+			`TETHER_WORKSPACE_STORAGE=image needs ${config.workspaceRoot} and ${config.checkpointRoot} on one filesystem with reflink (for example XFS with reflink=1)`,
+		);
+	}
+	log.warn(
+		`${config.workspaceRoot} does not support reflink; using directory workspaces (no disk limit, slow checkpoints). Put the data directory on XFS with reflink=1 to use workspace images.`,
+	);
+	return "directory";
+}
+
 function hostUser(): string {
 	const uid = process.getuid?.();
 	const gid = process.getgid?.();
@@ -74,12 +95,18 @@ function hostUser(): string {
 export async function createTether(config: Config, overrides: TetherOverrides = {}): Promise<Tether> {
 	const log = overrides.log ?? stderrLog;
 	await mkdir(config.workspaceRoot, { recursive: true });
+	await mkdir(config.checkpointRoot, { recursive: true });
 
+	const storage = await chooseStorage(config, log);
 	const { store, close: closeStore } = await openSqliteAppStore(join(config.dataDir, "tether.sqlite"));
 	const provider = createDockerSandboxProvider({
 		workspaceRoot: config.workspaceRoot,
 		user: hostUser(),
 		defaultImage: config.sandboxImage,
+		storage,
+		defaultDiskMb: config.defaultDiskMb,
+		checkpointRoot: config.checkpointRoot,
+		imagePullTimeoutMs: config.imagePullTimeoutMs,
 		...(config.sandboxRuntime !== undefined && { runtime: config.sandboxRuntime }),
 	});
 	// 每次启动 daemon 前先隔离旧的（ADR-007）。sandboxes 在下面才建好，回调只在运行时调用。
@@ -105,13 +132,41 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 				if (!engine) throw new TetherError("internal", "the engine is not open yet");
 				return engine.isRunning(engineSessionId);
 			},
+			transcript: (engineSessionId, page) => {
+				if (!engine) throw new TetherError("internal", "the engine is not open yet");
+				return engine.transcript(engineSessionId, page);
+			},
 		},
 		clock: systemClock,
 		setupTimeoutMs: config.setupTimeoutMs,
 		maxRunning: config.maxRunningSandboxes,
 		stopAfterMs: config.stopAfterMs,
+		destroyAfterMs: config.destroyAfterMs,
+		// checkpoints 在下面才建，巡检开始时早已建好
+		finalCheckpoint: (binding, take) => checkpoints.final(binding, take),
 		log,
 		record,
+	});
+	const ids = createIds();
+	const checkpoints = new CheckpointService({
+		store,
+		sandboxes,
+		provider,
+		engine: {
+			submissionEntry: (submissionId) => {
+				if (!engine) throw new TetherError("internal", "the engine is not open yet");
+				return engine.submissionEntry(submissionId);
+			},
+			transcript: (engineSessionId, page) => {
+				if (!engine) throw new TetherError("internal", "the engine is not open yet");
+				return engine.transcript(engineSessionId, page);
+			},
+		},
+		clock: systemClock,
+		ids,
+		record,
+		log,
+		minFreeRatio: config.checkpointMinFreePercent / 100,
 	});
 
 	const opened = await openPiEngine({
@@ -128,13 +183,19 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 				resolve: async () => exec.piEnv(await sandboxes.ensureSandbox(session.id), WORKSPACE),
 			});
 		},
+		// 每轮第一次请求模型之前存档（spec §8.3）；存档失败只记日志，这一轮照常
+		onRunStart: async (engineSessionId, submissionId) => {
+			const session = await store.getSessionByEngineId(engineSessionId);
+			if (session) await checkpoints.onRunStart(session.id, submissionId);
+		},
 		onError: (error) => log.warn("engine reported an error", error),
 	});
 	engine = opened;
 
-	const ids = createIds();
-	const agents = new AgentService({ store, clock: systemClock, ids, catalog: BUILTIN_TOOLS, unsupported: UNSUPPORTED_IN_M2 });
-	const sessions = new SessionService({ store, engine: opened, agents, sandboxes, clock: systemClock, ids });
+	// 目录模式限制不了磁盘，填了 diskMb 就拒绝，不悄悄忽略
+	const unsupported = { ...UNSUPPORTED_IN_M3, diskMb: storage === "directory", minDiskMb: MIN_DISK_MB };
+	const agents = new AgentService({ store, clock: systemClock, ids, catalog: BUILTIN_TOOLS, unsupported });
+	const sessions = new SessionService({ store, engine: opened, agents, sandboxes, checkpoints, clock: systemClock, ids });
 
 	let recovered: Awaited<ReturnType<typeof recover>>;
 	try {
@@ -151,7 +212,15 @@ export async function createTether(config: Config, overrides: TetherOverrides = 
 			log.warn(`recording the startup note for session ${sessionId} failed`, error),
 		);
 	}
-	const sweeper = startSweeper(() => sandboxes.sweep(), config.sweepIntervalMs, log);
+	// 先巡检（闲置删除会存最终存档），再看存档的盘够不够
+	const sweeper = startSweeper(
+		async () => {
+			await sandboxes.sweep();
+			await checkpoints.thin();
+		},
+		config.sweepIntervalMs,
+		log,
+	);
 
 	const http = createHttpApp({
 		agents,

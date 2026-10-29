@@ -35,6 +35,7 @@ const CreateSessionBody = Type.Object({
 	agentVersion: Type.Optional(Type.Integer({ minimum: 1 })),
 	variables: Type.Optional(Type.Unknown()),
 });
+const ForkBody = Type.Object({ entryId: Type.String({ minLength: 1 }) });
 const SendMessageBody = Type.Object({
 	content: Type.String(),
 	requestId: Type.String({ minLength: 1 }),
@@ -149,6 +150,11 @@ function sessionRoutes(sessions: SessionService, sandboxes: HttpDeps["sandboxes"
 		return ok(c, {});
 	});
 	r.post("/:id/archive", async (c) => ok(c, { session: await sessions.archive(c.req.param("id")) }));
+	r.post("/:id/fork", async (c) => {
+		const { entryId } = await body(c, ForkBody);
+		return ok(c, { session: await sessions.fork(c.req.param("id"), entryId) });
+	});
+	r.get("/:id/checkpoints", async (c) => ok(c, { items: await sessions.checkpoints(c.req.param("id")) }));
 	r.get("/:id/transcript", async (c) => {
 		const page = { limit: limitParam(c.req.query("limit")), ...optional("before", c.req.query("before")) };
 		return ok(c, await sessions.transcript(c.req.param("id"), page));

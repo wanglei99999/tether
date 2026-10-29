@@ -209,6 +209,25 @@ describe("tether CLI", () => {
 		expect(outside.stderr).toMatch(/invalid_request: path is outside \/workspace/);
 	});
 
+	it("forks a session and lists checkpoints from the command line", async () => {
+		const response = await fetch(`${url}/v1/sessions/${firstSessionId}/transcript?limit=50`, {
+			headers: { authorization: `Bearer ${TOKEN}` },
+		});
+		const { data } = (await response.json()) as { data: { items: { id: string; role?: string }[] } };
+		const entryId = data.items.find((e) => e.role === "user")!.id;
+
+		const forked = await cli("session", "fork", firstSessionId, entryId);
+		expect(forked).toMatchObject({ code: 0, stderr: "" });
+		// 这个 agent 的存档策略是 none：没有存档，分叉出来的工作区是模板
+		expect(forked.stdout).toMatch(new RegExp(`^ses_\\S+ \\(forked from ${firstSessionId} at entry ${entryId}, checkpoint none\\)`));
+		const listed = await cli("checkpoints", firstSessionId);
+		expect(listed).toMatchObject({ code: 0, stdout: "no checkpoints\n" });
+
+		const missing = await cli("session", "fork", firstSessionId, "999999");
+		expect(missing.code).toBe(1);
+		expect(missing.stderr).toMatch(/invalid_request/);
+	});
+
 	it("archives a session from the command line", async () => {
 		const archived = await cli("session", "archive", firstSessionId);
 		expect(archived).toMatchObject({ code: 0, stderr: "" });

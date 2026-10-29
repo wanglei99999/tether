@@ -88,6 +88,67 @@ export function registerSandboxProviderConformance(
 			await expect(made.provider.fence(sandboxId, 1)).rejects.toMatchObject({ code: "sandbox_failed" });
 		});
 
+		it("snapshots a running sandbox and keeps it running", async () => {
+			const { sandboxId } = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec() });
+
+			const { snapshotId } = await made.provider.snapshot(sandboxId);
+
+			expect(typeof snapshotId).toBe("string");
+			expect(await made.provider.status(sandboxId)).toBe("running");
+			expect(await made.provider.listSnapshots()).toContainEqual({ snapshotId, partial: false });
+		});
+
+		it("snapshots a stopped sandbox and leaves it stopped", async () => {
+			const { sandboxId } = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec() });
+			await made.provider.stop(sandboxId);
+
+			const { snapshotId } = await made.provider.snapshot(sandboxId);
+
+			expect(await made.provider.status(sandboxId)).toBe("stopped");
+			expect((await made.provider.listSnapshots()).map((s) => s.snapshotId)).toContain(snapshotId);
+		});
+
+		it("creates a running sandbox from a snapshot", async () => {
+			const { sandboxId } = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec() });
+			const { snapshotId } = await made.provider.snapshot(sandboxId);
+			const sessionId = made.sessionId();
+
+			const restored = await made.provider.create({ sessionId, spec: sampleSandboxSpec(), from: snapshotId });
+
+			expect(restored.sandboxId).not.toBe(sandboxId);
+			expect(await made.provider.status(restored.sandboxId)).toBe("running");
+			expect(await made.provider.listManaged()).toContainEqual({ sandboxId: restored.sandboxId, sessionId, status: "running" });
+		});
+
+		it("lists snapshots and deletes one; deleting a missing one does not throw", async () => {
+			const { sandboxId } = await made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec() });
+			const first = await made.provider.snapshot(sandboxId);
+			const second = await made.provider.snapshot(sandboxId);
+
+			await made.provider.deleteSnapshot(first.snapshotId);
+			await made.provider.deleteSnapshot(first.snapshotId);
+
+			const ids = (await made.provider.listSnapshots()).map((s) => s.snapshotId);
+			expect(ids).not.toContain(first.snapshotId);
+			expect(ids).toContain(second.snapshotId);
+		});
+
+		it("rejects a snapshot id that is not of the documented form with invalid_request", async () => {
+			// 快照 ID 会拼进路径：形如 ../x 的一律拒绝
+			await expect(made.provider.deleteSnapshot("../x")).rejects.toMatchObject({ code: "invalid_request" });
+			await expect(
+				made.provider.create({ sessionId: made.sessionId(), spec: sampleSandboxSpec(), from: "../../etc/passwd" }),
+			).rejects.toMatchObject({ code: "invalid_request" });
+		});
+
+		it("reports free and total bytes of the snapshot storage", async () => {
+			const { freeBytes, totalBytes } = await made.provider.storage();
+
+			expect(totalBytes).toBeGreaterThan(0);
+			expect(freeBytes).toBeGreaterThan(0);
+			expect(freeBytes).toBeLessThanOrEqual(totalBytes);
+		});
+
 		it("returns a daemon command that ends with the epoch", async () => {
 			const sessionId = made.sessionId();
 			const { sandboxId } = await made.provider.create({ sessionId, spec: sampleSandboxSpec() });

@@ -10,6 +10,8 @@ export const USAGE = `usage:
   tether agent list
   tether session create <agentId> [--version N] [--var KEY=VALUE]...
   tether session archive <sessionId>
+  tether session fork <sessionId> <entryId>
+  tether checkpoints <sessionId>
   tether send <sessionId> <text> [--follow]
   tether sandbox <sessionId>
   tether files <sessionId> [path]
@@ -142,6 +144,19 @@ async function dispatch(client: TetherClient, args: Parsed, io: Io): Promise<num
 	if (group === "session" && action === "archive") {
 		const session = await client.sessions.archive(need(rest[0], "<sessionId>"));
 		print({ session }, `${session.id} archived`);
+		return 0;
+	}
+	if (group === "session" && action === "fork") {
+		const sessionId = need(rest[0], "<sessionId>");
+		const session = await client.sessions.fork(sessionId, need(rest[1], "<entryId>"));
+		const checkpoint = session.forkedFrom?.checkpointId ?? "none";
+		print({ session }, `${session.id} (forked from ${sessionId} at entry ${rest[1]}, checkpoint ${checkpoint})`);
+		return 0;
+	}
+	if (group === "checkpoints") {
+		const items = await client.sessions.checkpoints(need(action, "<sessionId>"));
+		const lines = items.map((c) => `${c.id}  entry ${c.entryId}  ${c.snapshotId === null ? "template" : c.snapshotId}  ${c.createdAt}`);
+		print({ items }, lines.join("\n") || "no checkpoints");
 		return 0;
 	}
 	if (group === "send") {

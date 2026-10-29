@@ -1,4 +1,4 @@
-import { MemoryAppStore, sampleAgent, sampleSession, sampleSpec } from "@tether/testkit";
+import { MemoryAppStore, sampleAgent, sampleBinding, sampleCheckpoint, sampleSession, sampleSpec } from "@tether/testkit";
 import { describe, expect, it } from "vitest";
 import {
 	type BindingPatch,
@@ -7,6 +7,7 @@ import {
 	type SandboxBinding,
 	type SandboxNote,
 	SandboxService,
+	type SandboxServiceDeps,
 } from "../src/index.ts";
 import { FakeClock, FakeEngine, FakeExecChannel, FakeProvider, ManualClock } from "./fakes.ts";
 
@@ -30,10 +31,12 @@ interface SetUpOptions {
 	setupTimeoutMs?: number;
 	maxRunning?: number;
 	stopAfterMs?: number;
+	destroyAfterMs?: number;
+	finalCheckpoint?: SandboxServiceDeps["finalCheckpoint"];
 }
 
 async function setUp(setup: string[] = [], variables: Record<string, string> = {}, options: SetUpOptions = {}) {
-	const { setupTimeoutMs, maxRunning, stopAfterMs } = options;
+	const { setupTimeoutMs, maxRunning, stopAfterMs, destroyAfterMs, finalCheckpoint } = options;
 	const store = new SpyStore();
 	const spec = sampleSpec();
 	spec.sandbox.setup = setup;
@@ -62,6 +65,8 @@ async function setUp(setup: string[] = [], variables: Record<string, string> = {
 		...(setupTimeoutMs !== undefined && { setupTimeoutMs }),
 		...(maxRunning !== undefined && { maxRunning }),
 		...(stopAfterMs !== undefined && { stopAfterMs }),
+		...(destroyAfterMs !== undefined && { destroyAfterMs }),
+		...(finalCheckpoint !== undefined && { finalCheckpoint }),
 	});
 	return { store, provider, exec, engine, clock, recorded, notes, warnings, sandboxes };
 }
@@ -84,7 +89,7 @@ describe("SandboxService.ensureSandbox", () => {
 		const binding = await sandboxes.ensureSandbox("ses_1");
 
 		expect(binding).toMatchObject({ sessionId: "ses_1", provider: "docker", epoch: 0, state: "running", template: "" });
-		expect(provider.calls).toEqual(["create"]);
+		expect(provider.calls).toEqual(["prepareImage", "create"]);
 		expect(exec.calls).toEqual([
 			{ sandboxId: binding.sandboxId, cwd: "/workspace", command: 'git clone "$REPO_URL" .', env: variables, timeoutMs: 600_000 },
 			{ sandboxId: binding.sandboxId, cwd: "/workspace", command: "npm ci", env: variables, timeoutMs: 600_000 },
@@ -108,7 +113,7 @@ describe("SandboxService.ensureSandbox", () => {
 		expect(error).toMatchObject({ code: "sandbox_failed" });
 		expect((error as Error).message).toContain("`git clone https://dead.example/r.git .`");
 		expect((error as Error).message).toContain("timed out");
-		expect(provider.calls).toEqual(["create", "destroy"]);
+		expect(provider.calls).toEqual(["prepareImage", "create", "destroy"]);
 		expect(await store.getBinding("ses_1")).toBeUndefined();
 	});
 
@@ -161,7 +166,7 @@ describe("SandboxService.ensureSandbox", () => {
 		expect(message).toContain("error: missing header");
 		expect(message).toContain("compiling");
 		expect(exec.calls.map((c) => c.command)).toEqual(["true", "make build"]);
-		expect(provider.calls).toEqual(["create", "destroy"]);
+		expect(provider.calls).toEqual(["prepareImage", "create", "destroy"]);
 		expect(provider.containers.size).toBe(0);
 		expect(exec.closed).toHaveLength(1);
 		expect(await store.getBinding("ses_1")).toBeUndefined();
@@ -248,6 +253,39 @@ describe("SandboxService.ensureSandbox", () => {
 });
 
 describe("SandboxService admission", () => {
+	it("pulls a missing template image before taking the admission lock", async () => {
+		// 拉镜像可能要几分钟：ses_1 卡在拉镜像时，ses_2 照样能建沙箱
+		const { store, provider, sandboxes } = await setUpSessions(2, { maxRunning: 1 });
+		let release = () => {};
+		provider.onPrepareImage = () => {
+			provider.onPrepareImage = async () => {};
+			return new Promise((resolve) => {
+				release = resolve;
+			});
+		};
+		const first = sandboxes.ensureSandbox("ses_1");
+		await new Promise((resolve) => setTimeout(resolve, 10));
+
+		await expect(sandboxes.ensureSandbox("ses_2")).resolves.toMatchObject({ state: "running" });
+
+		release();
+		// 名额被 ses_2 占了：ses_1 拉完镜像才进准入，被拒绝
+		await expect(first).rejects.toMatchObject({ code: "sandbox_limit" });
+		expect(await store.getBinding("ses_1")).toBeUndefined();
+		expect(provider.calls.filter((call) => call === "prepareImage")).toHaveLength(2);
+	});
+
+	it("counts a lost sandbox whose cleanup failed towards the limit", async () => {
+		// setup 失败后容器没删掉：它可能还在跑，占着资源
+		const { store, sandboxes } = await setUpSessions(2, { maxRunning: 1 });
+		await store.createBinding(sampleBinding("ses_1", { state: "lost", reason: "cleanup failed" }));
+
+		await expect(sandboxes.ensureSandbox("ses_2")).rejects.toMatchObject({ code: "sandbox_limit" });
+
+		await store.updateBinding("ses_1", { reason: "missing" }, { state: "lost" });
+		await expect(sandboxes.ensureSandbox("ses_2")).resolves.toMatchObject({ state: "running" });
+	});
+
 	it("refuses a new sandbox at the limit with sandbox_limit and records tether.admission", async () => {
 		const { store, provider, notes, sandboxes } = await setUpSessions(2, { maxRunning: 1 });
 		await sandboxes.ensureSandbox("ses_1");
@@ -344,7 +382,7 @@ describe("SandboxService rebuild", () => {
 
 		expect(rebuilt).toMatchObject({ state: "running", epoch: 0 });
 		expect(rebuilt.sandboxId).not.toBe(first.sandboxId);
-		expect(provider.calls).toEqual(["destroy", "create"]);
+		expect(provider.calls).toEqual(["destroy", "prepareImage", "create"]);
 		expect(exec.closed).toContain(first.sandboxId);
 		expect(exec.calls.map((c) => c.command)).toEqual(["prep"]);
 		expect(notes.at(-1)).toEqual({
@@ -352,6 +390,136 @@ describe("SandboxService rebuild", () => {
 			data: { state: "running", reason: "recovered" },
 			modelText: NOTES.reset("missing"),
 		});
+	});
+
+	/** ses_1 有沙箱，存档 cp_1 对齐到条目 1（快照 snap_1）；之后写了 a.txt、执行了 make、读了一个文件；然后容器丢了。 */
+	async function lostAfterCheckpoint(setup: string[] = ["prep"]) {
+		const made = await setUp(setup);
+		const { store, provider, engine, sandboxes } = made;
+		await sandboxes.ensureSandbox("ses_1");
+		const entryId = engine.push("eng_1", { kind: "pi.user", role: "user", text: "go" });
+		await store.addCheckpoint(sampleCheckpoint("cp_1", { entryId, snapshotId: "snap_1" }));
+		provider.snapshots.set("snap_1", { sandboxId: "sbx_1", partial: false });
+		engine.ran("eng_1", "write", { path: "a.txt" });
+		engine.ran("eng_1", "bash", { command: "make" });
+		engine.ran("eng_1", "read", { path: "a.txt" });
+		provider.containers.clear();
+		await sandboxes.sweep();
+		made.provider.calls.length = 0;
+		made.exec.calls.length = 0;
+		return made;
+	}
+
+	it("rebuilds a lost sandbox from the latest checkpoint and lists the calls after it", async () => {
+		const { store, provider, exec, notes, sandboxes } = await lostAfterCheckpoint();
+
+		const rebuilt = await sandboxes.ensureSandbox("ses_1");
+
+		expect(rebuilt).toMatchObject({ state: "running", epoch: 0 });
+		expect(provider.calls).toEqual(["destroy", "prepareImage", "create-from"]);
+		expect(provider.containers.get(rebuilt.sandboxId)?.from).toBe("snap_1");
+		// 存档里已经有 setup 的结果
+		expect(exec.calls).toEqual([]);
+		expect(notes.at(-1)).toEqual({
+			kind: "tether.sandbox",
+			data: { state: "running", reason: "recovered", checkpointId: "cp_1" },
+			modelText: NOTES.restored("missing", ["write: a.txt", "bash: make"]),
+		});
+		expect((await store.getBinding("ses_1"))?.reason).toBeUndefined();
+	});
+
+	it("lists the calls since the reused checkpoint when the latest record reuses an earlier snapshot", async () => {
+		// 沙箱丢失后开始的那一轮记了一条对齐到它自己用户条目、内容却是 cp_1 的记录：
+		// 从它算起会告诉模型什么都没丢，其实 a.txt 和 make 的结果都没了
+		const { store, engine, provider, notes, sandboxes } = await lostAfterCheckpoint();
+		const later = engine.push("eng_1", { kind: "pi.user", role: "user", text: "again" });
+		await store.addCheckpoint(
+			sampleCheckpoint("cp_2", { entryId: later, snapshotId: "snap_1", basisCheckpointId: "cp_1", submissionId: "sub_again" }),
+		);
+
+		const rebuilt = await sandboxes.ensureSandbox("ses_1");
+
+		expect(provider.containers.get(rebuilt.sandboxId)?.from).toBe("snap_1");
+		expect(notes.at(-1)).toEqual({
+			kind: "tether.sandbox",
+			data: { state: "running", reason: "recovered", checkpointId: "cp_1" },
+			modelText: NOTES.restored("missing", ["write: a.txt", "bash: make"]),
+		});
+	});
+
+	it("rebuilds from the template when the latest checkpoint is a template one", async () => {
+		const { store, provider, exec, notes, sandboxes } = await setUp(["prep"]);
+		await sandboxes.ensureSandbox("ses_1");
+		await store.addCheckpoint(sampleCheckpoint("cp_1", { snapshotId: null }));
+		provider.containers.clear();
+		await sandboxes.sweep();
+		provider.calls.length = 0;
+		exec.calls.length = 0;
+
+		await sandboxes.ensureSandbox("ses_1");
+
+		expect(provider.calls).toEqual(["destroy", "prepareImage", "create"]);
+		expect(exec.calls.map((c) => c.command)).toEqual(["prep"]);
+		expect(notes.at(-1)).toMatchObject({ modelText: NOTES.reset("missing") });
+	});
+
+	it("rebuilds a lost forked session from its fork's checkpoint when it has none of its own", async () => {
+		const { store, provider, engine, notes, sandboxes } = await setUp();
+		await store.addCheckpoint(sampleCheckpoint("cp_src", { snapshotId: "snap_src" }));
+		provider.snapshots.set("snap_src", { sandboxId: "sbx_old", partial: false });
+		await engine.createSession({ model: sampleSpec().model, instructions: "", tools: [], cwd: "/workspace" });
+		await store.createSession(
+			sampleSession("ses_2", { engineSessionId: "eng_2", forkedFrom: { sessionId: "ses_1", entryId: "1", checkpointId: "cp_src" } }),
+		);
+		await sandboxes.ensureSandbox("ses_2");
+		provider.containers.clear();
+		await sandboxes.sweep();
+		provider.calls.length = 0;
+
+		const rebuilt = await sandboxes.ensureSandbox("ses_2");
+
+		expect(provider.calls).toEqual(["destroy", "prepareImage", "create-from"]);
+		expect(provider.containers.get(rebuilt.sandboxId)?.from).toBe("snap_src");
+		expect(notes.at(-1)).toMatchObject({ data: { checkpointId: "cp_src" }, modelText: NOTES.restored("missing", []) });
+	});
+
+	it("leaves the binding lost when creating from the checkpoint fails", async () => {
+		const { store, provider, notes, sandboxes } = await lostAfterCheckpoint();
+		provider.snapshots.delete("snap_1");
+
+		await expect(sandboxes.ensureSandbox("ses_1")).rejects.toMatchObject({ code: "sandbox_failed" });
+
+		expect(await store.getBinding("ses_1")).toMatchObject({ state: "lost", reason: "missing" });
+		provider.snapshots.set("snap_1", { sandboxId: "sbx_1", partial: false });
+		await sandboxes.ensureSandbox("ses_1");
+		expect(notes.at(-1)).toMatchObject({ data: { reason: "recovered" }, modelText: NOTES.restored("missing", ["write: a.txt", "bash: make"]) });
+	});
+
+	it("keeps the lost reason across a restart of the service", async () => {
+		const { store, provider, exec, engine, clock, sandboxes } = await setUp(["make"]);
+		exec.results.set("make", { exitCode: 2, stdout: "", stderr: "" });
+		provider.failDestroy = true;
+		await sandboxes.ensureSandbox("ses_1").catch(() => {});
+		exec.results.delete("make");
+		provider.failDestroy = false;
+		expect(await store.getBinding("ses_1")).toMatchObject({ state: "lost", reason: "cleanup failed" });
+
+		// 新的服务实例：内存里什么都没有，原因只能从绑定里读
+		const notes: SandboxNote[] = [];
+		const restarted = new SandboxService({
+			store,
+			provider,
+			exec,
+			engine,
+			clock,
+			record: async (_sessionId, note) => {
+				notes.push(note);
+			},
+			log: { warn: () => {} },
+		});
+		await restarted.ensureSandbox("ses_1");
+
+		expect(notes.at(-1)).toMatchObject({ modelText: NOTES.reset("cleanup failed") });
 	});
 
 	it("rebuilds a stopped sandbox whose container is gone on the next tool call", async () => {
@@ -391,8 +559,8 @@ describe("SandboxService rebuild", () => {
 
 		await expect(sandboxes.ensureSandbox("ses_1")).rejects.toMatchObject({ code: "sandbox_limit" });
 
-		// 残留在准入之前就删了（删除可以重复），没有新建；绑定还是 lost，下次照样按重建处理
-		expect(provider.calls).toEqual(["destroy"]);
+		// 残留在准入之前就删了（删除可以重复），镜像也在准入之前准备好；没有新建，绑定还是 lost，下次照样按重建处理
+		expect(provider.calls).toEqual(["destroy", "prepareImage"]);
 		expect((await store.getBinding("ses_1"))?.state).toBe("lost");
 	});
 
@@ -629,7 +797,7 @@ describe("SandboxService files", () => {
 });
 
 const HOUR = 3_600_000;
-const NOTHING = { stoppedIdle: 0, stoppedOutside: 0, lost: 0 };
+const NOTHING = { stoppedIdle: 0, stoppedOutside: 0, lost: 0, destroyedIdle: 0 };
 
 describe("SandboxService.sweep", () => {
 	it("stops a sandbox idle for stopAfter, writes the model-visible note and marks the session idle", async () => {
@@ -756,7 +924,7 @@ describe("SandboxService.sweep", () => {
 		const result = await sandboxes.sweep();
 
 		expect(result).toEqual({ ...NOTHING, lost: 1 });
-		expect((await store.getBinding("ses_1"))?.state).toBe("lost");
+		expect(await store.getBinding("ses_1")).toMatchObject({ state: "lost", reason: "missing" });
 		expect(notes.at(-1)).toEqual({ kind: "tether.sandbox", data: { state: "lost", reason: "missing" } });
 	});
 
@@ -876,5 +1044,148 @@ describe("SandboxService.connect", () => {
 		await store.updateBinding("ses_1", { state: "lost" }, { state: "stopped" });
 		await expect(sandboxes.connect("ses_1")).rejects.toMatchObject({ code: "conflict" });
 		expect(provider.fenced).toEqual([]);
+	});
+});
+
+describe("SandboxService for a forked session", () => {
+	/** ses_2 从 ses_1 的条目 3 分叉，选中存档 checkpointId；snapshotId 给了就让后端里有这张快照。 */
+	async function forked(checkpointId: string | null, snapshotId?: string | null) {
+		const made = await setUp(["git clone \"$REPO_URL\" ."], { REPO_URL: "r" });
+		await made.engine.createSession({ model: sampleSpec().model, instructions: "", tools: [], cwd: "/workspace" });
+		await made.store.createSession(
+			sampleSession("ses_2", {
+				engineSessionId: "eng_2",
+				variables: { REPO_URL: "r" },
+				forkedFrom: { sessionId: "ses_1", entryId: "3", checkpointId },
+			}),
+		);
+		if (checkpointId !== null && snapshotId !== undefined) {
+			await made.store.addCheckpoint(sampleCheckpoint(checkpointId, { snapshotId }));
+			if (snapshotId !== null) made.provider.snapshots.set(snapshotId, { sandboxId: "sbx_old", partial: false });
+		}
+		return made;
+	}
+
+	it("creates a forked session's sandbox from its checkpoint without running setup", async () => {
+		const { provider, exec, store, sandboxes, recorded, notes } = await forked("cp_1", "ses_1/aaaa");
+
+		const binding = await sandboxes.ensureSandbox("ses_2");
+
+		expect(binding.state).toBe("running");
+		expect(provider.calls.filter((call) => call.startsWith("create"))).toEqual(["create-from"]);
+		expect(provider.containers.get(binding.sandboxId)?.from).toBe("ses_1/aaaa");
+		expect(exec.calls).toEqual([]);
+		expect(recorded).toEqual([{ sessionId: "ses_2", kind: "tether.sandbox", state: "running", reason: "restored" }]);
+		// 分叉时已经告诉过模型，这里不再写
+		expect(notes.filter((note) => note.modelText !== undefined)).toEqual([]);
+		expect((await store.getBinding("ses_2"))?.state).toBe("running");
+	});
+
+	it("falls back to the template and tells the model when the fork's checkpoint is gone", async () => {
+		const { provider, exec, sandboxes, notes } = await forked("cp_gone");
+
+		await sandboxes.ensureSandbox("ses_2");
+
+		expect(provider.calls.filter((call) => call.startsWith("create"))).toEqual(["create"]);
+		expect(exec.calls.map((call) => call.command)).toEqual(['git clone "$REPO_URL" .']);
+		expect(notes.filter((note) => note.modelText !== undefined).map((note) => note.modelText)).toEqual([NOTES.forkFresh]);
+	});
+
+	it("creates from the template and runs setup for a template checkpoint, without a note", async () => {
+		// 存档是模板（这一轮开始时还没有沙箱）：按模板新建就是精确的
+		const { provider, exec, sandboxes, notes } = await forked("cp_1", null);
+
+		await sandboxes.ensureSandbox("ses_2");
+
+		expect(provider.calls.filter((call) => call.startsWith("create"))).toEqual(["create"]);
+		expect(exec.calls).toHaveLength(1);
+		expect(notes.filter((note) => note.modelText !== undefined)).toEqual([]);
+	});
+});
+
+describe("SandboxService idle removal", () => {
+	const DAY = 24 * HOUR;
+	const REMOVED = "removed after 7 days without activity";
+
+	/** 最终存档由 finalCheckpoint 存：这里调用 take 拿到快照，记一条存档；fail 为 true 时不存、返回 false。 */
+	async function idle(fail = false) {
+		const finals: { sessionId: string; snapshotId: string }[] = [];
+		let store: MemoryAppStore | undefined;
+		const made = await setUp([], {}, {
+			finalCheckpoint: async (binding, take) => {
+				if (fail) return false;
+				const snapshotId = await take();
+				finals.push({ sessionId: binding.sessionId, snapshotId });
+				await store!.addCheckpoint(sampleCheckpoint("cp_final", { entryId: "9", snapshotId, submissionId: "final" }));
+				return true;
+			},
+		});
+		store = made.store;
+		const first = await made.sandboxes.ensureSandbox("ses_1");
+		made.clock.advance(HOUR);
+		await made.sandboxes.sweep();
+		expect((await made.store.getBinding("ses_1"))?.state).toBe("stopped");
+		made.provider.calls.length = 0;
+		return { ...made, finals, first };
+	}
+
+	it("takes a final checkpoint and removes a sandbox stopped longer than destroyAfter", async () => {
+		const { store, provider, clock, notes, sandboxes, finals, first } = await idle();
+		clock.advance(7 * DAY);
+
+		const result = await sandboxes.sweep();
+
+		expect(result).toEqual({ ...NOTHING, destroyedIdle: 1 });
+		expect(finals).toEqual([{ sessionId: "ses_1", snapshotId: expect.any(String) }]);
+		expect(provider.calls.filter((call) => call !== "status")).toEqual(["snapshot", "destroy"]);
+		expect(provider.containers.has(first.sandboxId)).toBe(false);
+		expect(await store.getBinding("ses_1")).toMatchObject({ state: "lost", reason: REMOVED });
+		// 只给客户端看；模型在下次恢复时从 NOTES.restored 得知
+		expect(notes.at(-1)).toEqual({ kind: "tether.sandbox", data: { state: "lost", reason: REMOVED } });
+	});
+
+	it("restores the removed sandbox from the final checkpoint on the next tool call", async () => {
+		const { provider, clock, notes, sandboxes, finals } = await idle();
+		clock.advance(7 * DAY);
+		await sandboxes.sweep();
+
+		const rebuilt = await sandboxes.ensureSandbox("ses_1");
+
+		expect(provider.containers.get(rebuilt.sandboxId)?.from).toBe(finals[0]!.snapshotId);
+		expect(notes.at(-1)).toMatchObject({ data: { checkpointId: "cp_final" }, modelText: NOTES.restored(REMOVED, []) });
+	});
+
+	it("removes the sandbox even when the final checkpoint fails, and the rebuild uses an earlier one", async () => {
+		const { store, provider, clock, sandboxes, first } = await idle(true);
+		await store.addCheckpoint(sampleCheckpoint("cp_old", { snapshotId: "snap_old" }));
+		provider.snapshots.set("snap_old", { sandboxId: first.sandboxId, partial: false });
+		clock.advance(7 * DAY);
+
+		expect(await sandboxes.sweep()).toEqual({ ...NOTHING, destroyedIdle: 1 });
+		expect(provider.containers.has(first.sandboxId)).toBe(false);
+
+		const rebuilt = await sandboxes.ensureSandbox("ses_1");
+		expect(provider.containers.get(rebuilt.sandboxId)?.from).toBe("snap_old");
+	});
+
+	it("does not remove a stopped sandbox younger than destroyAfter", async () => {
+		const { store, provider, clock, sandboxes, finals } = await idle();
+		clock.advance(7 * DAY - 2 * HOUR);
+
+		expect(await sandboxes.sweep()).toEqual(NOTHING);
+		expect(finals).toEqual([]);
+		expect(provider.calls).not.toContain("destroy");
+		expect((await store.getBinding("ses_1"))?.state).toBe("stopped");
+	});
+
+	it("does not mark a running session idle when its sandbox stops", async () => {
+		// 一轮正在跑（比如模型还在思考）时容器在 Tether 之外被停掉：会话仍在运行，不能改成 idle
+		const { store, provider, engine, sandboxes } = await setUp();
+		const { sandboxId } = await sandboxes.ensureSandbox("ses_1");
+		await provider.stop(sandboxId);
+		engine.running.add("eng_1");
+
+		expect(await sandboxes.sweep()).toEqual({ ...NOTHING, stoppedOutside: 1 });
+		expect((await store.getSession("ses_1"))?.status).toBe("active");
 	});
 });

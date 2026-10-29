@@ -5,6 +5,7 @@ import type {
 	AgentVersionRecord,
 	AgentVersionSpec,
 	BindingPatch,
+	CheckpointRecord,
 	ExpectedState,
 	ModelRef,
 	SandboxBinding,
@@ -53,6 +54,18 @@ export interface AppStore {
 	nextEpoch(sessionId: string): Promise<number>;
 	deleteBinding(sessionId: string): Promise<void>;
 	listBindings(): Promise<SandboxBinding[]>;
+
+	/** 同一个 submissionId 已有存档时报 conflict。 */
+	addCheckpoint(checkpoint: CheckpointRecord): Promise<void>;
+	getCheckpoint(id: string): Promise<CheckpointRecord | undefined>;
+	checkpointForSubmission(submissionId: string): Promise<CheckpointRecord | undefined>;
+	/** 按 entryId 的数值从旧到新。 */
+	listCheckpoints(sessionId: string): Promise<CheckpointRecord[]>;
+	listAllCheckpoints(): Promise<CheckpointRecord[]>;
+	/** 不存在不报错。 */
+	deleteCheckpoint(id: string): Promise<void>;
+	/** 有没有未归档的会话以它为分叉存档（forkedFrom.checkpointId）：有就不能删。 */
+	checkpointReferenced(id: string): Promise<boolean>;
 }
 
 /** 创建引擎会话时交给引擎的配置，由 agent 版本翻译而来。 */
@@ -63,6 +76,14 @@ export interface EngineAgentConfig {
 	cwd: string;
 }
 
+/**
+ * 运行开始钩子（spec §4.2），每个 AgentEngine 实现都要支持，在打开引擎时传入：
+ * - 一轮运行里每次请求模型之前都调用（不只是第一次），去重由调用方按提交 ID 做；
+ * - submissionId 是触发这一轮的提交，同一轮内不变，中途 steer 进来的输入也不改变它；
+ * - 回调抛错不能打断这一轮：实现方报告错误后照常请求模型。
+ */
+export type RunStartListener = (engineSessionId: string, submissionId: string) => Promise<void>;
+
 export interface AgentEngine {
 	/** 返回引擎会话 ID。 */
 	createSession(config: EngineAgentConfig): Promise<string>;
@@ -72,6 +93,10 @@ export interface AgentEngine {
 		input: { content: string; requestId: string; whenBusy?: "followUp" | "steer" | "reject" },
 	): Promise<{ submissionId: string }>;
 	waitSubmission(submissionId: string): Promise<{ status: "done" | "unanswered"; answer?: TranscriptEntry }>;
+	/** 提交放进对话的那条用户条目；还没放进去时 undefined。未知提交报 not_found。 */
+	submissionEntry(submissionId: string): Promise<string | undefined>;
+	/** 在条目处分叉出一个新会话：它看得到到这条为止的记录，之后各写各的。条目不在这个会话里报 invalid_request。 */
+	fork(engineSessionId: string, entryId: string): Promise<string>;
 	abort(engineSessionId: string): Promise<void>;
 	/** 是否有一轮正在运行，与 SessionView.running 同一来源。未知会话报 not_found。 */
 	isRunning(engineSessionId: string): Promise<boolean>;
@@ -95,12 +120,16 @@ export interface AgentEngine {
 export interface SandboxCreate {
 	sessionId: string;
 	spec: SandboxSpec;
+	/** 从这张快照创建：工作区是快照里的内容，大小也跟着快照。不给就按模板新建。 */
+	from?: string;
 }
 
 /** 只管沙箱的生命周期；文件和命令走 ExecChannel。 */
 export interface SandboxProvider {
 	readonly name: "docker";
 	readonly capabilities: { snapshot: boolean; fork: boolean; rollback: boolean; preservesMemoryOnStop: boolean };
+	/** 模板镜像本地没有就拉下来。在准入之外调用：拉取可能要几分钟，不能让别的会话等着。 */
+	prepareImage(spec: SandboxSpec): Promise<void>;
 	create(input: SandboxCreate): Promise<{ sandboxId: string }>;
 	status(sandboxId: string): Promise<"running" | "stopped" | "missing">;
 	start(sandboxId: string): Promise<void>;
@@ -116,6 +145,23 @@ export interface SandboxProvider {
 	fence(sandboxId: string, epoch: number): Promise<{ killed: number }>;
 	/** 在沙箱里启动 daemon 的命令，ExecChannel 用它建立连接。 */
 	daemonCommand(sandboxId: string, epoch: number): string[];
+
+	/**
+	 * 给工作区存一张快照（capabilities.snapshot）。运行中的沙箱在存的那一刻冻结，快照是同一时刻的状态，之后照常运行；
+	 * 停止的沙箱保持停止。只存工作区，不存进程和内存。沙箱不存在时抛 sandbox_failed。
+	 */
+	snapshot(sandboxId: string): Promise<{ snapshotId: string }>;
+	/** 不存在不报错；ID 不是 snapshot() 给出的形式时抛 invalid_request。 */
+	deleteSnapshot(snapshotId: string): Promise<void>;
+	/** 后端保存的全部快照；partial 是存到一半中断留下的，启动对账删掉它们。 */
+	listSnapshots(): Promise<{ snapshotId: string; partial: boolean }[]>;
+	/** 快照所在存储的空间，稀疏化按它判断。 */
+	storage(): Promise<{ freeBytes: number; totalBytes: number }>;
+	/**
+	 * 启动对账用：没有容器的会话，释放它们工作区占着的后端资源（Docker 镜像模式下的卷和 loop 设备），
+	 * 工作区本身保留（丢失重建或归档时再删）。返回释放了几个会话的。
+	 */
+	releaseLeftovers(): Promise<number>;
 }
 
 export interface ExecChannel {
@@ -130,5 +176,5 @@ export interface Clock {
 
 export interface Ids {
 	/** 形如 agt_<ULID 或 UUIDv7>，按时间可排序。 */
-	next(prefix: "agt" | "ses"): string;
+	next(prefix: "agt" | "ses" | "cp"): string;
 }

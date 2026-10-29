@@ -7,11 +7,13 @@ import {
 	type AgentVersionSpec,
 	type AppStore,
 	type BindingPatch,
+	type CheckpointRecord,
 	type ExpectedState,
+	type ForkOrigin,
 	type SandboxBinding,
 	type SessionRecord,
 } from "@tether/core";
-import { SCHEMA_V1, SCHEMA_VERSION } from "./schema.ts";
+import { MIGRATIONS, SCHEMA_VERSION } from "./schema.ts";
 
 type Row = Record<string, unknown>;
 
@@ -47,6 +49,7 @@ function toVersion(row: Row): AgentVersionRecord {
 
 function toSession(row: Row): SessionRecord {
 	const title = optionalText(row, "title");
+	const forkedFrom = optionalText(row, "forked_from");
 	return {
 		id: text(row, "id"),
 		ownerId: text(row, "owner_id"),
@@ -54,7 +57,7 @@ function toSession(row: Row): SessionRecord {
 		agentVersion: Number(row.agent_version),
 		engineSessionId: optionalText(row, "engine_session_id") ?? null,
 		parentSessionId: null,
-		forkedFrom: null,
+		forkedFrom: forkedFrom === undefined ? null : (JSON.parse(forkedFrom) as ForkOrigin),
 		variables: JSON.parse(text(row, "variables")) as Record<string, string>,
 		status: text(row, "status") as SessionRecord["status"],
 		...(title !== undefined && { title }),
@@ -64,6 +67,7 @@ function toSession(row: Row): SessionRecord {
 }
 
 function toBinding(row: Row): SandboxBinding {
+	const reason = optionalText(row, "reason");
 	return {
 		sessionId: text(row, "session_id"),
 		provider: text(row, "provider") as SandboxBinding["provider"],
@@ -73,6 +77,21 @@ function toBinding(row: Row): SandboxBinding {
 		template: text(row, "template"),
 		createdAt: text(row, "created_at"),
 		lastUsedAt: text(row, "last_used_at"),
+		...(reason !== undefined && { reason }),
+	};
+}
+
+function toCheckpoint(row: Row): CheckpointRecord {
+	return {
+		id: text(row, "id"),
+		sessionId: text(row, "session_id"),
+		submissionId: text(row, "submission_id"),
+		entryId: String(row.entry_id),
+		snapshotId: optionalText(row, "snapshot_id") ?? null,
+		basisCheckpointId: optionalText(row, "basis_checkpoint_id") ?? null,
+		failed: row.failed === 1,
+		kind: text(row, "kind") as CheckpointRecord["kind"],
+		createdAt: text(row, "created_at"),
 	};
 }
 
@@ -80,16 +99,17 @@ function isConstraintError(error: unknown): boolean {
 	return error instanceof Error && /constraint failed/i.test(error.message);
 }
 
+/** 从当前版本逐步升到 SCHEMA_VERSION，全部在一个事务里：中途失败就回到原来的版本。 */
 function migrate(db: DatabaseSync): void {
 	const row = db.prepare("PRAGMA user_version").get() as Row;
 	const current = Number(row.user_version);
 	if (current === SCHEMA_VERSION) return;
-	if (current !== 0) {
+	if (current > SCHEMA_VERSION) {
 		throw new TetherError("internal", `unsupported tether.sqlite schema version ${current}`);
 	}
 	db.exec("BEGIN IMMEDIATE");
 	try {
-		db.exec(SCHEMA_V1);
+		for (const step of MIGRATIONS.slice(current)) db.exec(step);
 		db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 		db.exec("COMMIT");
 	} catch (error) {
@@ -203,12 +223,13 @@ class SqliteAppStore implements AppStore {
 			this.#run(
 				`INSERT INTO sessions (id, owner_id, agent_id, agent_version, engine_session_id, parent_session_id,
 				   forked_from, variables, status, title, created_at, last_active_at)
-				 VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)`,
+				 VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`,
 				session.id,
 				session.ownerId,
 				session.agentId,
 				session.agentVersion,
 				session.engineSessionId,
+				session.forkedFrom === null ? null : JSON.stringify(session.forkedFrom),
 				JSON.stringify(session.variables),
 				session.status,
 				session.title ?? null,
@@ -318,13 +339,17 @@ class SqliteAppStore implements AppStore {
 		return this.#transaction(() => {
 			const current = this.#requireBinding(sessionId);
 			assertBindingState(current, expected);
+			// reason：不给就不动（第一个参数为 0），给 null 就清除
 			this.#run(
 				`UPDATE sandbox_bindings SET
 				   state = COALESCE(?, state),
-				   last_used_at = COALESCE(?, last_used_at)
+				   last_used_at = COALESCE(?, last_used_at),
+				   reason = CASE WHEN ? THEN ? ELSE reason END
 				 WHERE session_id = ?`,
 				patch.state ?? null,
 				patch.lastUsedAt ?? null,
+				patch.reason === undefined ? 0 : 1,
+				patch.reason ?? null,
 				sessionId,
 			);
 			return this.#requireBinding(sessionId);
@@ -352,6 +377,61 @@ class SqliteAppStore implements AppStore {
 
 	async listBindings(): Promise<SandboxBinding[]> {
 		return this.#all("SELECT * FROM sandbox_bindings ORDER BY session_id").map(toBinding);
+	}
+
+	async addCheckpoint(checkpoint: CheckpointRecord): Promise<void> {
+		try {
+			this.#run(
+				`INSERT INTO checkpoints (id, session_id, submission_id, entry_id, snapshot_id, basis_checkpoint_id, failed, kind, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				checkpoint.id,
+				checkpoint.sessionId,
+				checkpoint.submissionId,
+				Number(checkpoint.entryId),
+				checkpoint.snapshotId,
+				checkpoint.basisCheckpointId,
+				checkpoint.failed ? 1 : 0,
+				checkpoint.kind,
+				checkpoint.createdAt,
+			);
+		} catch (error) {
+			if (isConstraintError(error)) {
+				throw new TetherError("conflict", `a checkpoint for submission ${checkpoint.submissionId} already exists`);
+			}
+			throw error;
+		}
+	}
+
+	async getCheckpoint(id: string): Promise<CheckpointRecord | undefined> {
+		const row = this.#get("SELECT * FROM checkpoints WHERE id = ?", id);
+		return row && toCheckpoint(row);
+	}
+
+	async checkpointForSubmission(submissionId: string): Promise<CheckpointRecord | undefined> {
+		const row = this.#get("SELECT * FROM checkpoints WHERE submission_id = ?", submissionId);
+		return row && toCheckpoint(row);
+	}
+
+	async listCheckpoints(sessionId: string): Promise<CheckpointRecord[]> {
+		return this.#all("SELECT * FROM checkpoints WHERE session_id = ? ORDER BY entry_id", sessionId).map(toCheckpoint);
+	}
+
+	async listAllCheckpoints(): Promise<CheckpointRecord[]> {
+		return this.#all("SELECT * FROM checkpoints ORDER BY id").map(toCheckpoint);
+	}
+
+	async deleteCheckpoint(id: string): Promise<void> {
+		this.#run("DELETE FROM checkpoints WHERE id = ?", id);
+	}
+
+	async checkpointReferenced(id: string): Promise<boolean> {
+		const row = this.#get(
+			`SELECT 1 FROM sessions
+			 WHERE status != 'archived' AND forked_from IS NOT NULL AND json_extract(forked_from, '$.checkpointId') = ?
+			 LIMIT 1`,
+			id,
+		);
+		return row !== undefined;
 	}
 }
 

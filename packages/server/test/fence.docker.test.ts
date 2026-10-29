@@ -18,7 +18,7 @@ const USER = `${process.getuid?.()}:${process.getgid?.()}`;
 const HOLDER = fileURLToPath(new URL("./fixtures/holder.ts", import.meta.url));
 const PID_HOST = `tether-pidhost-${process.pid}`;
 const workspaceRoot = mkdtempSync(join(tmpdir(), "tether-ws-"));
-const provider = createDockerSandboxProvider({ workspaceRoot, user: USER, defaultImage: IMAGE, ...runtimeOption() });
+const provider = createDockerSandboxProvider({ workspaceRoot, user: USER, defaultImage: IMAGE, storage: "directory", defaultDiskMb: 512, checkpointRoot: join(workspaceRoot, ".checkpoints"), ...runtimeOption() });
 let counter = 0;
 
 async function dockerExec(sandboxId: string, script: string): Promise<{ code: number; stdout: string }> {
@@ -56,7 +56,7 @@ async function runningSession() {
 		store,
 		provider,
 		exec: channel(),
-		engine: { isRunning: async () => false },
+		engine: { isRunning: async () => false, transcript: async () => ({ items: [] }) },
 		clock: { now: () => new Date().toISOString() },
 		record: async (_sessionId, note) => {
 			notes.push(note);

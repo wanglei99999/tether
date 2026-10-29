@@ -11,6 +11,7 @@ import {
 	type SandboxProvider,
 	TetherError,
 	type TetherEnv,
+	type TranscriptEntry,
 } from "../src/index.ts";
 
 export class FakeClock implements Clock {
@@ -33,7 +34,7 @@ export class ManualClock implements Clock {
 
 export class FakeIds implements Ids {
 	#next = 1;
-	next(prefix: "agt" | "ses"): string {
+	next(prefix: "agt" | "ses" | "cp"): string {
 		return `${prefix}_${String(this.#next++).padStart(4, "0")}`;
 	}
 }
@@ -64,9 +65,43 @@ export class FakeEngine implements AgentEngine {
 	async hasSession(engineSessionId: string): Promise<boolean> {
 		return Number(engineSessionId.slice(4)) <= this.#sessions;
 	}
+	/** 条目 ID 和 pi 一样在整个引擎里递增；每次提交占一个（它的用户条目）。 */
+	#entries = 0;
+	readonly #submissionEntries = new Map<string, string>();
+	/** 每个引擎会话的记录，从旧到新；分叉出来的会话复制分叉点之前的部分。 */
+	readonly logs = new Map<string, TranscriptEntry[]>();
+	/** 往会话记录末尾加一条，返回它的 ID。 */
+	push(engineSessionId: string, entry: Omit<TranscriptEntry, "id">): string {
+		const id = String(++this.#entries);
+		this.logs.set(engineSessionId, [...(this.logs.get(engineSessionId) ?? []), { id, ...entry }]);
+		return id;
+	}
+	/** 一次执行完的工具调用：一条带调用的助手条目加一条结果，返回结果条目的 ID。 */
+	ran(engineSessionId: string, name: string, args: unknown): string {
+		const callId = `call_${this.#entries + 1}`;
+		this.push(engineSessionId, { kind: "pi.assistant", role: "assistant", toolCalls: [{ id: callId, name, args }] });
+		return this.push(engineSessionId, { kind: "pi.tool-result", role: "tool", toolResult: { callId, isError: false, text: "" } });
+	}
 	async submit(engineSessionId: string, input: { content: string; requestId: string }) {
 		this.submitted.push({ engineSessionId, ...input });
-		return { submissionId: `sub_${this.submitted.length}` };
+		const submissionId = `sub_${this.submitted.length}`;
+		this.#submissionEntries.set(submissionId, this.push(engineSessionId, { kind: "pi.user", role: "user", text: input.content }));
+		return { submissionId };
+	}
+	async submissionEntry(submissionId: string): Promise<string | undefined> {
+		const entry = this.#submissionEntries.get(submissionId);
+		if (entry === undefined) throw new TetherError("not_found", `submission ${submissionId} not found`);
+		return entry;
+	}
+	readonly forks: { engineSessionId: string; entryId: string }[] = [];
+	async fork(engineSessionId: string, entryId: string): Promise<string> {
+		const log = this.logs.get(engineSessionId) ?? [];
+		const at = log.findIndex((entry) => entry.id === entryId);
+		if (at < 0) throw new TetherError("invalid_request", `entry ${entryId} is not in ${engineSessionId}`);
+		this.forks.push({ engineSessionId, entryId });
+		const forked = `eng_${++this.#sessions}`;
+		this.logs.set(forked, log.slice(0, at + 1));
+		return forked;
 	}
 	async waitSubmission() {
 		return { status: "done" as const };
@@ -75,10 +110,18 @@ export class FakeEngine implements AgentEngine {
 	async abort(engineSessionId: string): Promise<void> {
 		this.aborted.push(engineSessionId);
 	}
-	async transcript() {
-		return { items: [] };
+	/** 和 pi 适配器一样：新的在前，游标是上一页最后一条的 ID。 */
+	async transcript(engineSessionId: string, page: { limit: number; before?: string }) {
+		const newest = [...(this.logs.get(engineSessionId) ?? [])].reverse();
+		const from = page.before === undefined ? newest : newest.filter((entry) => Number(entry.id) < Number(page.before));
+		const items = from.slice(0, page.limit);
+		return from.length > page.limit ? { items, next: items.at(-1)!.id } : { items };
 	}
-	async appendEntry(): Promise<void> {}
+	readonly appended: { engineSessionId: string; kind: string; data: unknown; modelText?: string }[] = [];
+	async appendEntry(engineSessionId: string, entry: { kind: `tether.${string}`; data: unknown; modelText?: string }) {
+		this.appended.push({ engineSessionId, ...entry });
+		this.push(engineSessionId, { kind: entry.kind, data: entry.data });
+	}
 	async subscribe() {
 		return { stop: async () => {} };
 	}
@@ -90,8 +133,14 @@ type ContainerState = "running" | "stopped";
 
 export class FakeProvider implements SandboxProvider {
 	readonly name = "docker" as const;
-	readonly capabilities = { snapshot: false, fork: false, rollback: false, preservesMemoryOnStop: false };
-	readonly containers = new Map<string, { sessionId: string; state: ContainerState }>();
+	readonly capabilities = { snapshot: true, fork: false, rollback: false, preservesMemoryOnStop: false };
+	readonly containers = new Map<string, { sessionId: string; state: ContainerState; from?: string }>();
+	/** 快照 ID → 存档时的沙箱；partial 模拟存到一半崩溃留下的。 */
+	readonly snapshots = new Map<string, { sandboxId: string; partial: boolean }>();
+	/** 为 true 时 snapshot 抛错。 */
+	failSnapshot = false;
+	space = { freeBytes: 100, totalBytes: 100 };
+	#snapshots = 0;
 	readonly calls: string[] = [];
 	/** create 完成前等待的毫秒数，用来让并发调用真正交错。 */
 	createDelayMs = 0;
@@ -104,13 +153,38 @@ export class FakeProvider implements SandboxProvider {
 	readonly fenced: { sandboxId: string; epoch: number }[] = [];
 	#created = 0;
 
-	async create({ sessionId }: SandboxCreate) {
-		this.calls.push("create");
+	/** 在 prepareImage 里调用，测试用它让拉镜像卡住。 */
+	onPrepareImage: () => Promise<void> = async () => {};
+	async prepareImage() {
+		this.calls.push("prepareImage");
+		await this.onPrepareImage();
+	}
+	async create({ sessionId, from }: SandboxCreate) {
+		this.calls.push(from === undefined ? "create" : "create-from");
 		await new Promise((resolve) => setTimeout(resolve, this.createDelayMs));
 		if (this.failCreate) throw new TetherError("sandbox_failed", "docker run failed");
+		if (from !== undefined && !this.snapshots.has(from)) throw new TetherError("sandbox_failed", `snapshot ${from} does not exist`);
 		const sandboxId = `sbx_${++this.#created}`;
-		this.containers.set(sandboxId, { sessionId, state: "running" });
+		this.containers.set(sandboxId, { sessionId, state: "running", ...(from !== undefined && { from }) });
 		return { sandboxId };
+	}
+	async snapshot(sandboxId: string) {
+		this.calls.push("snapshot");
+		if (this.failSnapshot) throw new TetherError("sandbox_failed", `cannot snapshot ${sandboxId}`);
+		if (!this.containers.has(sandboxId)) throw new TetherError("sandbox_failed", `no container ${sandboxId}`);
+		const snapshotId = `snap_${++this.#snapshots}`;
+		this.snapshots.set(snapshotId, { sandboxId, partial: false });
+		return { snapshotId };
+	}
+	async deleteSnapshot(snapshotId: string) {
+		this.calls.push("deleteSnapshot");
+		this.snapshots.delete(snapshotId);
+	}
+	async listSnapshots() {
+		return [...this.snapshots].map(([snapshotId, { partial }]) => ({ snapshotId, partial }));
+	}
+	async storage() {
+		return { ...this.space };
 	}
 	async status(sandboxId: string) {
 		this.calls.push("status");
@@ -137,6 +211,11 @@ export class FakeProvider implements SandboxProvider {
 		if (this.failFence) throw new TetherError("sandbox_failed", `cannot fence ${sandboxId}`);
 		this.fenced.push({ sandboxId, epoch });
 		return { killed: 0 };
+	}
+	/** 没有容器的会话的卷和 loop 设备；假后端没有这些，只记调用。 */
+	async releaseLeftovers() {
+		this.calls.push("releaseLeftovers");
+		return 0;
 	}
 	async listManaged() {
 		return [...this.containers].map(([sandboxId, { sessionId, state }]) => ({ sandboxId, sessionId, status: state }));

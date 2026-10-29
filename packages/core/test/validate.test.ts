@@ -42,10 +42,30 @@ describe("validateVersionSpec unsupported fields", () => {
 	];
 
 	it("rejects diskMb, requireApproval and perRun while they are unsupported", () => {
+		const unsupported = { diskMb: true, approval: true, checkpoints: true };
 		for (const [field, spec] of variants) {
-			const error = rejection(() => validateVersionSpec(spec, BUILTIN_TOOLS));
+			const error = rejection(() => validateVersionSpec(spec, BUILTIN_TOOLS, unsupported));
 			expect(error, field).toMatchObject({ code: "invalid_request", message: `${field} is not supported yet` });
 		}
+	});
+
+	it("accepts perRun and still rejects diskMb and requireApproval by default", () => {
+		const [disk, approval, perRun] = variants;
+		expect(validateVersionSpec(perRun![1], BUILTIN_TOOLS)).toEqual(perRun![1]);
+		expect(rejection(() => validateVersionSpec(disk![1], BUILTIN_TOOLS)).code).toBe("invalid_request");
+		expect(rejection(() => validateVersionSpec(approval![1], BUILTIN_TOOLS)).code).toBe("invalid_request");
+	});
+
+	it("rejects a diskMb below the minimum the storage can make", () => {
+		const limits = { diskMb: false, approval: false, checkpoints: false, minDiskMb: 300 };
+		const small = { ...completeSpec(), sandbox: { ...completeSpec().sandbox, resources: { cpu: 1, memoryMb: 512, diskMb: 299 } } };
+		const enough = { ...completeSpec(), sandbox: { ...completeSpec().sandbox, resources: { cpu: 1, memoryMb: 512, diskMb: 300 } } };
+
+		expect(rejection(() => validateVersionSpec(small, BUILTIN_TOOLS, limits))).toMatchObject({
+			code: "invalid_request",
+			message: "sandbox.resources.diskMb must be at least 300",
+		});
+		expect(validateVersionSpec(enough, BUILTIN_TOOLS, limits)).toEqual(enough);
 	});
 
 	it("accepts them when supported", () => {

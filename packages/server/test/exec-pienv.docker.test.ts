@@ -20,6 +20,10 @@ const provider = createDockerSandboxProvider({
 	workspaceRoot,
 	user: `${process.getuid?.()}:${process.getgid?.()}`,
 	defaultImage: IMAGE,
+	// 这里读宿主上的工作区文件，用目录模式；镜像模式在 sandbox-docker.docker.test.ts
+	storage: "directory",
+	defaultDiskMb: 512,
+	checkpointRoot: join(workspaceRoot, ".checkpoints"),
 	...runtimeOption(),
 });
 /** 只测通道本身：不经 SandboxService，不隔离，固定用绑定里的 epoch。 */

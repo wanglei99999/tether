@@ -1,3 +1,4 @@
+export * from "./checkpoints.ts";
 export * from "./env.ts";
 export * from "./errors.ts";
 export * from "./events.ts";
@@ -7,6 +8,7 @@ export * from "./notes.ts";
 export * from "./ports.ts";
 export * from "./sandbox-lifecycle.ts";
 export * from "./services/agents.ts";
+export * from "./services/checkpoints.ts";
 export * from "./services/sandboxes.ts";
 export * from "./services/sessions.ts";
 export * from "./startup.ts";

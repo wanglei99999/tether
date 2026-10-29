@@ -2,6 +2,7 @@ import type {
 	AgentRecord,
 	AgentVersionRecord,
 	AgentVersionSpec,
+	CheckpointRecord,
 	DirEntry,
 	ErrorCode,
 	RunStatus,
@@ -103,6 +104,12 @@ export class TetherClient {
 		/** 归档：之后的消息被拒绝，沙箱的容器和工作区被删除。 */
 		archive: async (id: string) =>
 			(await this.#request<{ session: SessionRecord }>("POST", `/v1/sessions/${enc(id)}/archive`)).session,
+		/** 在会话记录的一条处分叉出新会话：对话到这一条为止，工作区取自这一刻之前最近的存档。 */
+		fork: async (id: string, entryId: string) =>
+			(await this.#request<{ session: SessionRecord }>("POST", `/v1/sessions/${enc(id)}/fork`, { entryId })).session,
+		/** 会话的存档，从旧到新。 */
+		checkpoints: async (id: string) =>
+			(await this.#request<{ items: CheckpointRecord[] }>("GET", `/v1/sessions/${enc(id)}/checkpoints`)).items,
 	};
 
 	/** 实时跟随一个会话：每个事件叠加到本地状态后回调一次，断线自动重连。 */

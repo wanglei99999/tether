@@ -13,6 +13,7 @@ import { createTether, type Tether } from "../src/app.ts";
 import { type Config, loadConfig } from "../src/config.ts";
 import { FAUX_MODEL, fauxModels } from "./fixtures/faux.ts";
 import { runtimeEnv } from "./fixtures/runtime.ts";
+import { freshRoot } from "./fixtures/storage.ts";
 
 const run = promisify(execFile);
 const IMAGE = "tether-sandbox:dev";
@@ -74,6 +75,92 @@ describe("createTether on docker", () => {
 		expect(readFileSync(join(config.workspaceRoot, session.id, "a.txt"), "utf8")).toBe("hi\n");
 		const { items } = await sessions.transcript(session.id, { limit: 20 });
 		expect(items.find((e) => e.kind === "tether.sandbox")).toMatchObject({ data: { state: "running", reason: "created" } });
+		await shutdown(tether);
+	});
+
+	it("runs a session on a workspace image of diskMb and removes it on archive", async () => {
+		// 其他用例的数据目录在 ext4 的临时目录上，自动选了目录模式；这里放到 XFS 上，走镜像模式
+		const dataDir = freshRoot("image", "tether-app-");
+		dirs.push(dataDir);
+		const config = newConfig({ TETHER_DATA_DIR: dataDir, TETHER_WORKSPACE_STORAGE: "image" });
+		const tether = await open(config, [
+			{ toolCall: { name: "bash", args: { command: "echo hi > a.txt && df -m --output=size /workspace | tail -1" } } },
+			{ text: "done" },
+		]);
+		const { agents, sessions, sandboxes, engine } = tether.services;
+		const spec = bashSpec();
+		const { agent } = await agents.create({
+			name: "image",
+			spec: { ...spec, sandbox: { ...spec.sandbox, resources: { cpu: 1, memoryMb: 512, diskMb: 512 } } },
+		});
+		const session = await sessions.create({ agentId: agent.id });
+
+		await engine.waitSubmission((await sessions.sendMessage(session.id, { content: "go", requestId: "r" })).submissionId);
+
+		const file = await sandboxes.readFile(session.id, "a.txt");
+		expect(new TextDecoder().decode(file.content)).toBe("hi\n");
+		const { items } = await sessions.transcript(session.id, { limit: 20 });
+		const size = Number(items.find((e) => e.role === "tool")?.toolResult?.text.trim().split("\n").at(-1));
+		expect(size).toBeGreaterThan(400);
+		expect(size).toBeLessThanOrEqual(512);
+
+		await sessions.archive(session.id);
+		expect(existsSync(join(config.workspaceRoot, session.id))).toBe(false);
+		await shutdown(tether);
+	});
+
+	it("checkpoints each round, aligned to the round's user entry", async () => {
+		const config = newConfig();
+		const write = (name: string): ScriptStep => ({ toolCall: { name: "bash", args: { command: `echo ${name} > ${name}.txt` } } });
+		const tether = await open(config, [write("f1"), { text: "one" }, write("f2"), { text: "two" }, { text: "three" }]);
+		const { agents, sessions, store, engine } = tether.services;
+		const { agent } = await agents.create({ name: "perrun", spec: { ...bashSpec(), checkpointPolicy: "perRun" } });
+		const session = await sessions.create({ agentId: agent.id });
+
+		for (const [i, content] of ["first", "second", "third"].entries()) {
+			const { submissionId } = await sessions.sendMessage(session.id, { content, requestId: `r${i}` });
+			await engine.waitSubmission(submissionId);
+		}
+
+		const userEntries = [...(await sessions.transcript(session.id, { limit: 50 })).items]
+			.reverse()
+			.filter((e) => e.role === "user" && ["first", "second", "third"].includes(e.text ?? ""))
+			.map((e) => e.id);
+		const checkpoints = await store.listCheckpoints(session.id);
+		expect(checkpoints.map((c) => c.entryId)).toEqual(userEntries);
+		// 第一轮开始时还没有沙箱：模板存档；第二、三轮存了真正的快照
+		expect(checkpoints.map((c) => c.snapshotId === null)).toEqual([true, false, false]);
+		await shutdown(tether);
+	});
+
+	it("forks a session and the fork sees the files as of the fork point", async () => {
+		const config = newConfig();
+		const write = (name: string): ScriptStep => ({ toolCall: { name: "bash", args: { command: `echo ${name} > ${name}.txt` } } });
+		const script: ScriptStep[] = [write("f1"), { text: "one" }, write("f2"), { text: "two" }, write("f3"), { text: "three" }];
+		const tether = await open(config, [...script, { toolCall: { name: "bash", args: { command: "ls" } } }, { text: "listed" }]);
+		const { agents, sessions, engine } = tether.services;
+		const { agent } = await agents.create({ name: "fork", spec: { ...bashSpec(), checkpointPolicy: "perRun" } });
+		const source = await sessions.create({ agentId: agent.id });
+		for (const [i, content] of ["first", "second", "third"].entries()) {
+			await engine.waitSubmission((await sessions.sendMessage(source.id, { content, requestId: `r${i}` })).submissionId);
+		}
+		const third = (await sessions.transcript(source.id, { limit: 50 })).items.find((e) => e.text === "third")!;
+
+		// 在第三条消息处分叉：第三轮的存档就对齐在这里，内容是 f1、f2
+		const fork = await sessions.fork(source.id, third.id);
+		await engine.waitSubmission((await sessions.sendMessage(fork.id, { content: "what is here", requestId: "f" })).submissionId);
+
+		const checkpoint = (await tether.services.store.listCheckpoints(source.id)).at(-1)!;
+		expect(fork.forkedFrom).toEqual({ sessionId: source.id, entryId: third.id, checkpointId: checkpoint.id });
+		const items = (await sessions.transcript(fork.id, { limit: 50 })).items;
+		expect(items.find((e) => e.kind === "tether.fork")).toMatchObject({ data: { missed: 0 } });
+		// 新的在前：第一条工具结果是分叉会话里的 ls
+		const listed = items.find((e) => e.role === "tool")?.toolResult?.text ?? "";
+		expect(listed).toContain("f2.txt");
+		expect(listed).not.toContain("f3.txt");
+		const files = (sid: string) => ["f1", "f2", "f3"].filter((f) => existsSync(join(config.workspaceRoot, sid, `${f}.txt`)));
+		expect(files(fork.id)).toEqual(["f1", "f2"]);
+		expect(files(source.id)).toEqual(["f1", "f2", "f3"]);
 		await shutdown(tether);
 	});
 

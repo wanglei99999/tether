@@ -6,6 +6,7 @@ import {
 	type AgentVersionSpec,
 	type AppStore,
 	type BindingPatch,
+	type CheckpointRecord,
 	type ExpectedState,
 	type SandboxBinding,
 	type SessionRecord,
@@ -19,6 +20,7 @@ export class MemoryAppStore implements AppStore {
 	readonly #versions = new Map<string, AgentVersionRecord[]>();
 	readonly #sessions = new Map<string, SessionRecord>();
 	readonly #bindings = new Map<string, SandboxBinding>();
+	readonly #checkpoints = new Map<string, CheckpointRecord>();
 
 	async createAgent(agent: AgentRecord, first: AgentVersionRecord): Promise<void> {
 		if (this.#agents.has(agent.id)) throw new TetherError("conflict", `agent ${agent.id} already exists`);
@@ -134,11 +136,14 @@ export class MemoryAppStore implements AppStore {
 	): Promise<SandboxBinding> {
 		const binding = this.#requireBinding(sessionId);
 		assertBindingState(binding, expected);
-		const { state, lastUsedAt } = patch;
+		const { state, lastUsedAt, reason } = patch;
+		const { reason: _previous, ...rest } = binding;
+		const keptReason = reason === undefined ? binding.reason : (reason ?? undefined);
 		const updated: SandboxBinding = {
-			...binding,
+			...rest,
 			...(state !== undefined && { state }),
 			...(lastUsedAt !== undefined && { lastUsedAt }),
+			...(keptReason !== undefined && { reason: keptReason }),
 		};
 		this.#bindings.set(sessionId, updated);
 		return structuredClone(updated);
@@ -159,6 +164,43 @@ export class MemoryAppStore implements AppStore {
 		return [...this.#bindings.values()]
 			.sort((a, b) => (a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0))
 			.map((b) => structuredClone(b));
+	}
+
+	async addCheckpoint(checkpoint: CheckpointRecord): Promise<void> {
+		const taken = [...this.#checkpoints.values()].some(
+			(c) => c.id === checkpoint.id || c.submissionId === checkpoint.submissionId,
+		);
+		if (taken) {
+			throw new TetherError("conflict", `a checkpoint for submission ${checkpoint.submissionId} already exists`);
+		}
+		this.#checkpoints.set(checkpoint.id, structuredClone(checkpoint));
+	}
+
+	async getCheckpoint(id: string): Promise<CheckpointRecord | undefined> {
+		return structuredClone(this.#checkpoints.get(id));
+	}
+
+	async checkpointForSubmission(submissionId: string): Promise<CheckpointRecord | undefined> {
+		return structuredClone([...this.#checkpoints.values()].find((c) => c.submissionId === submissionId));
+	}
+
+	async listCheckpoints(sessionId: string): Promise<CheckpointRecord[]> {
+		return [...this.#checkpoints.values()]
+			.filter((c) => c.sessionId === sessionId)
+			.sort((a, b) => Number(a.entryId) - Number(b.entryId))
+			.map((c) => structuredClone(c));
+	}
+
+	async listAllCheckpoints(): Promise<CheckpointRecord[]> {
+		return [...this.#checkpoints.values()].sort(byId).map((c) => structuredClone(c));
+	}
+
+	async deleteCheckpoint(id: string): Promise<void> {
+		this.#checkpoints.delete(id);
+	}
+
+	async checkpointReferenced(id: string): Promise<boolean> {
+		return [...this.#sessions.values()].some((s) => s.status !== "archived" && s.forkedFrom?.checkpointId === id);
 	}
 
 	#requireAgent(id: string): AgentRecord {

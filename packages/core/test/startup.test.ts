@@ -1,4 +1,4 @@
-import { MemoryAppStore, sampleBinding, sampleSpec } from "@tether/testkit";
+import { MemoryAppStore, sampleBinding, sampleCheckpoint, sampleSession, sampleSpec } from "@tether/testkit";
 import { describe, expect, it } from "vitest";
 import { AgentService, BUILTIN_TOOLS, NOTES, recover, SessionService } from "../src/index.ts";
 import { FakeClock, FakeEngine, FakeIds, FakeProvider, FakeSandboxes } from "./fakes.ts";
@@ -31,6 +31,16 @@ async function setUp() {
 		order.push("provider.listManaged");
 		return listManaged();
 	};
+	const deleteSnapshot = provider.deleteSnapshot.bind(provider);
+	provider.deleteSnapshot = async (snapshotId: string) => {
+		order.push(`provider.deleteSnapshot ${snapshotId}`);
+		await deleteSnapshot(snapshotId);
+	};
+	const releaseLeftovers = provider.releaseLeftovers.bind(provider);
+	provider.releaseLeftovers = async () => {
+		order.push("provider.releaseLeftovers");
+		return releaseLeftovers();
+	};
 	const agents = new AgentService({ store, clock, ids, catalog: BUILTIN_TOOLS });
 	const sessions = new SessionService({ store, engine, agents, sandboxes: new FakeSandboxes(), clock, ids });
 	const warnings: string[] = [];
@@ -55,9 +65,22 @@ async function setUp() {
 		return session.id;
 	}
 
+	/** 分叉做到一半：新会话的记录写了，引擎还没分叉。源会话有两条记录（用户、回答），在回答处分叉。 */
+	async function halfCreatedFork(): Promise<{ source: string; fork: string }> {
+		const source = await sessions.create({ agentId: agent.id });
+		await sessions.sendMessage(source.id, { content: "hi", requestId: "r" });
+		const entryId = engine.push(source.engineSessionId!, { kind: "pi.assistant", role: "assistant", text: "hello" });
+		const fork = sampleSession("ses_fork", {
+			agentId: agent.id,
+			forkedFrom: { sessionId: source.id, entryId, checkpointId: null },
+		});
+		await store.createSession(fork);
+		return { source: source.id, fork: fork.id };
+	}
+
 	order.length = 0;
 	const run = () => recover({ store, engine, provider, sessions, log });
-	return { order, store, engine, provider, warnings, halfCreatedSession, stoppedWhileDown, run };
+	return { order, store, engine, provider, warnings, halfCreatedSession, halfCreatedFork, stoppedWhileDown, run };
 }
 
 describe("recover", () => {
@@ -78,6 +101,69 @@ describe("recover", () => {
 			"engine.createSession",
 			"engine.resume",
 		]);
+	});
+
+	it("repairs a half-created fork by forking the engine session, not creating a new one", async () => {
+		const { store, engine, halfCreatedFork, run } = await setUp();
+		const { source, fork } = await halfCreatedFork();
+		const sourceEngine = (await store.getSession(source))!.engineSessionId!;
+		engine.created.length = 0;
+
+		const result = await run();
+
+		expect(result.repairedSessions).toBe(1);
+		expect(engine.created).toEqual([]);
+		expect(engine.forks).toEqual([{ engineSessionId: sourceEngine, entryId: "2" }]);
+		const repaired = await store.getSession(fork);
+		expect(repaired?.engineSessionId).toBe(`eng_${engine.forks.length + 1}`);
+		// 说明不在 recover 里写（resume 之前写引擎会提前续跑），交给组装层
+		expect(engine.appended).toEqual([]);
+		expect(result.notes).toEqual([
+			{
+				sessionId: fork,
+				note: {
+					kind: "tether.fork",
+					data: { sessionId: source, entryId: "2", checkpointId: null, missed: 0 },
+					modelText: NOTES.forkFresh,
+				},
+			},
+		]);
+	});
+
+	it("removes partial snapshots and snapshots without a record before resume", async () => {
+		// Review Focus 3 的另一半：存档存到一半崩溃，留下 partial；快照存好了、记录没写上，留下没有记录的文件
+		const { order, store, provider, run } = await setUp();
+		provider.snapshots.set("ses_1/aaaa", { sandboxId: "sbx_1", partial: true });
+		provider.snapshots.set("ses_1/bbbb", { sandboxId: "sbx_1", partial: false });
+		provider.snapshots.set("ses_1/cccc", { sandboxId: "sbx_1", partial: false });
+		await store.addCheckpoint(sampleCheckpoint("cp_kept", { snapshotId: "ses_1/cccc" }));
+
+		const result = await run();
+
+		expect(result.removedSnapshots).toBe(2);
+		expect([...provider.snapshots.keys()]).toEqual(["ses_1/cccc"]);
+		expect(order.indexOf("provider.deleteSnapshot ses_1/aaaa")).toBeLessThan(order.indexOf("engine.resume"));
+		expect(order.indexOf("provider.deleteSnapshot ses_1/bbbb")).toBeLessThan(order.indexOf("engine.resume"));
+	});
+
+	it("drops checkpoint records whose snapshot file is gone", async () => {
+		const { store, warnings, run } = await setUp();
+		await store.addCheckpoint(sampleCheckpoint("cp_gone", { snapshotId: "ses_1/dddd" }));
+		await store.addCheckpoint(sampleCheckpoint("cp_template", { snapshotId: null }));
+
+		await run();
+
+		expect((await store.listAllCheckpoints()).map((c) => c.id)).toEqual(["cp_template"]);
+		expect(warnings.join("\n")).toContain("cp_gone");
+	});
+
+	it("releases leftover workspaces of sessions without a container after removing orphans, before resume", async () => {
+		const { order, run } = await setUp();
+
+		await run();
+
+		const backend = order.filter((call) => call.startsWith("provider.") || call === "engine.resume");
+		expect(backend).toEqual(["provider.listManaged", "provider.releaseLeftovers", "engine.resume"]);
 	});
 
 	it("marks a session failed when its engine session cannot be created", async () => {
@@ -116,7 +202,8 @@ describe("recover", () => {
 		const result = await run();
 
 		expect(result.lostBindings).toBe(1);
-		expect((await store.getBinding("ses_gone"))?.state).toBe("lost");
+		// 原因写进绑定：重启后重建时说明里仍有它
+		expect(await store.getBinding("ses_gone")).toMatchObject({ state: "lost", reason: "missing" });
 		// 状态也按 Docker 的实际情况修正
 		expect((await store.getBinding("ses_kept"))?.state).toBe("stopped");
 	});

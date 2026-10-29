@@ -3,6 +3,7 @@ import {
 	applyEvent,
 	type EngineAgentConfig,
 	type ModelRef,
+	type RunStartListener,
 	type SessionView,
 	type TetherEvent,
 	type TranscriptEntry,
@@ -11,6 +12,11 @@ import type { ConformanceRunner } from "./app-store.ts";
 
 /** 与模型实现无关的剧本：每一步是模型的一次回答。 */
 export type ScriptStep = { text: string } | { toolCall: { name: string; args: unknown } };
+
+/** 打开引擎时的可选项；实现方必须把 onRunStart 接到自己的运行开始钩子上。 */
+export interface EngineTestOptions {
+	onRunStart?: RunStartListener;
+}
 
 /**
  * make 的实现要给会话提供一个能执行 shell 命令的环境：第二组用例让模型调用 bash（例如 sleep）。
@@ -96,12 +102,16 @@ const runEndOf = (submissionId: string) => (event: TetherEvent) =>
 export function registerAgentEngineConformance(
 	runner: ConformanceRunner,
 	name: string,
-	make: (script: ScriptStep[]) => Promise<MadeEngine>,
+	make: (script: ScriptStep[], options?: EngineTestOptions) => Promise<MadeEngine>,
 ): void {
 	const { describe, it, expect } = runner;
 
-	async function withEngine(script: ScriptStep[], body: (made: MadeEngine) => Promise<void>): Promise<void> {
-		const made = await make(script);
+	async function withEngine(
+		script: ScriptStep[],
+		body: (made: MadeEngine) => Promise<void>,
+		options?: EngineTestOptions,
+	): Promise<void> {
+		const made = await make(script, options);
 		try {
 			await body(made);
 		} finally {
@@ -368,6 +378,144 @@ export function registerAgentEngineConformance(
 			await withEngine([], async ({ engine }) => {
 				await expect(engine.isRunning("999999")).rejects.toMatchObject({ code: "not_found" });
 			});
+		});
+
+		it("forks at an entry: the fork sees entries up to it and none after", async () => {
+			await withEngine([{ text: "one" }, { text: "two" }], async ({ engine, model }) => {
+				const id = await engine.createSession(config(model));
+				const first = await engine.waitSubmission((await engine.submit(id, { content: "a", requestId: "r1" })).submissionId);
+				await engine.waitSubmission((await engine.submit(id, { content: "b", requestId: "r2" })).submissionId);
+
+				const fork = await engine.fork(id, first.answer!.id);
+
+				expect(fork).not.toBe(id);
+				expect(await engine.hasSession(fork)).toBe(true);
+				expect(texts((await engine.transcript(fork, { limit: 10 })).items)).toEqual(["one", "a"]);
+			});
+		});
+
+		it("gives entries written after a fork ids greater than the fork point", async () => {
+			await withEngine([{ text: "one" }, { text: "two" }, { text: "three" }], async ({ engine, model }) => {
+				const id = await engine.createSession(config(model));
+				const first = await engine.waitSubmission((await engine.submit(id, { content: "a", requestId: "r1" })).submissionId);
+				await engine.waitSubmission((await engine.submit(id, { content: "b", requestId: "r2" })).submissionId);
+				const parentIds = (await engine.transcript(id, { limit: 100 })).items.map((e) => Number(e.id));
+				const fork = await engine.fork(id, first.answer!.id);
+
+				await engine.waitSubmission((await engine.submit(fork, { content: "c", requestId: "r3" })).submissionId);
+
+				const forkEntries = (await engine.transcript(fork, { limit: 100 })).items;
+				const added = forkEntries.filter((e) => Number(e.id) > Number(first.answer!.id));
+				expect(texts(added)).toEqual(["three", "c"]);
+				// 不只大于分叉点，也大于父会话里已有的全部条目：ID 在整个存储里递增
+				for (const entry of added) expect(Number(entry.id)).toBeGreaterThan(Math.max(...parentIds));
+			});
+		});
+
+		it("keeps the parent unchanged when the fork gets new entries", async () => {
+			await withEngine([{ text: "one" }, { text: "two" }, { text: "three" }], async ({ engine, model }) => {
+				const id = await engine.createSession(config(model));
+				const first = await engine.waitSubmission((await engine.submit(id, { content: "a", requestId: "r1" })).submissionId);
+				await engine.waitSubmission((await engine.submit(id, { content: "b", requestId: "r2" })).submissionId);
+				const fork = await engine.fork(id, first.answer!.id);
+
+				await engine.waitSubmission((await engine.submit(fork, { content: "c", requestId: "r3" })).submissionId);
+
+				expect(texts((await engine.transcript(id, { limit: 10 })).items)).toEqual(["two", "b", "one", "a"]);
+			});
+		});
+
+		it("rejects a fork at an entry that does not exist with invalid_request", async () => {
+			await withEngine([{ text: "one" }], async ({ engine, model }) => {
+				const id = await engine.createSession(config(model));
+				await engine.waitSubmission((await engine.submit(id, { content: "a", requestId: "r1" })).submissionId);
+
+				await expect(engine.fork(id, "999999")).rejects.toMatchObject({ code: "invalid_request" });
+				await expect(engine.fork(id, "not-a-number")).rejects.toMatchObject({ code: "invalid_request" });
+			});
+		});
+
+		it("returns the user entry of a submission once it is placed", async () => {
+			await withEngine([{ text: "Hi there." }], async ({ engine, model }) => {
+				const id = await engine.createSession(config(model));
+				const { submissionId } = await engine.submit(id, { content: "hello", requestId: "r1" });
+				await engine.waitSubmission(submissionId);
+
+				const user = (await engine.transcript(id, { limit: 10 })).items.find((e) => e.role === "user");
+				expect(await engine.submissionEntry(submissionId)).toBe(user!.id);
+				await expect(engine.submissionEntry("999999")).rejects.toMatchObject({ code: "not_found" });
+			});
+		});
+
+		it("calls onRunStart before every model request with the submission that started the run", async () => {
+			const calls: [string, string][] = [];
+			const onRunStart: RunStartListener = async (session, submission) => {
+				calls.push([session, submission]);
+			};
+			await withEngine(
+				[bash("true"), { text: "ran" }, { text: "second" }],
+				async ({ engine, model }) => {
+					const id = await engine.createSession(bashConfig(model));
+					const s1 = (await engine.submit(id, { content: "first", requestId: "r1" })).submissionId;
+					await engine.waitSubmission(s1);
+					const s2 = (await engine.submit(id, { content: "second", requestId: "r2" })).submissionId;
+					await engine.waitSubmission(s2);
+
+					// 第一轮两次请求（工具调用前后），第二轮一次
+					expect(calls).toEqual([
+						[id, s1],
+						[id, s1],
+						[id, s2],
+					]);
+				},
+				{ onRunStart },
+			);
+		});
+
+		it("keeps the starting submission when a steer input joins the run", async () => {
+			const calls: string[] = [];
+			const onRunStart: RunStartListener = async (_session, submission) => {
+				calls.push(submission);
+			};
+			await withEngine(
+				[bash("sleep 1"), { text: "steered" }],
+				async ({ engine, model }) => {
+					const id = await engine.createSession(bashConfig(model));
+					const recorded = await record(engine, id);
+					try {
+						const s1 = (await engine.submit(id, { content: "first", requestId: "r1" })).submissionId;
+						await recorded.until((e) => e.type === "tool_start");
+						const s2 = (await engine.submit(id, { content: "also this", requestId: "r2", whenBusy: "steer" }))
+							.submissionId;
+						await engine.waitSubmission(s1);
+						await engine.waitSubmission(s2);
+
+						// steer 的输入并进这一轮：工具结果之后那次请求仍报告第一条提交
+						expect(calls).toEqual([s1, s1]);
+					} finally {
+						await recorded.stop();
+					}
+				},
+				{ onRunStart },
+			);
+		});
+
+		it("still answers when onRunStart throws", async () => {
+			const onRunStart: RunStartListener = async () => {
+				throw new Error("snapshot exploded");
+			};
+			await withEngine(
+				[{ text: "answered anyway" }],
+				async ({ engine, model }) => {
+					const id = await engine.createSession(config(model));
+					const settled = await engine.waitSubmission(
+						(await engine.submit(id, { content: "go", requestId: "r" })).submissionId,
+					);
+
+					expect(settled).toMatchObject({ status: "done", answer: { text: "answered anyway" } });
+				},
+				{ onRunStart },
+			);
 		});
 
 		it("reports an unknown session", async () => {

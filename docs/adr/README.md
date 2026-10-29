@@ -11,8 +11,9 @@
 | [ADR-003](ADR-003-docker-as-phase1-sandbox.md) | 第一阶段的沙箱后端用 Docker | 已采纳 | 2026-10-20 |
 | [ADR-004](ADR-004-ports-and-adapters-five-packages.md) | 端口与适配器架构，五个包 | 已采纳 | 2026-10-21 |
 | [ADR-005](ADR-005-single-event-source.md) | 单一事件源，沙箱与检查点事件写进引擎日志 | 已采纳（M0 已验证） | 2026-10-21 |
-| [ADR-006](ADR-006-checkpoint-workspace-mount-reflink.md) | 检查点用工作区挂载加 reflink，不用 docker commit | 已采纳（M0 已验证） | 2026-10-21 |
+| [ADR-006](ADR-006-checkpoint-workspace-mount-reflink.md) | 检查点用工作区挂载加 reflink，不用 docker commit | 部分被 ADR-011 取代 | 2026-10-21 |
 | [ADR-007](ADR-007-epoch-fencing.md) | 用 epoch 隔离清理崩溃后的旧进程 | 已采纳（M0 已验证） | 2026-10-21 |
 | [ADR-008](ADR-008-idle-two-tiers.md) | 闲置分两档，停止容器时写说明 | 已采纳 | 2026-10-21 |
 | [ADR-009](ADR-009-tether-env-minimal.md) | `TetherEnv` 先取最小子集 | 已采纳 | 2026-10-25 |
 | [ADR-010](ADR-010-sandbox-lifecycle-rules.md) | 沙箱生命周期的规则放在 core：状态表、会话锁、带期望值的写入 | 已采纳（M2 已实现） | 2026-10-26 |
+| [ADR-011](ADR-011-workspace-images-and-checkpoints.md) | 工作区改为每会话一个 XFS 镜像文件，检查点每轮都留、按空间稀疏化 | 已采纳（M3 已实现） | 2026-10-28 |

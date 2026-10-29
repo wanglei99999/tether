@@ -1,10 +1,10 @@
 import { execFile } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { SandboxService } from "@tether/core";
-import { MemoryAppStore, sampleAgent, sampleSession, sampleSpec } from "@tether/testkit";
+import { MemoryAppStore, sampleAgent, sampleCheckpoint, sampleSession, sampleSpec } from "@tether/testkit";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createPiEnvExecChannel } from "../src/adapters/exec-pienv/index.ts";
 import { buildSandboxImage, createDockerSandboxProvider } from "../src/adapters/sandbox-docker/index.ts";
@@ -17,6 +17,10 @@ const provider = createDockerSandboxProvider({
 	workspaceRoot,
 	user: `${process.getuid?.()}:${process.getgid?.()}`,
 	defaultImage: IMAGE,
+	// 这里读宿主上的工作区文件，用目录模式；镜像模式在 sandbox-docker.docker.test.ts
+	storage: "directory",
+	defaultDiskMb: 512,
+	checkpointRoot: join(workspaceRoot, ".checkpoints"),
 	...runtimeOption(),
 });
 /** 测试里每个会话一个 SandboxService，按会话 ID 找到对应的服务来连接。 */
@@ -55,7 +59,7 @@ async function sessionWith(setup: string[], variables: Record<string, string>, s
 		store,
 		provider,
 		exec,
-		engine: { isRunning: async () => false },
+		engine: { isRunning: async () => false, transcript: async () => ({ items: [] }) },
 		clock: { now: () => new Date().toISOString() },
 		record: async () => {},
 		log: { warn: () => {} },
@@ -104,5 +108,26 @@ describe("SandboxService on docker", () => {
 		expect(await store.getBinding(sessionId)).toBeUndefined();
 		const { stdout } = await run("docker", ["ps", "-aq", "--filter", `name=tether-${sessionId}`]);
 		expect(stdout.trim()).toBe("");
+	});
+
+	it("restores files from the checkpoint after the container is removed outside Tether", async () => {
+		const { store, sandboxes, sessionId, workspace } = await sessionWith(["echo ran >> setup-runs.txt"], {});
+		const first = await sandboxes.ensureSandbox(sessionId);
+		writeFileSync(join(workspace, "kept.txt"), "before the checkpoint");
+		const snapshot = await sandboxes.snapshot(sessionId);
+		if (!("snapshotId" in snapshot)) throw new Error(`no snapshot: ${JSON.stringify(snapshot)}`);
+		await store.addCheckpoint(sampleCheckpoint("cp_1", { sessionId, snapshotId: snapshot.snapshotId }));
+		writeFileSync(join(workspace, "later.txt"), "after the checkpoint");
+
+		await run("docker", ["rm", "--force", first.sandboxId]);
+		await sandboxes.sweep();
+		expect((await store.getBinding(sessionId))?.state).toBe("lost");
+		const rebuilt = await sandboxes.ensureSandbox(sessionId);
+
+		expect(rebuilt.state).toBe("running");
+		expect(readFileSync(join(workspace, "kept.txt"), "utf8")).toBe("before the checkpoint");
+		expect(existsSync(join(workspace, "later.txt"))).toBe(false);
+		// 从存档建，setup 没有再跑
+		expect(readFileSync(join(workspace, "setup-runs.txt"), "utf8")).toBe("ran\n");
 	});
 });
