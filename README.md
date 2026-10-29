@@ -2,7 +2,7 @@
 
 自托管的服务端 agent 运行时。agent 的循环跑在服务进程里，每个会话的工具调用在自己的 Docker 容器里执行；服务进程被 `kill -9` 后重启，没跑完的会话从断点继续。客户端通过 HTTP 和 WebSocket 接入，仓库里带一个 TypeScript SDK 和命令行工具 `tether`。
 
-第一阶段的引擎是 pi 1.3.0（`@earendil-works/pi-durable`、`pi-env`），Tether 在它前面定义了自己的接口，第二阶段换成自研实现。设计见 `docs/superpowers/specs/2026-10-20-tether-design.md`，决策记录在 `docs/adr/`。
+第一阶段的引擎是 pi 1.4.0（`@earendil-works/pi-durable`、`pi-env`），Tether 在它前面定义了自己的接口，第二阶段换成自研实现。设计见 `docs/superpowers/specs/2026-10-20-tether-design.md`，决策记录在 `docs/adr/`。
 
 ## 运行
 

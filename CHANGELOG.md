@@ -2,6 +2,14 @@
 
 Tether 还没有发布版本号，按里程碑记录。每个里程碑合进 `main` 时定稿；`[未发布]` 是正在进行的里程碑，随任务完成追加。只记使用者能感知的变化：API、命令、配置、数据目录、行为和已知限制。设计上的取舍见 `docs/adr/`。
 
+## [未发布]
+
+### 变更
+
+- pi 的四个包（`pi-durable`、`pi-env`、`pi-ai`、`chord`）从 1.3.0 升到 1.4.0。Tether 的 API、配置和数据目录不变；对使用者有影响的有两点：
+  - 引擎库 `engine.sqlite` 在第一次启动时自动迁移到 pi 的第 2 版，迁移后不能再用 pi 1.3.0 的 Tether 打开，也就是不能回退到 M3。`tether.sqlite` 不变。
+  - pi 新加了崩溃保护：同一个任务连续 5 次被崩溃打断、其间没有提交新状态，就停下不再重跑（pi 的 `settings.restartLimit`，Tether 用默认值）。
+
 ## M3 检查点与分叉：2026-10-29
 
 PR #4，合并提交 `ece5aa7`。决定见 ADR-011，执行中的决定见 `docs/superpowers/plans/2026-10-28-m3-rulings.md`，端到端验收见 `docs/acceptance/m3.md`。
