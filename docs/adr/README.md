@@ -17,3 +17,4 @@
 | [ADR-009](ADR-009-tether-env-minimal.md) | `TetherEnv` 先取最小子集 | 已采纳 | 2026-10-25 |
 | [ADR-010](ADR-010-sandbox-lifecycle-rules.md) | 沙箱生命周期的规则放在 core：状态表、会话锁、带期望值的写入 | 已采纳（M2 已实现） | 2026-10-26 |
 | [ADR-011](ADR-011-workspace-images-and-checkpoints.md) | 工作区改为每会话一个 XFS 镜像文件，检查点每轮都留、按空间稀疏化 | 已采纳（M3 已实现） | 2026-10-28 |
+| [ADR-012](ADR-012-approval-after-phase-one.md) | 工具审批移到第一阶段之后 | 已采纳 | 2026-11-05 |

@@ -16,7 +16,7 @@ export function checkSchema(schema: TSchema, value: unknown, what: string): void
 export interface Unsupported {
 	/** sandbox.resources.diskMb：只有工作区是镜像文件时才有上限（ADR-011），由组装层按存储模式决定。 */
 	diskMb: boolean;
-	/** permissions.requireApproval：审批在 M3 之后单独一份计划。 */
+	/** permissions.requireApproval：审批移到第一阶段之后（ADR-012）。 */
 	approval: boolean;
 	/** checkpointPolicy "perRun"：后端不支持快照时拒绝。 */
 	checkpoints: boolean;
