@@ -138,6 +138,41 @@ describe("checkRound", () => {
 		expect(ids(session({ fork: fork({ files: [`f-${T0}.txt`] }) }))).toEqual(["I6"]);
 	});
 
+	it("I6: files written before a template rebuild of the source are allowed to be missing", () => {
+		// 3 的结果之后容器丢了（lost 在 4.5），从模板重建（recovered 没有 checkpointId，在 7.5）
+		const entries = [
+			...transcript(),
+			{ id: "4.5", kind: "tether.sandbox", data: { state: "lost", reason: "missing" } },
+			{ id: "7.5", kind: "tether.sandbox", data: { state: "running", reason: "recovered" } },
+		].sort((a, b) => Number(a.id) - Number(b.id));
+		const streamed = entries.map((e) => e.id);
+		const rebuilt = session({ transcript: entries, streamEntryIds: streamed, fork: fork({ files: [`f-${T2}.txt`] }) });
+		expect(check(rebuilt)).toEqual([]);
+		// 重建之后写的文件仍然必须在
+		expect(ids(session({ transcript: entries, streamEntryIds: streamed, fork: fork({ files: [] }) }))).toEqual(["I6"]);
+	});
+
+	it("I6: a rebuild after the fork point does not excuse anything", () => {
+		const entries = [
+			...transcript(),
+			{ id: "9", kind: "tether.sandbox", data: { state: "lost", reason: "missing" } },
+			{ id: "10", kind: "tether.sandbox", data: { state: "running", reason: "recovered" } },
+		];
+		const streamed = entries.map((e) => e.id);
+		expect(ids(session({ transcript: entries, streamEntryIds: streamed, fork: fork({ files: [] }) }))).toEqual(["I6"]);
+	});
+
+	it("I6: a restore from a checkpoint is not a rebuild; its note has to list the operations", () => {
+		const entries = [
+			...transcript(),
+			{ id: "4.5", kind: "tether.sandbox", data: { state: "lost", reason: "missing" } },
+			{ id: "7.5", kind: "tether.sandbox", data: { state: "running", reason: "recovered", checkpointId: "cp_1" } },
+		].sort((a, b) => Number(a.id) - Number(b.id));
+		const streamed = entries.map((e) => e.id);
+		const restored = session({ transcript: entries, streamEntryIds: streamed, fork: fork({ files: [`f-${T2}.txt`] }) });
+		expect(ids(restored)).toEqual(["I6"]);
+	});
+
 	it("I7: anything left after archiving", () => {
 		expect(ids(session(), ["volume tether-ses_x"])).toEqual(["I7"]);
 	});
