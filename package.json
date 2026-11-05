@@ -13,6 +13,7 @@
 		"test:unit": "vitest run --project unit",
 		"test:docker": "vitest run --project docker",
 		"test:spikes": "vitest run --config vitest.spikes.config.ts",
+		"chaos": "node packages/server/test/chaos/main.ts",
 		"typecheck": "tsc --noEmit"
 	},
 	"devDependencies": {
