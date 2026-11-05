@@ -17,6 +17,7 @@ const { values } = parseArgs({
 		"keep-failed": { type: "boolean", default: false },
 		scenario: { type: "string" },
 		kills: { type: "string", default: "8" },
+		position: { type: "string" },
 		root: { type: "string", default: "/data/tether-xfs/chaos" },
 		image: { type: "string", default: "tether-sandbox:dev" },
 	},
@@ -31,6 +32,17 @@ const output = join(homedir(), "chaos-out", tag);
 mkdirSync(output, { recursive: true });
 
 const log = (line: string) => process.stdout.write(`${line}\n`);
+
+const ALL_POSITIONS: CrashPosition[] = ["early", "spaced", "tool", "setup", "model"];
+
+if (values.scenario === "crash-loop") {
+	for (const position of values.position ? [values.position as CrashPosition] : ALL_POSITIONS) {
+		const report = await runCrashLoop({ position, kills: Number(values.kills), root: values.root, image: values.image });
+		log(JSON.stringify(report));
+	}
+	process.exit(0);
+}
+
 const reports: RoundReport[] = [];
 for (let round = from; round < from + rounds; round += 1) {
 	const report = await runRound({

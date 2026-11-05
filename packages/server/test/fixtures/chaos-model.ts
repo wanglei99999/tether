@@ -18,12 +18,14 @@ function toModelMessage(message: Message): ModelMessage {
 
 /**
  * 混沌测试的模型：回答只取决于这次请求的消息（testkit 的 nextStep），服务重启后接着走。
+ * delayMs 模拟思考很久的模型，连续崩溃场景用。
  * 说明文本不在记录接口里，所以把模型实际收到的说明记进 notesFile，一行一个 JSON。
  */
-export function chaosModels(notesFile: string | undefined): Models {
+export function chaosModels(notesFile: string | undefined, delayMs = 0): Models {
 	const faux = fauxProvider();
 	faux.setResponses(
-		Array.from({ length: QUEUE_LENGTH }, () => (context: { messages: Message[] }) => {
+		Array.from({ length: QUEUE_LENGTH }, () => async (context: { messages: Message[] }) => {
+			if (delayMs > 0) await new Promise((done) => setTimeout(done, delayMs));
 			const messages = context.messages.map(toModelMessage);
 			const label = turnLabel(messages);
 			if (notesFile !== undefined && label !== undefined) {

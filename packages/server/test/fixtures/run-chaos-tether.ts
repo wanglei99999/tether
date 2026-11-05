@@ -6,7 +6,7 @@ import { loadConfig } from "../../src/config.ts";
 import { chaosModels } from "./chaos-model.ts";
 
 const config = loadConfig(process.env);
-const tether = await createTether(config, { models: chaosModels(process.env.TETHER_CHAOS_NOTES) });
+const tether = await createTether(config, { models: chaosModels(process.env.TETHER_CHAOS_NOTES, Number(process.env.TETHER_CHAOS_MODEL_DELAY_MS ?? 0)) });
 
 const server = serve({ fetch: tether.app.fetch, hostname: config.host, port: config.port }, (info) => {
 	process.stdout.write(`listening ${info.port}\n`);

@@ -69,7 +69,7 @@ export interface RoundReport {
 	dataDir?: string;
 }
 
-export function chaosSpec(storage: RoundOptions["storage"]): AgentVersionSpec {
+export function chaosSpec(storage: RoundOptions["storage"], setup: string[] = []): AgentVersionSpec {
 	return {
 		model: FAUX_MODEL,
 		instructions: "chaos",
@@ -78,7 +78,7 @@ export function chaosSpec(storage: RoundOptions["storage"]): AgentVersionSpec {
 			template: "",
 			resources: { cpu: 1, memoryMb: 256, ...(storage !== "directory" && { diskMb: 512 }) },
 			network: "none",
-			setup: [],
+			setup,
 			variables: [],
 		},
 		checkpointPolicy: "perRun",
