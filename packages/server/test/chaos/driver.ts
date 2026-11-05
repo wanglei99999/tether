@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -47,6 +47,8 @@ export interface RoundOptions {
 	/** 破坏性对照：直接在容器里把一条命令再执行一次，必须判 I2 失败。 */
 	sabotage?: "duplicate";
 	keepFailed?: boolean;
+	/** 同一个种子和轮号在不同组里各跑一次，数据目录按组分开，失败的轮次才不会被下一组覆盖。 */
+	group?: string;
 }
 
 export interface FaultEffect extends Fault {
@@ -321,7 +323,7 @@ async function sabotage(id: string, log: readonly string[]): Promise<void> {
 
 export async function runRound(options: RoundOptions): Promise<RoundReport> {
 	const started = Date.now();
-	const dataDir = join(options.root, `${options.seed}-${options.round}`);
+	const dataDir = join(options.root, `${options.group ?? "default"}-${options.seed}-${options.round}`);
 	rmSync(dataDir, { recursive: true, force: true });
 	mkdirSync(dataDir, { recursive: true });
 	const notesFile = join(dataDir, "model-notes.jsonl");
@@ -467,14 +469,17 @@ export async function runRound(options: RoundOptions): Promise<RoundReport> {
 		for (const id of round.sessionIds) await client.sessions.archive(id);
 		await server.stop("SIGTERM");
 
-		const entries = histories.flatMap((history) => history.transcript);
+		const history = { sessions: histories, leftovers: await leftovers(round.sessionIds, dataDir) };
+		const entries = histories.flatMap((one) => one.transcript);
 		const results = entries.flatMap((entry) => (entry.toolResult?.isError ? [entry.toolResult.text] : []));
 		const interrupted = results.filter((text) => /interrupt/i.test(text)).length;
 		result = report({
 			interrupted,
 			toolErrors: results.length - interrupted,
-			violations: checkRound({ sessions: histories, leftovers: await leftovers(round.sessionIds, dataDir) }),
+			violations: checkRound(history),
 		});
+		// 检查函数改了以后可以拿它重查，不用重跑
+		if (result.violations.length > 0) writeFileSync(join(dataDir, "history.json"), JSON.stringify(history));
 	} catch (error) {
 		result = report({ error: error instanceof Error ? (error.stack ?? error.message) : String(error) });
 	} finally {

@@ -145,10 +145,29 @@ function checkStream(session: SessionHistory): Violation[] {
 		: [{ invariant: "I5", session: session.label, detail: `the stream never showed entries ${missing.join(", ")}` }];
 }
 
+/**
+ * 来源会话在分叉点之前从模板重建过：重建前写的文件全部没了，分叉继承的说明已经告诉模型
+ * "/workspace 里的文件都没了"，不会逐条列出。返回重建前最后一条 lost 条目的位置。
+ * recovered 带 checkpointId 是从存档恢复，那种说明逐条列出没发生的操作，不算在这里。
+ */
+function lastRebuild(transcript: readonly TranscriptEntry[], at: number): number {
+	let lost = Number.NEGATIVE_INFINITY;
+	let cut = Number.NEGATIVE_INFINITY;
+	for (const entry of transcript) {
+		const id = Number(entry.id);
+		if (id > at || entry.kind !== "tether.sandbox") continue;
+		const data = (entry.data ?? {}) as { state?: string; reason?: string; checkpointId?: string };
+		if (data.state === "lost") lost = id;
+		if (data.reason === "recovered" && data.checkpointId === undefined) cut = lost;
+	}
+	return cut;
+}
+
 function checkFork(session: SessionHistory): Violation[] {
 	const fork = session.fork;
 	if (fork === undefined) return [];
 	const at = Number(fork.atEntryId);
+	const rebuilt = lastRebuild(session.transcript, at);
 	const calledAt = new Map<string, number>();
 	const succeededBy = new Map<string, number>();
 	for (const entry of session.transcript) {
@@ -177,7 +196,7 @@ function checkFork(session: SessionHistory): Violation[] {
 	const truncated = /and \d+ more/.test(notes);
 	for (const [token, result] of succeededBy) {
 		if (!token.endsWith("-t0") && !token.endsWith("-t2")) continue;
-		if (result > at || present.has(token) || truncated || notes.includes(token)) continue;
+		if (result > at || result < rebuilt || present.has(token) || truncated || notes.includes(token)) continue;
 		violations.push({
 			invariant: "I6",
 			session: fork.label,

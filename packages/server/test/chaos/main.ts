@@ -49,6 +49,7 @@ for (let round = from; round < from + rounds; round += 1) {
 		seed,
 		round,
 		root: values.root,
+		group: tag,
 		image: values.image,
 		keepFailed: values["keep-failed"],
 		...(values.runtime && { runtime: values.runtime }),
