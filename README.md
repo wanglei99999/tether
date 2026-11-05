@@ -183,7 +183,7 @@ TETHER_SANDBOX_RUNTIME=runsc npm run test:docker   # 可选：在 gVisor 下再�
 
 以下能力属于后续计划，还没有实现，相应的端点也没有注册：
 
-- 工具审批：拆成单独一份计划，在 M4 之前
+- 工具审批：移到第一阶段之后（ADR-012）。容器外的副作用（`git push`、调用外部 API）目前没有拦截手段，由 `tools` 和 `network` 控制
 - `/v1/metrics`（M4）
 - 自定义工具：只有内置的 `read`、`write`、`edit`、`bash`
 

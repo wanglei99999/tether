@@ -24,7 +24,7 @@ describe("AgentService", () => {
 
 	it("rejects unsupported fields on create and on a new version, and accepts them when the service supports them", async () => {
 		const { agents } = service();
-		// 审批默认还不支持（M3 之后单独一份计划）
+		// 审批默认还不支持（ADR-012）
 		const approval = { ...sampleSpec(), permissions: { denyTools: [], requireApproval: ["bash"] } };
 		const unsupported = { code: "invalid_request", message: "permissions.requireApproval is not supported yet" };
 
