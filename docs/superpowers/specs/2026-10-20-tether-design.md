@@ -39,7 +39,6 @@ Tether 是一个可以自托管的**服务端 agent 运行时**。它负责把 a
 - **执行沙箱**：harness 不进沙箱。每个会话绑定一个沙箱，工具在沙箱里执行；模型 API key 等凭据永远不进沙箱。
 - **工作区初始化**：沙箱第一次创建时执行 agent 版本里配置的 `setup` 命令（例如克隆仓库），会话创建时可以传入变量替换进这些命令（§5.1）。
 - **沙箱生命周期**：懒创建、长时间闲置后停止（并告知模型）、按需启动、过期删除后从检查点重建、会话结束回收（§8.5）。
-- **审批**：指定的工具在执行前必须由用户批准；服务端在等待审批期间崩溃重启，审批请求依然在，批准后只执行一次（§6.4）。
 - **快照与分叉**：在支持的后端上，会话检查点与沙箱快照对齐；分叉会话时沙箱也一起分叉。
 - **实时事件流**：多个客户端可以同时订阅同一个会话；断线重连后拿到当前完整状态。
 - **可替换性**：第一阶段只实现 Docker 后端（runc，可选 gVisor），但 SandboxProvider 接口按"E2B / CubeSandbox / Firecracker 以后都能接进来"来设计：能力用显式标志声明，core 不假设任何后端特有的行为。E2B、CubeSandbox 适配器是第一阶段之后的可选项（§14）。
@@ -53,6 +52,7 @@ Tether 是一个可以自托管的**服务端 agent 运行时**。它负责把 a
 - harness 进沙箱的执行模式。
 - 水平扩展。`pi-durable` 的约束是"一个进程独占一份存储"，第一版就是单进程、单机。
 - Windows 沙箱。
+- 工具审批（§6.4）。2026-11-05 移到第一阶段之后（ADR-012）；`requireApproval` 非空时报 `invalid_request`。
 
 ### 反目标（技术上能跑，但出现就算失败）
 
@@ -106,7 +106,7 @@ packages/
 
 ### 4.2 三个接口（替换点）
 
-**AgentEngine**：持久化的 agent 执行引擎。职责：创建会话、提交输入（带幂等 `requestId`）、中断、分叉、订阅事件、进程重启后恢复；**追加 Tether 自定义条目**（模型可见或不可见，见 §4.4）；**运行开始钩子**（一轮运行里每次请求模型之前回调 core，带上触发这一轮的提交 ID，同一轮只存一次由 core 按提交 ID 去重，约定写在 `ports.ts` 的 `RunStartListener` 并由 testkit 检查；core 由它解析出对齐用的条目 ID，用于 §8.3 的检查点；pi-durable 上的取法见 `docs/m0-findings.md` 第 7 节）；**工具审批挂起与恢复**（§6.4）。引擎通过 core 定义的 `EnvResolver.envFor(sessionId)` 拿执行环境，不直接依赖沙箱。第一阶段实现是对 `pi-durable` 的 `Harness` / `Conversation` 的适配。
+**AgentEngine**：持久化的 agent 执行引擎。职责：创建会话、提交输入（带幂等 `requestId`）、中断、分叉、订阅事件、进程重启后恢复；**追加 Tether 自定义条目**（模型可见或不可见，见 §4.4）；**运行开始钩子**（一轮运行里每次请求模型之前回调 core，带上触发这一轮的提交 ID，同一轮只存一次由 core 按提交 ID 去重，约定写在 `ports.ts` 的 `RunStartListener` 并由 testkit 检查；core 由它解析出对齐用的条目 ID，用于 §8.3 的检查点；pi-durable 上的取法见 `docs/m0-findings.md` 第 7 节）；**工具审批挂起与恢复**（§6.4，第一阶段之后）。引擎通过 core 定义的 `EnvResolver.envFor(sessionId)` 拿执行环境，不直接依赖沙箱。第一阶段实现是对 `pi-durable` 的 `Harness` / `Conversation` 的适配。
 
 **SandboxProvider**：沙箱生命周期，不负责执行。职责：按模板创建、按 ID 查找、停止、启动、销毁、列出带状态的受管沙箱（`listManaged()`，巡检和启动对账用）；`daemonCommand(binding, epoch)` 返回启动沙箱内 daemon 的命令行（Docker 就是 `docker exec -i ...`），也就是一条到 daemon 的**字节管道**；`fence(sandboxId, epoch)` 在沙箱里杀掉旧 epoch 的 daemon 和它启动的全部进程（§8.2，Docker 上是 `kill -KILL -1` 加两道防护）；可选能力：快照、从快照创建、原地回滚、分叉。能力用显式的 `capabilities` 标出，core 根据能力决定策略，不做"假装支持"。
 
@@ -272,7 +272,7 @@ sessions.forkedFrom           { sessionId, entryId, checkpointId | null }：分�
 
 ### 6.4 需要审批的工具
 
-`permissions.requireApproval` 里的工具，调用前由 `beforeTool` 钩子拦下：在会话里写一条"等待审批"的状态，工具调用以"等待中"挂起，客户端通过 API 批准或拒绝。实现方式（在钩子里阻塞等待、还是返回 block 后由审批结果重新驱动）留给实现者，但必须满足：服务端在等待审批期间崩溃重启，审批请求依然在，批准后只执行一次。这是持久化执行的典型难题，属于第一阶段的正式目标（M3）。如果 `pi-durable` 的钩子模型无法直接表达，就在适配层用自定义条目和持久化任务实现，不降级。
+`permissions.requireApproval` 里的工具，调用前由 `beforeTool` 钩子拦下：在会话里写一条"等待审批"的状态，工具调用以"等待中"挂起，客户端通过 API 批准或拒绝。实现方式（在钩子里阻塞等待、还是返回 block 后由审批结果重新驱动）留给实现者，但必须满足：服务端在等待审批期间崩溃重启，审批请求依然在，批准后只执行一次。这是持久化执行的典型难题。2026-11-05 移到第一阶段之后（ADR-012），本节的设计和要求保留。如果 `pi-durable` 的钩子模型无法直接表达，就在适配层用自定义条目和持久化任务实现，不降级。
 
 ### 6.5 中断、归档
 
@@ -297,7 +297,7 @@ GET    /v1/sessions  /v1/sessions/:id     列表支持按 agent、状态过滤�
 POST   /v1/sessions/:id/messages          { content, requestId, whenBusy? }
 POST   /v1/sessions/:id/abort
 POST   /v1/sessions/:id/fork              { entryId }，见 §8.3
-POST   /v1/sessions/:id/approvals/:callId { decision: "approve" | "deny" }
+POST   /v1/sessions/:id/approvals/:callId { decision: "approve" | "deny" }，第一阶段不注册（ADR-012）
 POST   /v1/sessions/:id/archive
 GET    /v1/sessions/:id/transcript        分页读历史条目
 
@@ -313,7 +313,7 @@ GET    /v1/health  /v1/metrics
 
 ### 7.2 事件流
 
-WebSocket 连接建立后，服务端先发一个 `snapshot`（会话当前完整状态），之后按提交顺序发增量事件：消息开始/文本增量/结束、工具开始/输出增量/结束、审批请求、沙箱状态变化、检查点创建、错误。第一阶段直接由 `pi-durable` 的 `watchEvents` 转换而来；沙箱和检查点事件来自 §4.4 的 `tether.*` 条目，同在一条流里，不另行合并。
+WebSocket 连接建立后，服务端先发一个 `snapshot`（会话当前完整状态），之后按提交顺序发增量事件：消息开始/文本增量/结束、工具开始/输出增量/结束、审批请求（第一阶段没有，ADR-012）、沙箱状态变化、检查点创建、错误。第一阶段直接由 `pi-durable` 的 `watchEvents` 转换而来；沙箱和检查点事件来自 §4.4 的 `tether.*` 条目，同在一条流里，不另行合并。
 
 交互式终端（pi-env 的 pty 能力）不在第一阶段范围内，以后做 App 时再接。
 
@@ -436,13 +436,13 @@ M3 实测：镜像模式每个检查点只占改动的块，存一张约 0.3 s�
 
 **M3：检查点与分叉**
 - 检查点策略、快照记录、会话分叉、从检查点重建（§8.3、§8.4 的第一支）、闲置删除档（§8.5 的第三档）。
-- 2026-10-28 完成，工作区存法和保留规则见 ADR-011，执行中的决定见 `docs/superpowers/plans/2026-10-28-m3-rulings.md`。范围调整（作者的决定）：审批工具（§6.4）拆成单独一份计划，在 M3 之后、M4 之前做，仍属第一阶段；检查点改为每轮都留、按空间稀疏化。
+- 2026-10-28 完成，工作区存法和保留规则见 ADR-011，执行中的决定见 `docs/superpowers/plans/2026-10-28-m3-rulings.md`。范围调整（作者的决定）：审批工具（§6.4）拆成单独一份计划，在 M3 之后、M4 之前做，仍属第一阶段（2026-11-05 改为移到第一阶段之后，见 ADR-012）；检查点改为每轮都留、按空间稀疏化。
 
 **M4：混沌测试与发布**
 - 混沌测试框架（§11.3），在 Docker 后端上跑通（runc 和 gVisor 各一遍，如果服务器装了 gVisor）。
 - 查看页、README、架构图、一篇介绍文章的草稿。
 
-**第一阶段之后（可选）**：E2B 适配器、CubeSandbox 适配器。各自先验证 §4.3 的字节管道，再跑同一套接口测试和少量混沌测试。
+**第一阶段之后（可选）**：工具审批（§6.4，ADR-012）；E2B 适配器、CubeSandbox 适配器。各自先验证 §4.3 的字节管道，再跑同一套接口测试和少量混沌测试。
 
 ## 11. 测试策略
 
