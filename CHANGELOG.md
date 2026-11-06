@@ -11,6 +11,15 @@ Tether 还没有发布版本号，按里程碑记录。每个里程碑合进 `ma
   - pi 新加了崩溃保护：同一个任务连续 5 次被崩溃打断、其间没有提交新状态，就停下不再重跑（pi 的 `settings.restartLimit`，Tether 用默认值）。
 - 工具审批移到第一阶段之后（ADR-012）。`permissions.requireApproval` 非空时仍然报 `invalid_request`。
 
+### 新增
+
+- 混沌测试：`npm run chaos`（只在测试机上运行，不进 `npm test`）。在随机时刻 `kill -9` 服务端、挂起 `docker exec`、删容器，检查 8 条承诺。结果和发现的问题见 `docs/acceptance/m4-chaos.md`。
+
+### 已知问题
+
+- 一次模型请求期间服务端连续崩溃 5 次，pi 把这一轮停下，消息一直显示运行中，没有说明；发一次中止可以解开（混沌测试 F1）。
+- 存档复制完、容器恰好被删时，快照文件没有记录，归档删不掉，要到下次启动才清理（混沌测试 F2）。
+
 ## M3 检查点与分叉：2026-10-29
 
 PR #4，合并提交 `ece5aa7`。决定见 ADR-011，执行中的决定见 `docs/superpowers/plans/2026-10-28-m3-rulings.md`，端到端验收见 `docs/acceptance/m3.md`。
